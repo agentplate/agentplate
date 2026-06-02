@@ -4,6 +4,30 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-06-02
+
+### Added
+
+- **Auto-merge** (`merge.autoMerge`: `off` / `on-gates-pass` / `on-complete`,
+  default `off`). When enabled, a completed worker's branch lands on the canonical
+  branch automatically (queue + lock + tiered resolve), reporting `merged` /
+  `merge_failed` mail. Configured in `ap setup`.
+- **`agentplate turn <agent>`** — runs the next turn for an idle agent, **resuming**
+  the runtime session (warm start) instead of cold-starting. The shared `driveTurn`
+  core backs both the first turn (`sling`) and follow-ups.
+- **Per-capability model tiering** — `providers[id].models` lets a faster/cheaper
+  model drive read-only roles (scout, reviewer) while the strong model handles the
+  rest. Optional prompt in `ap setup`.
+- **Quality-gates prompt in `ap setup`** — detected from `package.json` scripts.
+
+### Changed
+
+- **Quality gates run concurrently** (was sequential); the outcome is reused for
+  both skill distillation and auto-merge.
+- **Orchestration limits are now enforced.** `agents.maxConcurrent`,
+  `maxAgentsPerLead`, and `maxDepth` were validated but ignored; `sling` now
+  refuses a spawn that would exceed them with a typed `CapacityError`.
+
 ## [1.1.0] — 2026-06-02
 
 ### Added
