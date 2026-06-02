@@ -10,6 +10,10 @@ updates:
       root-dependencies:
         patterns:
           - "*"
+        # Batch only minor/patch; majors get their own reviewable PRs.
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "bun"
     directory: "/ui"
@@ -21,6 +25,10 @@ updates:
       ui-dependencies:
         patterns:
           - "*"
+        # Batch only minor/patch; majors get their own reviewable PRs.
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -32,3 +40,7 @@ updates:
       github-actions:
         patterns:
           - "*"
+        # Batch only minor/patch; majors get their own reviewable PRs.
+        update-types:
+          - "minor"
+          - "patch"
