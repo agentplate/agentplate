@@ -72,7 +72,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			await p.text({
 				message: "Base URL for the endpoint",
 				placeholder: "https://my-endpoint.example.com/v1",
-				validate: (v) => (v.trim().length === 0 ? "A base URL is required" : undefined),
+				validate: (v) => (!v || v.trim().length === 0 ? "A base URL is required" : undefined),
 			}),
 		);
 	} else {
@@ -148,7 +148,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			const key = ensure(
 				await p.password({
 					message: `Enter your ${spec.label} API key (${spec.authEnvVar})`,
-					validate: (v) => (v.trim().length === 0 ? "An API key is required" : undefined),
+					validate: (v) => (!v || v.trim().length === 0 ? "An API key is required" : undefined),
 				}),
 			);
 			secret = { key: spec.authEnvVar, value: key.trim() };
@@ -178,7 +178,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 				? ensure(
 						await p.text({
 							message: "Model id",
-							validate: (v) => (v.trim().length === 0 ? "A model id is required" : undefined),
+							validate: (v) => (!v || v.trim().length === 0 ? "A model id is required" : undefined),
 						}),
 					).trim()
 				: choice;
@@ -187,7 +187,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			await p.text({
 				message: "Model id",
 				placeholder: "provider/model-name",
-				validate: (v) => (v.trim().length === 0 ? "A model id is required" : undefined),
+				validate: (v) => (!v || v.trim().length === 0 ? "A model id is required" : undefined),
 			}),
 		).trim();
 	}
