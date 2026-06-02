@@ -4,6 +4,35 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-06-02
+
+### Added
+
+- **Role-based 3D Office.** Every agent is now a distinct voxel character keyed to
+  its capability — a team color plus headgear and a held prop (builder
+  hard-hat + pickaxe, scout explorer-cap + map, reviewer glasses + magnifier,
+  deployer rocket, …). The **coordinator presides from a corner office** (rug, wide
+  desk, `DIRECTOR` nameplate) at the head of the room. Room polish: back-wall
+  windows, posters, role-colored desk fascia, warmer lighting, and a role key in
+  the legend.
+- **README screenshot gallery** of all web-UI screens (`assets/screenshots/`),
+  captured from a live `agentplate serve`.
+
+### Changed
+
+- **Office agent visibility is now lifecycle-aware.** Live agents always show; a
+  `completed` agent lingers briefly ("Done") then leaves; a reaped (`stopped`)
+  agent leaves immediately. Finished **workers are visible** again instead of
+  vanishing instantly.
+
+### Fixed
+
+- Office name/state labels no longer overlap the info/legend overlay panels (drei
+  `<Html>` z-index clamped below the panels).
+- Restored project-wide UI typechecking under `@types/react@19` — a global `JSX`
+  namespace shim (`ui/src/jsx.d.ts`) and the standard `vite/client` ambient types
+  (`ui/src/vite-env.d.ts`).
+
 ## [1.4.0] — 2026-06-02
 
 ### Added
