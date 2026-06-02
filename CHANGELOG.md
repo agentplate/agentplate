@@ -4,6 +4,32 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-06-02
+
+### Added
+
+- **`agentplate spec` command** (`write` / `show` / `list` / `path`) — a
+  first-class, role-clean way to author the dispatch **contract** a lead or worker
+  launches with, written to `.agentplate/specs/<taskId>.md`.
+
+### Fixed
+
+- **Coordinator→lead contract race.** A slung agent reads its inbox once at launch
+  and starts immediately, so a brief mailed *after* `sling` arrived too late and the
+  agent worked from inherited (wrong) branch content. Contracts are now delivered
+  **in-band at launch**: `sling --spec` validates the spec exists and is non-empty
+  (failing loudly otherwise) and **inlines** its content into the agent's first
+  prompt. Coordinator/lead guidance now requires authoring the spec before slinging
+  and forbids delivering a contract by mail afterward.
+
+### Changed
+
+- Updated root dependencies to current majors (`@clack/prompts` 1.x, `commander`
+  15, `typescript` 6, `biome` 2.4). Dependabot now batches only minor/patch updates,
+  so majors arrive as individual reviewable PRs.
+- Repository hardening for public contributions: Code of Conduct, CODEOWNERS,
+  Dependabot config, and branch protection on `main`.
+
 ## [1.0.0] — 2026-06-01
 
 Initial public release of Agentplate as `@agentplate/cli`.
