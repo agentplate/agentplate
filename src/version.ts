@@ -4,4 +4,4 @@
  * Kept as a plain constant (not read from package.json at runtime) so the value
  * is available without filesystem access and survives bundling.
  */
-export const VERSION = "1.4.1";
+export const VERSION = "1.0.0";
