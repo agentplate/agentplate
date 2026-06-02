@@ -123,4 +123,14 @@ describe("agentplate watch --once", () => {
 		expect(out.driven).toBe(1);
 		expect(out.turns.map((t) => t.agent)).toEqual(["has-mail"]);
 	});
+
+	test("drives multiple idle-with-mail agents in one pass (concurrent)", async () => {
+		for (const a of ["a1", "a2", "a3"]) {
+			seedSession({ agentName: a, state: "idle" });
+			sendMailTo(a);
+		}
+		const out = await watchOnce();
+		expect(out.driven).toBe(3);
+		expect(out.turns.map((t) => t.agent).sort()).toEqual(["a1", "a2", "a3"]);
+	});
 });
