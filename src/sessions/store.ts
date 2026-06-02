@@ -57,6 +57,7 @@ export interface SessionStore {
 	setRuntimeSessionId(id: string, runtimeSessionId: string): void;
 	touch(id: string): void;
 	countActive(runId?: string): number;
+	countActiveByParent(parentAgent: string, runId?: string): number;
 	// --- Lifecycle ---
 	close(): void;
 }
@@ -328,6 +329,24 @@ export function createSessionStore(dbPath: string): SessionStore {
 		return row.n;
 	}
 
+	function countActiveByParent(parentAgent: string, runId?: string): number {
+		// Active children of a given parent (for the per-lead child cap).
+		if (runId !== undefined) {
+			const row = db
+				.query(
+					`SELECT COUNT(*) AS n FROM sessions WHERE parent_agent = ? AND run_id = ? AND state IN ${ACTIVE_STATES_SQL}`,
+				)
+				.get(parentAgent, runId) as { n: number };
+			return row.n;
+		}
+		const row = db
+			.query(
+				`SELECT COUNT(*) AS n FROM sessions WHERE parent_agent = ? AND state IN ${ACTIVE_STATES_SQL}`,
+			)
+			.get(parentAgent) as { n: number };
+		return row.n;
+	}
+
 	function close(): void {
 		db.close();
 	}
@@ -345,6 +364,7 @@ export function createSessionStore(dbPath: string): SessionStore {
 		setRuntimeSessionId,
 		touch,
 		countActive,
+		countActiveByParent,
 		close,
 	};
 }

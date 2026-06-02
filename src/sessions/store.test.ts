@@ -318,6 +318,19 @@ describe("createSessionStore — countActive", () => {
 		store.updateSessionState(s.id, "completed");
 		expect(store.countActive("run-x")).toBe(0);
 	});
+
+	test("countActiveByParent counts a parent's active children only", () => {
+		store.upsertSession(makeSession({ runId: "r", parentAgent: "lead-1", state: "working" }));
+		store.upsertSession(makeSession({ runId: "r", parentAgent: "lead-1", state: "booting" }));
+		const done = makeSession({ runId: "r", parentAgent: "lead-1", state: "completed" });
+		store.upsertSession(done);
+		store.upsertSession(makeSession({ runId: "r", parentAgent: "lead-2", state: "working" }));
+
+		expect(store.countActiveByParent("lead-1", "r")).toBe(2); // excludes the completed child
+		expect(store.countActiveByParent("lead-2", "r")).toBe(1);
+		expect(store.countActiveByParent("lead-1", "other-run")).toBe(0);
+		expect(store.countActiveByParent("nobody")).toBe(0);
+	});
 });
 
 describe("createSessionStore — file-backed database", () => {
