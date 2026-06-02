@@ -12,12 +12,15 @@
  * (resumed when `resumeSessionId` is given) — there is no long-lived agent.
  */
 
+import { existsSync } from "node:fs";
 import type { EventStore } from "../events/store.ts";
 import { runQualityGates } from "../insights/quality-gates.ts";
 import type { MailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { maybeAutoMerge } from "../merge/auto.ts";
-import { mailDbPath } from "../paths.ts";
+import { mailDbPath, manifestFilePath } from "../paths.ts";
+import { getRuntime } from "../runtimes/registry.ts";
+import { resolveModel } from "../runtimes/resolve.ts";
 import type { AgentRuntime } from "../runtimes/types.ts";
 import type { SessionStore } from "../sessions/store.ts";
 import { runSkillFeedbackAndDistill } from "../skills/lifecycle.ts";
@@ -30,6 +33,7 @@ import type {
 	SessionState,
 } from "../types.ts";
 import { updateIdentity } from "./identity.ts";
+import { buildDefaultManifest, getDefinition, loadManifest } from "./manifest.ts";
 import { runTurn } from "./turn-runner.ts";
 
 /** Terminal mail types whose presence marks a capability's work complete. */
@@ -197,4 +201,50 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 	}
 
 	return { finalState, exitCode: turn.exitCode, gateStatus };
+}
+
+export interface DriveAgentTurnCtx {
+	root: string;
+	config: AgentplateConfig;
+	session: AgentSession;
+	store: SessionStore;
+	events: EventStore;
+	mail: MailClient;
+}
+
+/**
+ * Run the next (resumed) turn for an existing session: resolve its runtime + model
+ * + manifest def, inject its unread mail as the prompt, and {@link driveTurn} with
+ * the stored `runtimeSessionId` (warm start). Shared by `agentplate turn` (single)
+ * and `agentplate watch` (the mail pump). Assumes the caller has already decided
+ * the session is drivable.
+ */
+export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnResult> {
+	const { root, config, session } = ctx;
+	const manifestPath = manifestFilePath(root);
+	const manifest = existsSync(manifestPath) ? loadManifest(manifestPath) : buildDefaultManifest();
+	const def = getDefinition(manifest, session.capability);
+	const runtime = getRuntime(config.runtime.default, config.runtime.default);
+	const model = resolveModel(config, root, def.model, session.capability);
+
+	// The turn's user text is the agent's unread mail (a child's reply / operator
+	// direction); fall back to a continue nudge. checkInject marks it read.
+	const injected = ctx.mail.checkInject(session.agentName);
+	const prompt =
+		injected.trim().length > 0
+			? injected
+			: "Continue your task. If it is complete, send your terminal mail.";
+
+	return driveTurn({
+		root,
+		config,
+		runtime,
+		store: ctx.store,
+		events: ctx.events,
+		mail: ctx.mail,
+		session,
+		model,
+		prompt,
+		resumeSessionId: session.runtimeSessionId ?? undefined,
+	});
 }
