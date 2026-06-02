@@ -321,6 +321,71 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		);
 	}
 
+	// 6b. Advanced limits — gated so the common path stays short.
+	const agents = { ...currentConfig.agents };
+	const tuneAdvanced = ensure(
+		await p.confirm({
+			message: "Tune advanced limits (concurrency, timeouts, skip steps)?",
+			initialValue: false,
+		}),
+	);
+	if (tuneAdvanced) {
+		const posInt = (v: string | undefined): string | undefined =>
+			v && Number.isInteger(Number(v)) && Number(v) >= 0 ? undefined : "Enter a whole number ≥ 0";
+		agents.maxConcurrent = Number(
+			ensure(
+				await p.text({
+					message: "Max agents running at once",
+					initialValue: String(agents.maxConcurrent),
+					validate: (v) => (v && Number(v) >= 1 ? undefined : "Enter a number ≥ 1"),
+				}),
+			),
+		);
+		agents.maxAgentsPerLead = Number(
+			ensure(
+				await p.text({
+					message: "Max workers per lead",
+					initialValue: String(agents.maxAgentsPerLead),
+					validate: (v) => (v && Number(v) >= 1 ? undefined : "Enter a number ≥ 1"),
+				}),
+			),
+		);
+		agents.turnTimeoutMinutes = Number(
+			ensure(
+				await p.text({
+					message: "Per-turn timeout in minutes (0 = no cap)",
+					initialValue: String(agents.turnTimeoutMinutes),
+					validate: posInt,
+				}),
+			),
+		);
+		const skips = ensure(
+			await p.multiselect({
+				message: "Default speed shortcuts (leave empty for none)",
+				options: [
+					{
+						value: "skipScout",
+						label: "Skip scout step",
+						hint: "leads dispatch builders directly",
+					},
+					{ value: "skipReview", label: "Skip review step", hint: "no reviewer before integrate" },
+					{
+						value: "skipGates",
+						label: "Skip quality gates",
+						hint: "faster; disables on-gates-pass merge",
+					},
+					{ value: "skipSkills", label: "Skip skill distillation" },
+				],
+				initialValues: [],
+				required: false,
+			}),
+		) as string[];
+		agents.skipScout = skips.includes("skipScout");
+		agents.skipReview = skips.includes("skipReview");
+		agents.skipGates = skips.includes("skipGates");
+		agents.skipSkills = skips.includes("skipSkills");
+	}
+
 	// 7. Summary -----------------------------------------------------------
 	const previewProvider = buildProviderConfig(spec, model, authMode, baseUrl);
 	const authSummary: Record<AuthMode, string> = {
@@ -356,6 +421,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		runtime,
 	});
 	config.merge = { ...config.merge, autoMerge };
+	config.agents = agents;
 	if (qualityGates.length) config.project = { ...config.project, qualityGates };
 	if (modelsByCapability) {
 		const pc = config.providers[providerId];

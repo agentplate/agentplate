@@ -153,6 +153,20 @@ export interface AgentsConfig {
 	 * `0` disables idle reaping. Default 10.
 	 */
 	idleTimeoutMinutes: number;
+	/**
+	 * Hard wall-clock cap on a SINGLE turn, in minutes. Unlike idle reaping (which
+	 * needs inactivity), this kills a turn that keeps streaming but never finishes.
+	 * `0` disables the cap. Default 0.
+	 */
+	turnTimeoutMinutes: number;
+	/** Default: leads skip the scout step (go straight to builders). */
+	skipScout: boolean;
+	/** Default: leads skip the reviewer step before integrating. */
+	skipReview: boolean;
+	/** Skip the post-turn quality-gate run (speed; disables `on-gates-pass` merge). */
+	skipGates: boolean;
+	/** Skip the post-turn skill-distillation loop. */
+	skipSkills: boolean;
 }
 
 /**

@@ -43,6 +43,11 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 		maxDepth: 2,
 		maxAgentsPerLead: 5,
 		idleTimeoutMinutes: 10,
+		turnTimeoutMinutes: 0,
+		skipScout: false,
+		skipReview: false,
+		skipGates: false,
+		skipSkills: false,
 	},
 	merge: {
 		aiResolveEnabled: true,
@@ -174,6 +179,11 @@ export function validateConfig(config: AgentplateConfig): void {
 	if (config.agents.idleTimeoutMinutes < 0) {
 		throw new ConfigError(
 			"config.agents.idleTimeoutMinutes must be >= 0 (0 disables idle reaping)",
+		);
+	}
+	if (config.agents.turnTimeoutMinutes < 0) {
+		throw new ConfigError(
+			"config.agents.turnTimeoutMinutes must be >= 0 (0 disables the per-turn cap)",
 		);
 	}
 	const autoMergeModes: AutoMergeMode[] = ["off", "on-gates-pass", "on-complete"];

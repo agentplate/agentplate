@@ -1,14 +1,28 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ValidationError } from "../errors.ts";
-import type { ResolvedModel } from "../types.ts";
+import type { ResolvedModel, RuntimeConfig } from "../types.ts";
 import { ClaudeRuntime } from "./claude.ts";
 import { CodexRuntime } from "./codex.ts";
 import { CursorRuntime } from "./cursor.ts";
 import { GeminiRuntime } from "./gemini.ts";
 import { MockRuntime } from "./mock.ts";
 import { OpenCodeRuntime, opencodeModel } from "./opencode.ts";
-import { getRuntime, getRuntimeNames } from "./registry.ts";
+import { getRuntime, getRuntimeNames, runtimeNameForCapability } from "./registry.ts";
 import type { AgentEvent, DirectSpawnOpts } from "./types.ts";
+
+describe("runtimeNameForCapability", () => {
+	const rt: RuntimeConfig = { default: "claude", capabilities: { scout: "codex" } };
+	test("explicit override wins over everything", () => {
+		expect(runtimeNameForCapability(rt, "scout", "gemini")).toBe("gemini");
+	});
+	test("per-capability override applies when set", () => {
+		expect(runtimeNameForCapability(rt, "scout")).toBe("codex");
+	});
+	test("falls back to the default runtime", () => {
+		expect(runtimeNameForCapability(rt, "builder")).toBe("claude");
+		expect(runtimeNameForCapability({ default: "opencode" }, "scout")).toBe("opencode");
+	});
+});
 
 // Minimal DirectSpawnOpts builder for argv-shape assertions. `cwd` and
 // `instructionPath` are required by the type but irrelevant to argv here.

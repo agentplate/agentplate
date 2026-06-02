@@ -19,7 +19,7 @@ import type { MailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { maybeAutoMerge } from "../merge/auto.ts";
 import { mailDbPath, manifestFilePath } from "../paths.ts";
-import { getRuntime } from "../runtimes/registry.ts";
+import { getRuntime, runtimeNameForCapability } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
 import type { AgentRuntime } from "../runtimes/types.ts";
 import type { SessionStore } from "../sessions/store.ts";
@@ -110,6 +110,8 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 		prompt: ctx.prompt,
 		env: model.env,
 		resumeSessionId: ctx.resumeSessionId,
+		timeoutMs:
+			config.agents.turnTimeoutMinutes > 0 ? config.agents.turnTimeoutMinutes * 60_000 : undefined,
 		onEvent: (event) => {
 			if (event.error || event.type === "error") sawError = true;
 			// Prefer the error message (so a failed agent's reason is visible in the
@@ -126,6 +128,17 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 		},
 	});
 	if (turn.runtimeSessionId) store.setRuntimeSessionId(sessionId, turn.runtimeSessionId);
+
+	// Record a clear reason when the wall-clock cap killed the turn.
+	if (turn.timedOut) {
+		events.record({
+			agentName: name,
+			runId,
+			type: "error",
+			tool: null,
+			detail: `Turn killed: exceeded agents.turnTimeoutMinutes (${config.agents.turnTimeoutMinutes}m).`,
+		});
+	}
 
 	// A non-zero exit with no error event means the runtime failed via stderr;
 	// record it so the failure reason is visible instead of a blank "failed".
@@ -151,15 +164,19 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 	});
 
 	// Quality gates run once when EITHER the self-improving loop or auto-merge
-	// needs them; the outcome feeds both. Best-effort — never fails the turn.
+	// needs them (and gates aren't skipped); the outcome feeds both. Best-effort.
+	const runSkills = config.skills.enabled && !config.agents.skipSkills;
 	const autoMergeWants =
 		config.merge.autoMerge !== "off" && capability !== "scout" && capability !== "merger";
+	const wantGates = !config.agents.skipGates && (runSkills || autoMergeWants);
 	let gateStatus: OutcomeStatus | null = null;
-	if (finalState === "completed" && (config.skills.enabled || autoMergeWants)) {
+	if (finalState === "completed" && (wantGates || runSkills)) {
 		try {
-			const gateOutcome = await runQualityGates(config.project.qualityGates ?? [], worktreePath);
-			gateStatus = gateOutcome?.status ?? null;
-			if (config.skills.enabled) {
+			if (wantGates) {
+				const gateOutcome = await runQualityGates(config.project.qualityGates ?? [], worktreePath);
+				gateStatus = gateOutcome?.status ?? null;
+			}
+			if (runSkills) {
 				await runSkillFeedbackAndDistill({
 					root,
 					agentName: name,
@@ -224,7 +241,10 @@ export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnR
 	const manifestPath = manifestFilePath(root);
 	const manifest = existsSync(manifestPath) ? loadManifest(manifestPath) : buildDefaultManifest();
 	const def = getDefinition(manifest, session.capability);
-	const runtime = getRuntime(config.runtime.default, config.runtime.default);
+	const runtime = getRuntime(
+		runtimeNameForCapability(config.runtime, session.capability),
+		config.runtime.default,
+	);
 	const model = resolveModel(config, root, def.model, session.capability);
 
 	// The turn's user text is the agent's unread mail (a child's reply / operator

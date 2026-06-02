@@ -23,6 +23,8 @@ export interface RunTurnOptions {
 	env?: Record<string, string>;
 	/** Prior runtime session id, to resume across turns. */
 	resumeSessionId?: string;
+	/** Hard wall-clock cap in ms; the child is killed past it. 0/undefined = none. */
+	timeoutMs?: number;
 	/** Called for each parsed event (e.g. to record tool calls). */
 	onEvent?: (event: AgentEvent) => void;
 }
@@ -33,6 +35,8 @@ export interface TurnResult {
 	runtimeSessionId: string | null;
 	/** Captured stderr (already bounded by the child). */
 	stderr: string;
+	/** True if the turn was killed by the wall-clock cap. */
+	timedOut: boolean;
 }
 
 /** Run a single headless turn and resolve when the child process exits. */
@@ -59,6 +63,18 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 		stdin: "ignore",
 	});
 
+	// Hard wall-clock cap: kill a turn that runs past the limit even if it keeps
+	// streaming (idle reaping only catches inactivity). Closing the child's pipes
+	// ends the drain/parse loops below, so the turn resolves with a non-zero exit.
+	let timedOut = false;
+	const timer =
+		opts.timeoutMs && opts.timeoutMs > 0
+			? setTimeout(() => {
+					timedOut = true;
+					proc.kill(); // SIGTERM
+				}, opts.timeoutMs)
+			: null;
+
 	// Read stderr concurrently so a full pipe buffer can't deadlock the child.
 	const stderrPromise = new Response(proc.stderr).text();
 
@@ -75,5 +91,6 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 
 	const stderr = await stderrPromise;
 	const exitCode = await proc.exited;
-	return { exitCode, runtimeSessionId, stderr };
+	if (timer) clearTimeout(timer);
+	return { exitCode, runtimeSessionId, stderr, timedOut };
 }
