@@ -4,6 +4,28 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-06-02
+
+### Added
+
+- **`agentplate watch`** — the mail pump that makes warm-start automatic: it
+  advances every **idle** agent with unread mail to its next (resumed) turn,
+  driving eligible agents concurrently up to `agents.maxConcurrent`. Modes:
+  `--once`, `--until-idle`, or loop until Ctrl-C.
+- **Hard per-turn timeout** (`agents.turnTimeoutMinutes`, 0 = off) — kills a turn
+  that runs past the cap even while still streaming (idle reaping only catches
+  inactivity).
+- **Per-capability runtime** — `runtime.capabilities[capability]` now selects the
+  runtime adapter per role (previously defined but unused).
+- **Speed shortcuts** — `agents.skipScout` / `skipReview` (surfaced as lead overlay
+  constraints) and `agents.skipGates` / `skipSkills` (honored on the turn path).
+- **Wizard** — a gated "advanced limits" step (concurrency, turn-timeout, skips).
+
+### Changed
+
+- The turn path is shared via `driveTurn` / `driveAgentTurn`, used by `sling`
+  (turn 1), `agentplate turn` (single follow-up), and `agentplate watch`.
+
 ## [1.2.0] — 2026-06-02
 
 ### Added
