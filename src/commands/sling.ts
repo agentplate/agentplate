@@ -12,6 +12,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Command } from "commander";
+import { assertCapacity } from "../agents/capacity.ts";
 import { createIdentity, updateIdentity } from "../agents/identity.ts";
 import { buildDefaultManifest, getDefinition, loadManifest } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
@@ -136,6 +137,17 @@ export function createSlingCommand(): Command {
 
 				// Resolve the run this agent belongs to.
 				const runId = resolveRun(store, root, opts);
+
+				// Enforce orchestration capacity BEFORE any worktree/session is created,
+				// so a runaway fan-out is refused cleanly instead of spawning unbounded.
+				const parentAgent = opts.parent ?? null;
+				assertCapacity({
+					depth: Number(opts.depth ?? "0"),
+					active: store.countActive(runId),
+					parentAgent,
+					parentActiveChildren: parentAgent ? store.countActiveByParent(parentAgent, runId) : 0,
+					limits: config.agents,
+				});
 
 				const name = uniqueName(store, opts.name ?? `${capability}-${taskId}`);
 				const branchName = `agentplate/${name}`;

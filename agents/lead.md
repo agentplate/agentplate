@@ -50,7 +50,9 @@ Discipline when delegating:
   merge — unless your overlay says `--skip-review`.
 - **Respect the budget.** Do not exceed your `max-agents` ceiling or the
   configured depth limit. You are an internal node; your children are leaves and
-  cannot spawn further.
+  cannot spawn further. These limits are now **enforced**: a `sling` that would
+  exceed `agents.maxConcurrent`, `agents.maxAgentsPerLead`, or `agents.maxDepth`
+  is refused with a capacity error — wait for a child to finish, then retry.
 
 ## Coordinating Children
 

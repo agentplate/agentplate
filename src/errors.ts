@@ -63,6 +63,17 @@ export class NotFoundError extends AgentplateError {
 	}
 }
 
+/**
+ * A spawn was refused because it would exceed a configured orchestration limit
+ * (maxConcurrent / maxAgentsPerLead / maxDepth). Distinct exit code so callers
+ * (a lead/coordinator) can recognize "at capacity — back off and retry later".
+ */
+export class CapacityError extends AgentplateError {
+	constructor(message: string) {
+		super(message, "CAPACITY_EXCEEDED", 5);
+	}
+}
+
 /** Type guard: is the given value a AgentplateError? */
 export function isAgentplateError(value: unknown): value is AgentplateError {
 	return value instanceof AgentplateError;
