@@ -123,6 +123,10 @@ export function createSlingCommand(): Command {
 			const mail = createMailClient(root);
 			const events = createEventStore(eventsDbPath(root));
 			try {
+				// Validate + load the spec contract up front (fails loudly on a missing or
+				// empty --spec rather than launching the agent contract-less).
+				const specBody = readSpecContract(opts.spec, taskId);
+
 				// Resolve the run this agent belongs to.
 				const runId = resolveRun(store, root, opts);
 
@@ -191,7 +195,7 @@ export function createSlingCommand(): Command {
 					from: opts.parent ?? "operator",
 					to: name,
 					subject: `Dispatch: ${taskId}`,
-					body: dispatchBody(taskId, capability, overlayConfig),
+					body: dispatchBody(taskId, capability, overlayConfig, specBody),
 					type: "dispatch",
 				});
 
@@ -325,7 +329,35 @@ function resolveRun(
 	return run.id;
 }
 
-function dispatchBody(taskId: string, capability: Capability, cfg: OverlayConfig): string {
+/**
+ * Resolve the contract a `--spec` points to, or "" when no spec was given.
+ *
+ * `--spec` is the race-free channel for an agent's contract: its content is
+ * inlined into the dispatch and loaded at launch, unlike a brief mailed *after*
+ * `sling` (which lands only after the agent has read its inbox once and started).
+ * A missing or empty spec is therefore a hard error — launching an agent with a
+ * blank contract makes it fall back to inherited (wrong) branch content.
+ */
+export function readSpecContract(specPath: string | undefined, taskId: string): string {
+	if (!specPath) return "";
+	if (!existsSync(specPath)) {
+		throw new ValidationError(
+			`--spec file not found: ${specPath}. Author it first with \`agentplate spec write ${taskId}\`.`,
+		);
+	}
+	const body = readFileSync(specPath, "utf8");
+	if (body.trim().length === 0) {
+		throw new ValidationError(`--spec file is empty: ${specPath}. The contract would be blank.`);
+	}
+	return body;
+}
+
+export function dispatchBody(
+	taskId: string,
+	capability: Capability,
+	cfg: OverlayConfig,
+	specBody: string,
+): string {
 	const lines = [
 		`You are ${cfg.agentName}, a ${capability} agent.`,
 		`Task: ${taskId}`,
@@ -333,7 +365,13 @@ function dispatchBody(taskId: string, capability: Capability, cfg: OverlayConfig
 		cfg.fileScope.length ? `File scope: ${cfg.fileScope.join(", ")}` : undefined,
 		`Your full instructions are in ${cfg.worktreePath}.`,
 	];
-	return lines.filter(Boolean).join("\n");
+	let body = lines.filter(Boolean).join("\n");
+	// Inline the spec contract so it is in the agent's first prompt — not merely a
+	// path it has to open. This is the in-band contract; do not rely on a later mail.
+	if (specBody.trim()) {
+		body += `\n\n=== SPEC (your contract — work from this, not inherited branch content) ===\n${specBody.trim()}\n=== END SPEC ===`;
+	}
+	return body;
 }
 
 function buildInitialPrompt(injected: string, instructionPath: string): string {

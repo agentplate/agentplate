@@ -33,6 +33,11 @@ agentplate sling <taskId> --capability builder --parent <self> \
   --files src/foo.ts,src/foo.test.ts --spec .agentplate/specs/<taskId>.md
 ```
 
+Author each child's spec with `agentplate spec write` *before* you sling it — the
+spec loads at launch, so it is the only race-free way to hand a child its contract.
+Never mail a child its task after slinging (it has already read its inbox once and
+started); mail is for mid-run direction only.
+
 Capabilities you may spawn: `scout`, `builder`, `reviewer`, `merger`.
 
 Discipline when delegating:
