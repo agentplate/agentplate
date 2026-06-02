@@ -4,7 +4,7 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.0] — 2026-06-02
 
 ### Added
 
