@@ -12,7 +12,13 @@ import { join } from "node:path";
 import * as p from "@clack/prompts";
 import { applyProviderSelection, buildProviderConfig } from "../providers/apply.ts";
 import { getProviderSpec, listProviders, meetsContextFloor } from "../providers/registry.ts";
-import type { AgentplateConfig, AuthMode, AutoMergeMode, QualityGate } from "../types.ts";
+import type {
+	AgentplateConfig,
+	AuthMode,
+	AutoMergeMode,
+	Capability,
+	QualityGate,
+} from "../types.ts";
 import { commandOnPath, detectDefaultRuntime } from "../utils/detect.ts";
 
 /** Runtimes the wizard can offer. */
@@ -220,6 +226,31 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		).trim();
 	}
 
+	// 4b. Model tiering — optionally use a faster/cheaper model for read-only
+	//     roles (scout, reviewer), keeping the chosen model for the rest.
+	let modelsByCapability: Partial<Record<Capability, string>> | undefined;
+	if (eligible.length > 1) {
+		const wantTiering = ensure(
+			await p.confirm({
+				message: "Use a faster/cheaper model for read-only roles (scout & reviewer)?",
+				initialValue: false,
+			}),
+		);
+		if (wantTiering) {
+			const fast = ensure(
+				await p.select({
+					message: "Fast model for scout & reviewer",
+					options: eligible.map((m) => ({
+						value: m.id,
+						label: m.label,
+						hint: `${Math.round(m.contextWindow / 1000)}k context`,
+					})),
+				}),
+			) as string;
+			modelsByCapability = { scout: fast, reviewer: fast };
+		}
+	}
+
 	// 5. Runtime -----------------------------------------------------------
 	const detected = await detectDefaultRuntime();
 	const installed = new Set<string>();
@@ -307,6 +338,9 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			previewProvider.baseUrl ? `base URL:  ${previewProvider.baseUrl}` : undefined,
 			`gates:     ${qualityGates.length ? qualityGates.map((g) => g.name).join(", ") : "none"}`,
 			`auto-merge:${autoMerge}`,
+			modelsByCapability?.scout
+				? `fast model: ${modelsByCapability.scout} (scout, reviewer)`
+				: undefined,
 		]
 			.filter(Boolean)
 			.join("\n"),
@@ -323,6 +357,10 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 	});
 	config.merge = { ...config.merge, autoMerge };
 	if (qualityGates.length) config.project = { ...config.project, qualityGates };
+	if (modelsByCapability) {
+		const pc = config.providers[providerId];
+		if (pc) config.providers[providerId] = { ...pc, models: modelsByCapability };
+	}
 
 	p.outro("Ready to write configuration.");
 	return secret ? { config, secret } : { config };

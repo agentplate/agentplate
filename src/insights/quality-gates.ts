@@ -34,37 +34,36 @@ export async function runQualityGates(
 ): Promise<QualityGateOutcome | null> {
 	if (gates.length === 0) return null;
 
-	const results: GateResult[] = [];
-	let total = 0;
-	for (const gate of gates) {
-		const started = performance.now();
-		let exitCode = 1;
-		try {
-			// Run the gate through the platform shell: `cmd /c` on Windows (no bash
-			// there), `bash -lc` elsewhere. `.cmd` shims (biome/tsc) resolve under both.
-			const shellArgv =
-				process.platform === "win32"
-					? ["cmd", "/d", "/s", "/c", gate.command]
-					: ["bash", "-lc", gate.command];
-			const proc = Bun.spawn(shellArgv, {
-				cwd,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			exitCode = await proc.exited;
-		} catch {
-			exitCode = 1;
-		}
-		const durationMs = Math.round(performance.now() - started);
-		total += durationMs;
-		results.push({
-			name: gate.name,
-			command: gate.command,
-			passed: exitCode === 0,
-			exitCode,
-			durationMs,
-		});
-	}
+	// Gates are independent checks, so run them concurrently and measure the
+	// outcome by wall-clock — `totalDurationMs` is the elapsed time of the whole
+	// batch (the slowest gate), not the sum of all gates.
+	const overallStart = performance.now();
+	const results: GateResult[] = await Promise.all(
+		gates.map(async (gate): Promise<GateResult> => {
+			const started = performance.now();
+			let exitCode = 1;
+			try {
+				// Run the gate through the platform shell: `cmd /c` on Windows (no bash
+				// there), `bash -lc` elsewhere. `.cmd` shims (biome/tsc) resolve under both.
+				const shellArgv =
+					process.platform === "win32"
+						? ["cmd", "/d", "/s", "/c", gate.command]
+						: ["bash", "-lc", gate.command];
+				const proc = Bun.spawn(shellArgv, { cwd, stdout: "pipe", stderr: "pipe" });
+				exitCode = await proc.exited;
+			} catch {
+				exitCode = 1;
+			}
+			return {
+				name: gate.name,
+				command: gate.command,
+				passed: exitCode === 0,
+				exitCode,
+				durationMs: Math.round(performance.now() - started),
+			};
+		}),
+	);
+	const total = Math.round(performance.now() - overallStart);
 
 	const passed = results.filter((r) => r.passed).length;
 	const status: OutcomeStatus =

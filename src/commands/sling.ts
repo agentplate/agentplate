@@ -207,7 +207,7 @@ export function createSlingCommand(): Command {
 				});
 
 				// 5. Run the first headless turn.
-				const resolved = resolveModel(config, root, def.model);
+				const resolved = resolveModel(config, root, def.model, capability);
 				store.updateSessionState(session.id, "working");
 				const prompt = buildInitialPrompt(mail.checkInject(name), runtime.instructionPath);
 				let sawError = false;
