@@ -5,8 +5,8 @@
  * have **unread mail**, and runs each one's next turn via {@link driveAgentTurn},
  * which **resumes** the runtime session (warm start). Detection is non-destructive
  * (`mail.check(..., { unreadOnly })`); the turn itself injects + marks the mail
- * read. Turns are driven sequentially per pass; a failing turn is logged and the
- * loop continues.
+ * read. Each pass drives eligible agents concurrently, capped at the fleet's
+ * `maxConcurrent`; a failing turn is logged and the loop continues.
  *
  * Modes: `--once` (single pass), `--until-idle` (loop until no active agents
  * remain — the run drained), or the default (loop until Ctrl-C).
@@ -23,6 +23,7 @@ import { brand, muted, printInfo, printSuccess, printWarning } from "../logging/
 import { createMailClient } from "../mail/client.ts";
 import { currentRunPath, eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
+import type { AgentSession } from "../types.ts";
 
 interface WatchOptions {
 	run?: string;
@@ -74,33 +75,48 @@ export function createWatchCommand(): Command {
 
 			let totalDriven = 0;
 			const drivenLog: Array<{ agent: string; state: string }> = [];
+			// Cap simultaneous turns at the fleet's maxConcurrent (>= 1).
+			const concurrency = Math.max(1, config.agents.maxConcurrent);
 
-			/** One pass: drive every idle agent that has unread mail. Returns count driven. */
-			const pass = async (): Promise<number> => {
-				const idle = store.listSessions({ runId, state: "idle" });
-				let driven = 0;
-				for (const session of idle) {
-					if (stop) break;
-					if (mail.check(session.agentName, { unreadOnly: true }).length === 0) continue;
-					try {
-						const { finalState } = await driveAgentTurn({
-							root,
-							config,
-							session,
-							store,
-							events,
-							mail,
-						});
-						driven++;
-						totalDriven++;
-						drivenLog.push({ agent: session.agentName, state: finalState });
-						if (!useJson) printInfo(`  ${brand(session.agentName)} → ${finalState}`);
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						if (!useJson) printWarning(`  ${session.agentName}: turn failed — ${message}`);
-					}
+			/** Drive one agent's next turn, recording the outcome. */
+			const driveOne = async (session: AgentSession): Promise<void> => {
+				try {
+					const { finalState } = await driveAgentTurn({
+						root,
+						config,
+						session,
+						store,
+						events,
+						mail,
+					});
+					totalDriven++;
+					drivenLog.push({ agent: session.agentName, state: finalState });
+					if (!useJson) printInfo(`  ${brand(session.agentName)} → ${finalState}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (!useJson) printWarning(`  ${session.agentName}: turn failed — ${message}`);
 				}
-				return driven;
+			};
+
+			/**
+			 * One pass: drive every idle agent that has unread mail, up to `concurrency`
+			 * turns at a time. Returns the number driven.
+			 */
+			const pass = async (): Promise<number> => {
+				const eligible = store
+					.listSessions({ runId, state: "idle" })
+					.filter((s) => mail.check(s.agentName, { unreadOnly: true }).length > 0);
+				let next = 0;
+				const worker = async (): Promise<void> => {
+					while (!stop) {
+						const session = eligible[next++];
+						if (!session) break;
+						await driveOne(session);
+					}
+				};
+				const lanes = Math.min(concurrency, eligible.length);
+				await Promise.all(Array.from({ length: lanes }, () => worker()));
+				return eligible.length;
 			};
 
 			try {
