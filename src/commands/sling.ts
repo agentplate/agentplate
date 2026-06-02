@@ -24,6 +24,7 @@ import { jsonOutput } from "../json.ts";
 import { brand, muted, printHint, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
+import { maybeAutoMerge } from "../merge/auto.ts";
 import {
 	currentRunPath,
 	eventsDbPath,
@@ -36,7 +37,13 @@ import { getRuntime } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { retrieveSkillsForSpawn, runSkillFeedbackAndDistill } from "../skills/lifecycle.ts";
-import type { AgentManifest, AgentSession, Capability, OverlayConfig } from "../types.ts";
+import type {
+	AgentManifest,
+	AgentSession,
+	Capability,
+	OutcomeStatus,
+	OverlayConfig,
+} from "../types.ts";
 import { SUPPORTED_CAPABILITIES } from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
 
@@ -258,29 +265,58 @@ export function createSlingCommand(): Command {
 					summary: `${capability} ran a turn for ${taskId} → ${finalState}`,
 				});
 
-				// 7. Self-improving loop: score quality gates, append outcomes to
-				//    applied skills, and distill a skill when the work passed. Only
-				//    runs for a completed task; best-effort (never fails the spawn).
-				if (finalState === "completed" && config.skills.enabled) {
+				// 7. Quality gates run once when EITHER the self-improving loop or
+				//    auto-merge needs them; the outcome feeds both. Best-effort — a
+				//    failure here must never fail the spawn.
+				const autoMergeWants =
+					config.merge.autoMerge !== "off" && capability !== "scout" && capability !== "merger";
+				let gateStatus: OutcomeStatus | null = null;
+				if (finalState === "completed" && (config.skills.enabled || autoMergeWants)) {
 					try {
 						const gateOutcome = await runQualityGates(
 							config.project.qualityGates ?? [],
 							worktree.path,
 						);
-						await runSkillFeedbackAndDistill({
-							root,
-							agentName: name,
-							capability,
-							taskId,
-							worktreePath: worktree.path,
-							baseRef: config.project.canonicalBranch,
-							runtime,
-							outcomeStatus: gateOutcome?.status ?? null,
-							skills: config.skills,
-							model: resolved.model,
-						});
+						gateStatus = gateOutcome?.status ?? null;
+						if (config.skills.enabled) {
+							await runSkillFeedbackAndDistill({
+								root,
+								agentName: name,
+								capability,
+								taskId,
+								worktreePath: worktree.path,
+								baseRef: config.project.canonicalBranch,
+								runtime,
+								outcomeStatus: gateStatus,
+								skills: config.skills,
+								model: resolved.model,
+							});
+						}
 					} catch {
 						// Skill loop is advisory; a failure here must not fail the spawn.
+					}
+				}
+
+				// 8. Auto-merge the worker's branch onto the canonical branch when
+				//    configured (off by default). Best-effort — a landing must never
+				//    fail the spawn; conflicts are reported to the coordinator via mail.
+				if (finalState === "completed") {
+					try {
+						await maybeAutoMerge({
+							root,
+							branchName,
+							targetBranch: config.project.canonicalBranch,
+							capability,
+							agentName: name,
+							taskId,
+							parent: opts.parent ?? null,
+							mode: config.merge.autoMerge,
+							aiResolveEnabled: config.merge.aiResolveEnabled,
+							gateStatus,
+							mail,
+						});
+					} catch {
+						// Auto-merge is best-effort; never fail the spawn over a landing.
 					}
 				}
 

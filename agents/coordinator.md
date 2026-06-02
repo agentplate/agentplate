@@ -90,6 +90,12 @@ Discipline when dispatching:
   if integration itself is non-trivial.
 - Re-dispatch on failure: if a lead escalates something it cannot finish, decide
   whether to re-scope and re-dispatch, or escalate to the operator.
+- Auto-merge (when `merge.autoMerge` is enabled in config): a worker's branch
+  lands on the canonical branch automatically when it finishes, and you receive a
+  `merged` or `merge_failed` mail per landing. You do **not** run `agentplate merge`
+  for those slices — just act on `merge_failed` (re-dispatch a merger or resolve),
+  and still own cross-slice integration. When auto-merge is `off` (the default),
+  you drive merges yourself as below.
 
 ## Communication Protocol
 

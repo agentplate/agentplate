@@ -7,10 +7,12 @@
  * module owns only the interactive I/O.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import * as p from "@clack/prompts";
 import { applyProviderSelection, buildProviderConfig } from "../providers/apply.ts";
 import { getProviderSpec, listProviders, meetsContextFloor } from "../providers/registry.ts";
-import type { AgentplateConfig, AuthMode } from "../types.ts";
+import type { AgentplateConfig, AuthMode, AutoMergeMode, QualityGate } from "../types.ts";
 import { commandOnPath, detectDefaultRuntime } from "../utils/detect.ts";
 
 /** Runtimes the wizard can offer. */
@@ -32,6 +34,32 @@ export interface WizardResult {
 	config: AgentplateConfig;
 	/** A secret to store (env-var name → value), if the user provided one. */
 	secret?: { key: string; value: string };
+}
+
+/**
+ * Suggest quality gates for a project. Prefers the project's own package.json
+ * scripts (`bun run <script>`) when present, falling back to the Bun/Biome/TS
+ * defaults this stack uses. The user confirms/deselects in the wizard.
+ */
+export function detectQualityGates(root: string): QualityGate[] {
+	let scripts: Record<string, string> = {};
+	try {
+		const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+			scripts?: Record<string, string>;
+		};
+		scripts = pkg.scripts ?? {};
+	} catch {
+		// No package.json (or unreadable) — fall back to stack defaults below.
+	}
+	const gate = (name: string, fallback: string): QualityGate => ({
+		name,
+		command: scripts[name] ? `bun run ${name}` : fallback,
+	});
+	return [
+		gate("test", "bun test"),
+		gate("lint", "biome check ."),
+		gate("typecheck", "tsc --noEmit"),
+	];
 }
 
 /** Abort the wizard cleanly if the user cancelled a prompt. */
@@ -219,7 +247,50 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		}),
 	);
 
-	// 6. Summary -----------------------------------------------------------
+	// 6. Orchestration & merge --------------------------------------------
+	const canonicalBranch = currentConfig.project.canonicalBranch;
+	const suggestedGates = detectQualityGates(currentConfig.project.root || ".");
+	const chosenGateNames = ensure(
+		await p.multiselect({
+			message:
+				"Quality gates to run on a worker's output (used by skill distillation and 'on gates pass' auto-merge)",
+			options: suggestedGates.map((g) => ({ value: g.name, label: g.name, hint: g.command })),
+			initialValues: suggestedGates.map((g) => g.name),
+			required: false,
+		}),
+	) as string[];
+	const qualityGates = suggestedGates.filter((g) => chosenGateNames.includes(g.name));
+
+	const autoMerge = ensure(
+		await p.select({
+			message: `Auto-merge a worker's branch into ${canonicalBranch} when it finishes?`,
+			initialValue: "off",
+			options: [
+				{ value: "off", label: "Never — merge manually", hint: "default; safest" },
+				{
+					value: "on-gates-pass",
+					label: "On quality gates pass",
+					hint: qualityGates.length
+						? "merge only when gates are green"
+						: "needs gates — will hold otherwise",
+				},
+				{
+					value: "on-complete",
+					label: "On complete",
+					hint: "merge as soon as the agent finishes (no gate check)",
+				},
+			],
+		}),
+	) as AutoMergeMode;
+
+	if (autoMerge === "on-gates-pass" && qualityGates.length === 0) {
+		p.note(
+			"No quality gates selected, so 'on gates pass' will hold every merge for manual review.\nAdd gates or pick a different mode to actually auto-merge.",
+			"Heads up",
+		);
+	}
+
+	// 7. Summary -----------------------------------------------------------
 	const previewProvider = buildProviderConfig(spec, model, authMode, baseUrl);
 	const authSummary: Record<AuthMode, string> = {
 		subscription: `subscription / ${runtimeCli(spec.subscriptionRuntime ?? runtime)} login (no key stored)`,
@@ -234,6 +305,8 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			`runtime:   ${runtime}`,
 			`auth:      ${authSummary[authMode]}`,
 			previewProvider.baseUrl ? `base URL:  ${previewProvider.baseUrl}` : undefined,
+			`gates:     ${qualityGates.length ? qualityGates.map((g) => g.name).join(", ") : "none"}`,
+			`auto-merge:${autoMerge}`,
 		]
 			.filter(Boolean)
 			.join("\n"),
@@ -248,6 +321,8 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		baseUrl,
 		runtime,
 	});
+	config.merge = { ...config.merge, autoMerge };
+	if (qualityGates.length) config.project = { ...config.project, qualityGates };
 
 	p.outro("Ready to write configuration.");
 	return secret ? { config, secret } : { config };

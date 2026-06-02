@@ -45,6 +45,13 @@ describe("loadConfig", () => {
 		expect(cfg.merge.aiResolveEnabled).toBe(true);
 	});
 
+	test("an old config without merge.autoMerge inherits the 'off' default (deep merge)", () => {
+		writeConfig(root, "config.yaml", "merge:\n  aiResolveEnabled: true\n");
+		const cfg = loadConfig(root);
+		expect(cfg.merge.autoMerge).toBe("off");
+		expect(cfg.merge.aiResolveEnabled).toBe(true);
+	});
+
 	test("config.local.yaml overrides config.yaml", () => {
 		writeConfig(root, "config.yaml", "runtime:\n  default: claude\n");
 		writeConfig(root, "config.local.yaml", "runtime:\n  default: gemini\n");
@@ -73,6 +80,17 @@ describe("validateConfig", () => {
 
 	test("accepts the defaults", () => {
 		expect(() => validateConfig(structuredClone(DEFAULT_CONFIG))).not.toThrow();
+	});
+
+	test("auto-merge defaults to off", () => {
+		expect(DEFAULT_CONFIG.merge.autoMerge).toBe("off");
+	});
+
+	test("rejects an unknown merge.autoMerge mode", () => {
+		const cfg = structuredClone(DEFAULT_CONFIG);
+		// @ts-expect-error intentionally invalid value
+		cfg.merge.autoMerge = "always";
+		expect(() => validateConfig(cfg)).toThrow();
 	});
 });
 
