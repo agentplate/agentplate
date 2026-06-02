@@ -127,6 +127,11 @@ export interface ProviderConfig {
 	authTokenEnv?: string;
 	/** Default model id for this provider. */
 	model?: string;
+	/**
+	 * Per-capability model overrides (tiering): e.g. a fast/cheap model for
+	 * `scout`/`reviewer` and a strong model for `builder`. Falls back to `model`.
+	 */
+	models?: Partial<Record<Capability, string>>;
 }
 
 /** Orchestration limits and agent registry locations. */
