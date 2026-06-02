@@ -626,22 +626,33 @@ export function postTask(
 	const specFile = join(specDir, `${taskId}.md`);
 	writeFileSync(specFile, `# Task ${taskId}\n\n${prompt}\n`, "utf8");
 
-	const proc = Bun.spawn(
-		[
-			"agentplate",
-			"sling",
-			taskId,
-			"--capability",
-			capability,
-			"--spec",
-			specFile,
-			"--project",
-			ctx.root,
-		],
-		{ cwd: ctx.root, stdout: "ignore", stderr: "ignore", stdin: "ignore" },
-	);
-	proc.unref();
-	return { accepted: true, taskId, capability };
+	// The spec above is the durable task intent — GET /api/tasks surfaces it as a
+	// queued task even with no worker running. The detached sling is best-effort:
+	// if the `agentplate` binary isn't resolvable (e.g. not on PATH), log and still
+	// accept the task rather than 500-ing after the spec was persisted.
+	let spawned = false;
+	try {
+		const proc = Bun.spawn(
+			[
+				"agentplate",
+				"sling",
+				taskId,
+				"--capability",
+				capability,
+				"--spec",
+				specFile,
+				"--project",
+				ctx.root,
+			],
+			{ cwd: ctx.root, stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+		);
+		proc.unref();
+		spawned = true;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`[agentplate] failed to spawn worker for task ${taskId}: ${message}`);
+	}
+	return { accepted: true, taskId, capability, spawned };
 }
 
 /** Resolve a path to a route + params, or null. */
