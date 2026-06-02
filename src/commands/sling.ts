@@ -31,7 +31,7 @@ import {
 	packageAgentDefPath,
 	sessionsDbPath,
 } from "../paths.ts";
-import { getRuntime } from "../runtimes/registry.ts";
+import { getRuntime, runtimeNameForCapability } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { retrieveSkillsForSpawn } from "../skills/lifecycle.ts";
@@ -159,7 +159,18 @@ export function createSlingCommand(): Command {
 				});
 
 				// 3. Overlay (base definition + assignment + skills) → instruction file.
-				const runtime = getRuntime(opts.runtime ?? config.runtime.default, config.runtime.default);
+				const runtime = getRuntime(
+					runtimeNameForCapability(config.runtime, capability, opts.runtime),
+					config.runtime.default,
+				);
+				// Surface project skip-defaults as constraints the spawning agent obeys.
+				const skipDirectives: string[] = [];
+				if (def.canSpawn && config.agents.skipScout) {
+					skipDirectives.push("Skip the scout step — dispatch builders directly (--skip-scout).");
+				}
+				if (def.canSpawn && config.agents.skipReview) {
+					skipDirectives.push("Skip the reviewer step before integrating (--skip-review).");
+				}
 				const overlayConfig: OverlayConfig = {
 					agentName: name,
 					capability,
@@ -173,7 +184,7 @@ export function createSlingCommand(): Command {
 					baseDefinition: readBaseDefinition(root, def.file),
 					canSpawn: def.canSpawn,
 					qualityGates: config.project.qualityGates ?? [],
-					constraints: def.constraints,
+					constraints: [...def.constraints, ...skipDirectives],
 					siblings: opts.siblings ? opts.siblings.split(",").map((s) => s.trim()) : undefined,
 					skillsOverlay: skillsOverlay || undefined,
 				};

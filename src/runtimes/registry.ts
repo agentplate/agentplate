@@ -8,6 +8,7 @@
  */
 
 import { ValidationError } from "../errors.ts";
+import type { Capability, RuntimeConfig } from "../types.ts";
 import { ClaudeRuntime } from "./claude.ts";
 import { CodexRuntime } from "./codex.ts";
 import { CursorRuntime } from "./cursor.ts";
@@ -52,6 +53,18 @@ export function getRuntime(name?: string, fallback?: string): AgentRuntime {
 		);
 	}
 	return factory();
+}
+
+/**
+ * Resolve which runtime adapter drives a given capability: an explicit `override`
+ * wins, then a per-capability entry in `runtime.capabilities`, then the default.
+ */
+export function runtimeNameForCapability(
+	runtime: RuntimeConfig,
+	capability: Capability,
+	override?: string,
+): string {
+	return override ?? runtime.capabilities?.[capability] ?? runtime.default;
 }
 
 /**

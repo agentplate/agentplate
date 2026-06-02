@@ -92,6 +92,20 @@ describe("validateConfig", () => {
 		cfg.merge.autoMerge = "always";
 		expect(() => validateConfig(cfg)).toThrow();
 	});
+
+	test("turn timeout + skip defaults are off", () => {
+		expect(DEFAULT_CONFIG.agents.turnTimeoutMinutes).toBe(0);
+		expect(DEFAULT_CONFIG.agents.skipScout).toBe(false);
+		expect(DEFAULT_CONFIG.agents.skipReview).toBe(false);
+		expect(DEFAULT_CONFIG.agents.skipGates).toBe(false);
+		expect(DEFAULT_CONFIG.agents.skipSkills).toBe(false);
+	});
+
+	test("rejects a negative turnTimeoutMinutes", () => {
+		const cfg = structuredClone(DEFAULT_CONFIG);
+		cfg.agents.turnTimeoutMinutes = -1;
+		expect(() => validateConfig(cfg)).toThrow();
+	});
 });
 
 describe("isInitialized / serializeConfig", () => {
