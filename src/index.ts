@@ -35,6 +35,7 @@ import { createStatusCommand } from "./commands/status.ts";
 import { createStopCommand } from "./commands/stop.ts";
 import { createTuiCommand } from "./commands/tui.ts";
 import { createTurnCommand } from "./commands/turn.ts";
+import { createWatchCommand } from "./commands/watch.ts";
 import { createWorktreeCommand } from "./commands/worktree.ts";
 import { setProjectRootOverride } from "./config.ts";
 import { isAgentplateError } from "./errors.ts";
@@ -98,6 +99,7 @@ function buildProgram(): Command {
 	program.addCommand(createCoordinatorCommand());
 	program.addCommand(createSlingCommand());
 	program.addCommand(createTurnCommand());
+	program.addCommand(createWatchCommand());
 	program.addCommand(createSpecCommand());
 	program.addCommand(createStatusCommand());
 	program.addCommand(createMailCommand());

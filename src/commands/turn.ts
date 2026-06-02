@@ -12,19 +12,15 @@
  * call is one fresh, resumed runtime subprocess.
  */
 
-import { existsSync } from "node:fs";
 import { Command } from "commander";
-import { driveTurn } from "../agents/drive.ts";
-import { buildDefaultManifest, getDefinition, loadManifest } from "../agents/manifest.ts";
+import { driveAgentTurn } from "../agents/drive.ts";
 import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
-import { eventsDbPath, manifestFilePath, sessionsDbPath } from "../paths.ts";
-import { getRuntime } from "../runtimes/registry.ts";
-import { resolveModel } from "../runtimes/resolve.ts";
+import { eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { SessionState } from "../types.ts";
 
@@ -60,34 +56,13 @@ export function createTurnCommand(): Command {
 					);
 				}
 
-				const manifestPath = manifestFilePath(root);
-				const manifest = existsSync(manifestPath)
-					? loadManifest(manifestPath)
-					: buildDefaultManifest();
-				const def = getDefinition(manifest, session.capability);
-				const runtime = getRuntime(config.runtime.default, config.runtime.default);
-				const model = resolveModel(config, root, def.model, session.capability);
-
-				// The next turn's user text is the agent's unread mail (e.g. a child's
-				// reply or operator direction); fall back to a continue nudge.
-				const injected = mail.checkInject(agent);
-				const prompt =
-					injected.trim().length > 0
-						? injected
-						: "Continue your task. If it is complete, send your terminal mail.";
-
-				const { finalState, exitCode } = await driveTurn({
+				const { finalState, exitCode } = await driveAgentTurn({
 					root,
 					config,
-					runtime,
+					session,
 					store,
 					events,
 					mail,
-					session,
-					model,
-					prompt,
-					// Warm start: resume the runtime session captured on a prior turn.
-					resumeSessionId: session.runtimeSessionId ?? undefined,
 				});
 
 				if (useJson) {
