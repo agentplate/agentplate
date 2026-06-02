@@ -22,8 +22,9 @@ export const agentStateDir = (root: string, agentName: string): string =>
 	join(root, AGENTPLATE_DIR, "agents", agentName);
 export const appliedSkillsPath = (root: string, agentName: string): string =>
 	join(agentStateDir(root, agentName), "applied-skills.json");
+export const specsDir = (root: string): string => join(root, AGENTPLATE_DIR, "specs");
 export const specPath = (root: string, taskId: string): string =>
-	join(root, AGENTPLATE_DIR, "specs", `${taskId}.md`);
+	join(specsDir(root), `${taskId}.md`);
 
 /**
  * Path to a bundled base agent definition shipped with the package

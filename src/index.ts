@@ -30,6 +30,7 @@ import { createSetupCommand } from "./commands/setup.ts";
 import { createShipCommand } from "./commands/ship.ts";
 import { createSkillCommand } from "./commands/skill.ts";
 import { createSlingCommand } from "./commands/sling.ts";
+import { createSpecCommand } from "./commands/spec.ts";
 import { createStatusCommand } from "./commands/status.ts";
 import { createStopCommand } from "./commands/stop.ts";
 import { createTuiCommand } from "./commands/tui.ts";
@@ -95,6 +96,7 @@ function buildProgram(): Command {
 	// Orchestration
 	program.addCommand(createCoordinatorCommand());
 	program.addCommand(createSlingCommand());
+	program.addCommand(createSpecCommand());
 	program.addCommand(createStatusCommand());
 	program.addCommand(createMailCommand());
 	program.addCommand(createMergeCommand());
