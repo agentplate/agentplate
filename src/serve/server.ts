@@ -221,23 +221,25 @@ export function startServer(opts: ServeOptions): ServeHandle {
 	// Idle-agent reaper: terminate workers idle past the configured timeout. Runs
 	// independently of connected clients (serve running = reaping active). Disabled
 	// when idleTimeoutMinutes is 0. Config is read once at startup.
-	const idleMinutes = (() => {
+	const { idleMinutes, purgeOnReap } = (() => {
 		try {
-			return loadConfig(opts.root).agents.idleTimeoutMinutes;
+			const agents = loadConfig(opts.root).agents;
+			return { idleMinutes: agents.idleTimeoutMinutes, purgeOnReap: agents.purgeOnReap };
 		} catch {
-			return 0;
+			return { idleMinutes: 0, purgeOnReap: false };
 		}
 	})();
 	const reapTimer =
 		idleMinutes > 0
 			? setInterval(() => {
 					const store = createSessionStore(sessionsDbPath(opts.root));
-					reapIdleSessions(store, opts.root, { idleMs: idleMinutes * 60_000 })
+					reapIdleSessions(store, opts.root, { idleMs: idleMinutes * 60_000, purge: purgeOnReap })
 						.then((reaped) => {
 							if (reaped.length > 0) {
 								const names = reaped.map((r) => r.agentName).join(", ");
+								const how = purgeOnReap ? "reaped + purged" : "reaped";
 								console.error(
-									`[agentplate] reaped ${reaped.length} idle agent(s) (>${idleMinutes}m): ${names}`,
+									`[agentplate] ${how} ${reaped.length} idle agent(s) (>${idleMinutes}m): ${names}`,
 								);
 							}
 						})

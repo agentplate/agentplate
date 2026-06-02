@@ -384,6 +384,13 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		agents.skipReview = skips.includes("skipReview");
 		agents.skipGates = skips.includes("skipGates");
 		agents.skipSkills = skips.includes("skipSkills");
+
+		agents.purgeOnReap = ensure(
+			await p.confirm({
+				message: "Fully erase idle agents when reaped (mail, events, merges, files, session)?",
+				initialValue: agents.purgeOnReap,
+			}),
+		);
 	}
 
 	// 7. Summary -----------------------------------------------------------
@@ -403,6 +410,7 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			previewProvider.baseUrl ? `base URL:  ${previewProvider.baseUrl}` : undefined,
 			`gates:     ${qualityGates.length ? qualityGates.map((g) => g.name).join(", ") : "none"}`,
 			`auto-merge:${autoMerge}`,
+			agents.purgeOnReap ? "purge-on-reap: on (idle agents fully erased)" : undefined,
 			modelsByCapability?.scout
 				? `fast model: ${modelsByCapability.scout} (scout, reviewer)`
 				: undefined,

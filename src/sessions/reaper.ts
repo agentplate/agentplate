@@ -15,9 +15,13 @@
  * worktree IS the project root, and it does not stream per-turn events).
  */
 
-import { worktreesDir } from "../paths.ts";
+import { createEventStore } from "../events/store.ts";
+import { createMailStore } from "../mail/store.ts";
+import { createMergeQueue } from "../merge/queue.ts";
+import { eventsDbPath, mailDbPath, mergeDbPath, worktreesDir } from "../paths.ts";
 import type { AgentSession, SessionState } from "../types.ts";
 import { deleteBranch, removeWorktree, worktreeExists } from "../worktree/manager.ts";
+import { type PurgeReport, purgeAgentData } from "./purge.ts";
 import type { SessionStore } from "./store.ts";
 
 /** States that can be reaped — the pre-terminal (still-counted) ones. */
@@ -62,6 +66,8 @@ export interface ReapedAgent {
 	idleMs: number;
 	/** Whether its worktree was removed (false if kept, missing, or removal failed). */
 	worktreeRemoved: boolean;
+	/** What a full data purge removed, or null when purge was not requested. */
+	purged: PurgeReport | null;
 }
 
 export interface ReapOptions {
@@ -71,6 +77,13 @@ export interface ReapOptions {
 	now?: number;
 	/** Remove the reaped agent's worktree + branch (default true). */
 	removeWorktrees?: boolean;
+	/**
+	 * Fully erase each reaped agent's data — mail, events, queued merges, on-disk
+	 * state dir, and the session row itself — so nothing of it remains ("clear the
+	 * Office"). Default false: reaping keeps records for history. When true, the
+	 * auxiliary stores are opened from `root` for the sweep and closed afterward.
+	 */
+	purge?: boolean;
 	/** Capabilities to skip (defaults to `["coordinator"]`). */
 	excludeCapabilities?: readonly string[];
 }
@@ -88,52 +101,80 @@ export async function reapIdleSessions(
 ): Promise<ReapedAgent[]> {
 	const now = opts.now ?? Date.now();
 	const removeWorktrees = opts.removeWorktrees !== false;
+	const purge = opts.purge === true;
 	const stale = selectIdleSessions(store.listSessions(), {
 		idleMs: opts.idleMs,
 		now,
 		excludeCapabilities: opts.excludeCapabilities,
 	});
 
+	// Open the auxiliary stores once for the whole sweep, only when purging. They
+	// share the session store's `root` and are closed in `finally` below.
+	const aux = purge
+		? {
+				events: createEventStore(eventsDbPath(root)),
+				merge: createMergeQueue(mergeDbPath(root)),
+				mail: createMailStore(mailDbPath(root)),
+			}
+		: null;
+
 	const reaped: ReapedAgent[] = [];
-	for (const s of stale) {
-		// 1. Kill any live process (spawn-per-turn workers usually have no pid).
-		if (s.pid != null) {
-			try {
-				process.kill(s.pid, "SIGTERM");
-			} catch {
-				// Already gone / not ours — nothing to do.
-			}
-		}
-
-		// 2. Remove the worktree + branch (guarded against the project root).
-		let worktreeRemoved = false;
-		if (removeWorktrees && isRemovableWorktree(root, s.worktreePath)) {
-			try {
-				if (await worktreeExists(root, s.worktreePath)) {
-					await removeWorktree(root, s.worktreePath, { force: true });
-				}
-				worktreeRemoved = true;
-				// Branch delete is separate and best-effort (no-op if already gone).
+	try {
+		for (const s of stale) {
+			// 1. Kill any live process (spawn-per-turn workers usually have no pid).
+			if (s.pid != null) {
 				try {
-					await deleteBranch(root, s.branchName);
+					process.kill(s.pid, "SIGTERM");
 				} catch {
-					// Branch may be merged away or shared — leave it.
+					// Already gone / not ours — nothing to do.
 				}
-			} catch {
-				worktreeRemoved = false;
 			}
+
+			// 2. Remove the worktree + branch (guarded against the project root).
+			let worktreeRemoved = false;
+			if (removeWorktrees && isRemovableWorktree(root, s.worktreePath)) {
+				try {
+					if (await worktreeExists(root, s.worktreePath)) {
+						await removeWorktree(root, s.worktreePath, { force: true });
+					}
+					worktreeRemoved = true;
+					// Branch delete is separate and best-effort (no-op if already gone).
+					try {
+						await deleteBranch(root, s.branchName);
+					} catch {
+						// Branch may be merged away or shared — leave it.
+					}
+				} catch {
+					worktreeRemoved = false;
+				}
+			}
+
+			// 3. Mark the session terminated so it stops counting and shows as stopped.
+			//    (When purging, the row is deleted in step 4 — but we still transition it
+			//    first so any concurrent reader observes a terminal state, never a gap.)
+			store.updateSessionState(s.id, "stopped");
+
+			// 4. Optionally erase every trace of the agent so the workspace is cleared.
+			let purged: PurgeReport | null = null;
+			if (aux) {
+				purged = purgeAgentData(root, s, { sessions: store, ...aux });
+			}
+
+			reaped.push({
+				id: s.id,
+				agentName: s.agentName,
+				capability: s.capability,
+				idleMs: now - Date.parse(s.lastActivity),
+				worktreeRemoved,
+				purged,
+			});
 		}
-
-		// 3. Mark the session terminated so it stops counting and shows as stopped.
-		store.updateSessionState(s.id, "stopped");
-
-		reaped.push({
-			id: s.id,
-			agentName: s.agentName,
-			capability: s.capability,
-			idleMs: now - Date.parse(s.lastActivity),
-			worktreeRemoved,
-		});
+	} finally {
+		if (aux) {
+			aux.events.close();
+			aux.merge.close();
+			aux.mail.close();
+		}
 	}
 	return reaped;
 }

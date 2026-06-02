@@ -42,6 +42,12 @@ export interface ListEventsFilter {
 export interface EventStore {
 	record(event: RecordEventInput): EventRecord;
 	list(filter?: ListEventsFilter): EventRecord[];
+	/**
+	 * Delete every event logged by `agentName` (optionally scoped to one run);
+	 * returns the number of rows removed. Used when fully purging a reaped agent's
+	 * data. The log is otherwise append-only — this is the sole deletion path.
+	 */
+	deleteByAgent(agentName: string, runId?: string): number;
 	close(): void;
 }
 
@@ -193,9 +199,26 @@ export function createEventStore(dbPath: string): EventStore {
 		return rows.map(rowToRecord);
 	}
 
+	function deleteByAgent(agentName: string, runId?: string): number {
+		// Count first so we can report how many rows were removed (bun:sqlite's
+		// run() does not surface a changes count through this query API uniformly).
+		const where =
+			runId !== undefined
+				? "agent_name = $agent_name AND run_id = $run_id"
+				: "agent_name = $agent_name";
+		const params: Record<string, string> = { $agent_name: agentName };
+		if (runId !== undefined) params.$run_id = runId;
+		const countRow = db.query(`SELECT COUNT(*) AS n FROM events WHERE ${where}`).get(params) as {
+			n: number;
+		} | null;
+		const n = countRow?.n ?? 0;
+		if (n > 0) db.query(`DELETE FROM events WHERE ${where}`).run(params);
+		return n;
+	}
+
 	function close(): void {
 		db.close();
 	}
 
-	return { record, list, close };
+	return { record, list, deleteByAgent, close };
 }

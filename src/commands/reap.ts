@@ -6,6 +6,11 @@
  * live process, and removes its worktree + branch. The coordinator is never
  * reaped. Run it manually or on a cron; `agentplate serve` also reaps on its own
  * loop. Use `--dry-run` to preview and `--keep-worktrees` to leave worktrees.
+ *
+ * `--purge` goes further than a normal reap: it erases every trace of each reaped
+ * agent — mail, events, queued merges, the on-disk `.agentplate/agents/<name>/`
+ * state dir, and the session row itself — so the workspace is fully cleared. The
+ * plain reap keeps those records for history; purge is the opt-in clean slate.
  */
 
 import { Command } from "commander";
@@ -22,11 +27,21 @@ export function createReapCommand(): Command {
 		.description("Terminate agents idle past the timeout (stop + kill + remove worktree)")
 		.option("--minutes <n>", "idle timeout in minutes (default: config.agents.idleTimeoutMinutes)")
 		.option("--keep-worktrees", "mark stopped + kill process but keep worktrees/branches")
+		.option(
+			"--purge",
+			"fully erase each reaped agent (mail, events, merges, state dir, session row)",
+		)
 		.option("--dry-run", "list which agents would be reaped without changing anything")
 		.option("--json", "output JSON")
 		.action(
 			async (
-				opts: { minutes?: string; keepWorktrees?: boolean; dryRun?: boolean; json?: boolean },
+				opts: {
+					minutes?: string;
+					keepWorktrees?: boolean;
+					purge?: boolean;
+					dryRun?: boolean;
+					json?: boolean;
+				},
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
@@ -51,11 +66,12 @@ export function createReapCommand(): Command {
 							now: Date.now(),
 						}).map((s) => ({ agent: s.agentName, capability: s.capability, state: s.state }));
 						if (useJson) {
-							jsonOutput({ dryRun: true, minutes, candidates });
+							jsonOutput({ dryRun: true, minutes, purge: opts.purge === true, candidates });
 						} else if (candidates.length === 0) {
 							printInfo(`No agents idle longer than ${minutes}m.`);
 						} else {
-							printInfo(`Would reap ${candidates.length} agent(s) idle >${minutes}m:`);
+							const how = opts.purge ? "reap + purge" : "reap";
+							printInfo(`Would ${how} ${candidates.length} agent(s) idle >${minutes}m:`);
 							for (const c of candidates) {
 								process.stdout.write(`  ${c.agent} ${muted(`(${c.capability}, ${c.state})`)}\n`);
 							}
@@ -66,17 +82,24 @@ export function createReapCommand(): Command {
 					const reaped = await reapIdleSessions(store, root, {
 						idleMs,
 						removeWorktrees: opts.keepWorktrees !== true,
+						purge: opts.purge === true,
 					});
 
 					if (useJson) {
-						jsonOutput({ minutes, reapedCount: reaped.length, reaped });
+						jsonOutput({ minutes, purge: opts.purge === true, reapedCount: reaped.length, reaped });
 					} else if (reaped.length === 0) {
 						printInfo(`No agents idle longer than ${minutes}m.`);
 					} else {
-						printSuccess(`Reaped ${reaped.length} idle agent(s) (>${minutes}m):`);
+						const verb = opts.purge ? "Reaped + purged" : "Reaped";
+						printSuccess(`${verb} ${reaped.length} idle agent(s) (>${minutes}m):`);
 						for (const r of reaped) {
 							const wt = r.worktreeRemoved ? "worktree removed" : "worktree kept";
-							process.stdout.write(`  ${r.agentName} ${muted(`(${r.capability}, ${wt})`)}\n`);
+							const extra = r.purged
+								? `, purged ${r.purged.mailDeleted} mail/${r.purged.eventsDeleted} events/${r.purged.mergeDeleted} merges`
+								: "";
+							process.stdout.write(
+								`  ${r.agentName} ${muted(`(${r.capability}, ${wt}${extra})`)}\n`,
+							);
 						}
 					}
 				} finally {
