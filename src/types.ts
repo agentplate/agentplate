@@ -150,10 +150,20 @@ export interface AgentsConfig {
 	idleTimeoutMinutes: number;
 }
 
-/** Conflict-resolution behavior for merging agent branches. */
+/**
+ * When a completed worker's branch is auto-merged into the canonical branch.
+ * - `off`: never (the operator/coordinator merges manually) — the default.
+ * - `on-gates-pass`: merge only if the task's quality gates pass.
+ * - `on-complete`: merge as soon as the agent finishes without error.
+ */
+export type AutoMergeMode = "off" | "on-gates-pass" | "on-complete";
+
+/** Conflict-resolution and auto-merge behavior for merging agent branches. */
 export interface MergeConfig {
 	/** Allow AI-assisted resolution of semantic conflicts. */
 	aiResolveEnabled: boolean;
+	/** When to auto-merge a completed worker's branch into the canonical branch. */
+	autoMerge: AutoMergeMode;
 }
 
 /** Logging behavior. */

@@ -13,7 +13,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import yaml from "js-yaml";
 import { ConfigError } from "./errors.ts";
-import type { AgentplateConfig } from "./types.ts";
+import type { AgentplateConfig, AutoMergeMode } from "./types.ts";
 
 /** Directory (relative to project root) holding all Agentplate state. */
 export const AGENTPLATE_DIR = ".agentplate";
@@ -46,6 +46,7 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 	},
 	merge: {
 		aiResolveEnabled: true,
+		autoMerge: "off",
 	},
 	skills: {
 		enabled: true,
@@ -174,6 +175,10 @@ export function validateConfig(config: AgentplateConfig): void {
 		throw new ConfigError(
 			"config.agents.idleTimeoutMinutes must be >= 0 (0 disables idle reaping)",
 		);
+	}
+	const autoMergeModes: AutoMergeMode[] = ["off", "on-gates-pass", "on-complete"];
+	if (!autoMergeModes.includes(config.merge.autoMerge)) {
+		throw new ConfigError(`config.merge.autoMerge must be one of: ${autoMergeModes.join(", ")}`);
 	}
 }
 
