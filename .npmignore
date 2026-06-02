@@ -1,0 +1,23 @@
+# Tests and fixtures — not needed in the published package.
+*.test.ts
+*.test.tsx
+src/test-helpers.ts
+src/test-setup.ts
+
+# Dev/CI/meta — never publish.
+.github/
+.agentplate/
+CONTRIBUTING.md
+SECURITY.md
+install.sh
+
+# UI sources — only the built ui/dist ships (allowlisted in package.json "files").
+ui/src/
+ui/node_modules/
+ui/index.html
+ui/vite.config.ts
+ui/tsconfig.json
+ui/package.json
+ui/bun.lock
+ui/README.md
+ui/.gitignore

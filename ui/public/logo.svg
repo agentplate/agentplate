@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Agentplate">
+  <!-- Plate & Spark — app coral. Recolor by changing the two fills/strokes. -->
+  <defs>
+    <path id="ap-ray-full" d="M -3.2,-14 L -1.8,-40 Q0,-44 1.8,-40 L 3.2,-14 Q0,-11 -3.2,-14 Z"/>
+  </defs>
+  <circle cx="60" cy="60" r="46" fill="none" stroke="#fb4b38" stroke-width="7"/>
+  <g transform="translate(60,60)" fill="#fb4b38">
+    <use href="#ap-ray-full"/>
+    <use href="#ap-ray-full" transform="rotate(45)"/>
+    <use href="#ap-ray-full" transform="rotate(90)"/>
+    <use href="#ap-ray-full" transform="rotate(135)"/>
+    <use href="#ap-ray-full" transform="rotate(180)"/>
+    <use href="#ap-ray-full" transform="rotate(225)"/>
+    <use href="#ap-ray-full" transform="rotate(270)"/>
+    <use href="#ap-ray-full" transform="rotate(315)"/>
+    <circle cx="0" cy="0" r="8.5"/>
+  </g>
+</svg>

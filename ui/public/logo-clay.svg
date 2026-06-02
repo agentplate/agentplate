@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Agentplate">
+  <!-- Plate & Spark — Claude clay palette (the approved exploration colorway):
+       ink plate ring + clay spark with an ink hub. For light/ivory surfaces. -->
+  <defs>
+    <path id="ap-ray-clay" d="M -3.2,-14 L -1.8,-40 Q0,-44 1.8,-40 L 3.2,-14 Q0,-11 -3.2,-14 Z"/>
+  </defs>
+  <circle cx="60" cy="60" r="46" fill="none" stroke="#1A1A18" stroke-width="6"/>
+  <g transform="translate(60,60)">
+    <g fill="#D97757">
+      <use href="#ap-ray-clay"/>
+      <use href="#ap-ray-clay" transform="rotate(45)"/>
+      <use href="#ap-ray-clay" transform="rotate(90)"/>
+      <use href="#ap-ray-clay" transform="rotate(135)"/>
+      <use href="#ap-ray-clay" transform="rotate(180)"/>
+      <use href="#ap-ray-clay" transform="rotate(225)"/>
+      <use href="#ap-ray-clay" transform="rotate(270)"/>
+      <use href="#ap-ray-clay" transform="rotate(315)"/>
+    </g>
+    <circle cx="0" cy="0" r="8.5" fill="#1A1A18"/>
+  </g>
+</svg>

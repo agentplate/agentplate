@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 150" width="560" height="150" role="img" aria-label="Agentplate">
+  <defs>
+    <path id="ray" d="M -3.2,-14 L -1.8,-40 Q0,-44 1.8,-40 L 3.2,-14 Q0,-11 -3.2,-14 Z"/>
+  </defs>
+  <!-- Plate & Spark mark -->
+  <circle cx="75" cy="75" r="46" fill="none" stroke="#fb4b38" stroke-width="7"/>
+  <g transform="translate(75,75)" fill="#fb4b38">
+    <use href="#ray"/>
+    <use href="#ray" transform="rotate(45)"/>
+    <use href="#ray" transform="rotate(90)"/>
+    <use href="#ray" transform="rotate(135)"/>
+    <use href="#ray" transform="rotate(180)"/>
+    <use href="#ray" transform="rotate(225)"/>
+    <use href="#ray" transform="rotate(270)"/>
+    <use href="#ray" transform="rotate(315)"/>
+    <circle cx="0" cy="0" r="8.5"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="156" y="96" font-family="Georgia, 'Times New Roman', 'Tiempos', serif" font-size="60" font-weight="700" letter-spacing="-1.5" fill="#fb4b38">Agentplate</text>
+</svg>

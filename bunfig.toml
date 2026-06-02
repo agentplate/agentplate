@@ -1,0 +1,5 @@
+[install]
+exact = false
+
+[test]
+# Colocated *.test.ts files are discovered automatically.

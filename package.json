@@ -1,0 +1,64 @@
+{
+	"name": "@agentplate/cli",
+	"version": "1.0.0",
+	"publishConfig": {
+		"access": "public"
+	},
+	"description": "Self-improving multi-agent orchestration that takes you from build → CI/CD → deploy. Interactive setup wizard, pluggable AI providers, agent swarms in git worktrees.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/agentplate/agentplate.git"
+	},
+	"homepage": "https://github.com/agentplate/agentplate",
+	"keywords": [
+		"ai",
+		"agents",
+		"orchestration",
+		"multi-agent",
+		"swarm",
+		"deploy",
+		"ci-cd",
+		"self-improving",
+		"cli",
+		"developer-tools"
+	],
+	"bin": {
+		"agentplate": "src/index.ts",
+		"ap": "src/index.ts"
+	},
+	"main": "src/index.ts",
+	"files": [
+		"src",
+		"agents",
+		"templates",
+		"ui/dist",
+		"LICENSE",
+		"CHANGELOG.md"
+	],
+	"engines": {
+		"bun": ">=1.0"
+	},
+	"scripts": {
+		"test": "bun test",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"typecheck": "tsc --noEmit",
+		"check": "bun test && biome check . && tsc --noEmit",
+		"build:ui": "cd ui && bun install && bun run build",
+		"prepack": "bun run build:ui"
+	},
+	"dependencies": {
+		"@clack/prompts": "^0.11.0",
+		"chalk": "^5.6.2",
+		"commander": "^14.0.3",
+		"js-yaml": "^4.1.1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.3.15",
+		"@types/bun": "latest",
+		"@types/js-yaml": "^4.0.9",
+		"typescript": "^5.9.0"
+	}
+}

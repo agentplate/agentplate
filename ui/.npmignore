@@ -1,0 +1,12 @@
+# Overrides ui/.gitignore for npm publishing: the built ui/dist MUST ship
+# (it is allowlisted in the root package.json "files"). Exclude only sources.
+# Patterns are anchored with a leading slash so they do NOT also match files
+# inside dist/ (e.g. /index.html must not exclude dist/index.html).
+/src/
+/node_modules/
+/index.html
+/vite.config.ts
+/tsconfig.json
+/package.json
+/bun.lock
+/README.md

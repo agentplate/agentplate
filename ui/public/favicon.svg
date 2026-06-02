@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Agentplate">
+  <defs>
+    <linearGradient id="ap-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff6a4d"/>
+      <stop offset="1" stop-color="#fb4b38"/>
+    </linearGradient>
+    <path id="ap-ray" d="M -3.2,-13 L -1.8,-38 Q0,-42 1.8,-38 L 3.2,-13 Q0,-10 -3.2,-13 Z"/>
+  </defs>
+  <rect x="4" y="4" width="112" height="112" rx="30" fill="url(#ap-tile)"/>
+  <g transform="translate(60,60)" fill="#FAF6EF">
+    <use href="#ap-ray"/>
+    <use href="#ap-ray" transform="rotate(45)"/>
+    <use href="#ap-ray" transform="rotate(90)"/>
+    <use href="#ap-ray" transform="rotate(135)"/>
+    <use href="#ap-ray" transform="rotate(180)"/>
+    <use href="#ap-ray" transform="rotate(225)"/>
+    <use href="#ap-ray" transform="rotate(270)"/>
+    <use href="#ap-ray" transform="rotate(315)"/>
+    <circle cx="0" cy="0" r="8"/>
+  </g>
+</svg>
