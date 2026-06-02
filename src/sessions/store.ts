@@ -56,6 +56,12 @@ export interface SessionStore {
 	updateSessionState(id: string, state: SessionState): void;
 	setRuntimeSessionId(id: string, runtimeSessionId: string): void;
 	touch(id: string): void;
+	/**
+	 * Permanently delete a session row by id (no-op if absent). Unlike
+	 * {@link updateSessionState}(id, "stopped") — which keeps the row for history —
+	 * this removes it entirely, used when fully purging a reaped agent's data.
+	 */
+	deleteSession(id: string): void;
 	countActive(runId?: string): number;
 	countActiveByParent(parentAgent: string, runId?: string): number;
 	// --- Lifecycle ---
@@ -312,6 +318,11 @@ export function createSessionStore(dbPath: string): SessionStore {
 		db.query("UPDATE sessions SET last_activity = ? WHERE id = ?").run(now, id);
 	}
 
+	function deleteSession(id: string): void {
+		// Hard delete. Safe to call for a missing id (DELETE simply affects 0 rows).
+		db.query("DELETE FROM sessions WHERE id = ?").run(id);
+	}
+
 	function countActive(runId?: string): number {
 		// Active = booting | working | idle (see ACTIVE_STATES). Used by schedulers
 		// to enforce per-run / global concurrency caps.
@@ -363,6 +374,7 @@ export function createSessionStore(dbPath: string): SessionStore {
 		updateSessionState,
 		setRuntimeSessionId,
 		touch,
+		deleteSession,
 		countActive,
 		countActiveByParent,
 		close,

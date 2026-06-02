@@ -4,6 +4,27 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Full purge of reaped agents** (`agentplate reap --purge`, `agentplate stop
+  <agent> --purge`) — beyond stopping an agent and removing its worktree, purge
+  erases every trace it left behind: mail, events, queued merges, the on-disk
+  `.agentplate/agents/<name>/` state dir, the task spec (only once no sibling
+  session still references it), and the session row itself. A `PurgeReport` records
+  what was removed.
+- **`agents.purgeOnReap`** (default `false`) — when set, the `agentplate serve`
+  idle-reaper loop purges idle agents automatically (not just marks them stopped).
+  Surfaced as a gated toggle in `agentplate setup`.
+- **Store deletion APIs** backing the purge: `SessionStore.deleteSession`,
+  `EventStore.deleteByAgent`, and `MergeQueue.deleteByAgent`.
+
+### Changed
+
+- Plain `reap` / `serve` behavior is unchanged — reaping still keeps records for
+  history by default. Full erasure is strictly opt-in via `--purge` / `purgeOnReap`.
+
 ## [1.3.0] — 2026-06-02
 
 ### Added

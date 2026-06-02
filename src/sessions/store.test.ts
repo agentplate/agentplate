@@ -344,6 +344,24 @@ describe("createSessionStore — file-backed database", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
+	test("deleteSession removes the row entirely (not just a state change)", () => {
+		const store = createSessionStore(":memory:");
+		try {
+			const run = store.createRun();
+			const session = makeSession({ runId: run.id, state: "idle" });
+			store.upsertSession(session);
+			expect(store.getSession(session.id)).not.toBeNull();
+
+			store.deleteSession(session.id);
+			expect(store.getSession(session.id)).toBeNull();
+			expect(store.countActive(run.id)).toBe(0);
+			// Deleting a missing id is a no-op (no throw).
+			expect(() => store.deleteSession("does-not-exist")).not.toThrow();
+		} finally {
+			store.close();
+		}
+	});
+
 	test("creates the parent directory and persists across reopen", () => {
 		// Point at a NON-existent nested path to exercise the mkdir-parent logic.
 		const dbPath = join(dir, "nested", "sessions.db");

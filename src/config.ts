@@ -48,6 +48,7 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 		skipReview: false,
 		skipGates: false,
 		skipSkills: false,
+		purgeOnReap: false,
 	},
 	merge: {
 		aiResolveEnabled: true,

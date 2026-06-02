@@ -180,4 +180,26 @@ describe("createEventStore", () => {
 		// Newest two builder events.
 		expect(limited.map((e) => e.type)).toEqual(["c", "b"]);
 	});
+
+	test("deleteByAgent removes only that agent's rows and returns the count", () => {
+		store.record({ agentName: "builder", type: "a" });
+		store.record({ agentName: "builder", type: "b" });
+		store.record({ agentName: "scout", type: "a" });
+
+		expect(store.deleteByAgent("builder")).toBe(2);
+		expect(store.list({ agentName: "builder" })).toEqual([]);
+		expect(store.list({ agentName: "scout" }).length).toBe(1);
+	});
+
+	test("deleteByAgent scoped to a run leaves the agent's other runs intact", () => {
+		store.record({ agentName: "builder", runId: "r1", type: "a" });
+		store.record({ agentName: "builder", runId: "r2", type: "b" });
+
+		expect(store.deleteByAgent("builder", "r1")).toBe(1);
+		expect(store.list({ agentName: "builder" }).map((e) => e.runId)).toEqual(["r2"]);
+	});
+
+	test("deleteByAgent on an unknown agent returns 0", () => {
+		expect(store.deleteByAgent("nobody")).toBe(0);
+	});
 });

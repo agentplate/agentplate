@@ -167,6 +167,14 @@ export interface AgentsConfig {
 	skipGates: boolean;
 	/** Skip the post-turn skill-distillation loop. */
 	skipSkills: boolean;
+	/**
+	 * When the idle reaper fires (in `agentplate serve`'s loop), also fully erase
+	 * each reaped agent — mail, events, queued merges, on-disk state dir, and the
+	 * session row — so the workspace is cleared, not just stopped. Default false
+	 * (reaping keeps records for history). The `agentplate reap --purge` flag does
+	 * the same on demand regardless of this setting.
+	 */
+	purgeOnReap: boolean;
 }
 
 /**

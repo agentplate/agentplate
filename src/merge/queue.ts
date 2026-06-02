@@ -36,6 +36,12 @@ export interface MergeQueue {
 	 * The returned object reflects its pre-removal `status` ("pending").
 	 */
 	dequeue(): MergeEntry | null;
+	/**
+	 * Delete every queue entry belonging to `agentName` regardless of status;
+	 * returns the number removed. Used when fully purging a reaped agent's data so
+	 * no stale pending merge survives the agent it came from.
+	 */
+	deleteByAgent(agentName: string): number;
 	/** Close the underlying database connection. */
 	close(): void;
 }
@@ -131,6 +137,14 @@ export function createMergeQueue(dbPath: string): MergeQueue {
 		"DELETE FROM merge_queue WHERE seq = $seq",
 	);
 
+	const countByAgentStmt = db.query<{ n: number }, { $agent: string }>(
+		"SELECT COUNT(*) AS n FROM merge_queue WHERE agent_name = $agent",
+	);
+
+	const deleteByAgentStmt = db.query<void, { $agent: string }>(
+		"DELETE FROM merge_queue WHERE agent_name = $agent",
+	);
+
 	return {
 		enqueue(entry): MergeEntry {
 			const row = insertStmt.get({
@@ -168,6 +182,12 @@ export function createMergeQueue(dbPath: string): MergeQueue {
 			// even if two entries somehow shared other column values.
 			deleteBySeqStmt.run({ $seq: row.seq });
 			return rowToEntry(row);
+		},
+
+		deleteByAgent(agentName): number {
+			const n = countByAgentStmt.get({ $agent: agentName })?.n ?? 0;
+			if (n > 0) deleteByAgentStmt.run({ $agent: agentName });
+			return n;
 		},
 
 		close(): void {

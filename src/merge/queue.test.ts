@@ -133,4 +133,19 @@ describe("createMergeQueue", () => {
 			queue = createMergeQueue(join(dir, "merge-queue.db"));
 		}
 	});
+
+	test("deleteByAgent removes every entry for the agent and returns the count", () => {
+		add({ agentName: "builder-1", branchName: "agent/a" });
+		add({ agentName: "builder-1", branchName: "agent/b" });
+		add({ agentName: "builder-2", branchName: "agent/c" });
+
+		expect(queue.deleteByAgent("builder-1")).toBe(2);
+		const pending = queue.listPending();
+		expect(pending).toHaveLength(1);
+		expect(pending[0]?.agentName).toBe("builder-2");
+	});
+
+	test("deleteByAgent on an unknown agent returns 0", () => {
+		expect(queue.deleteByAgent("nobody")).toBe(0);
+	});
 });
