@@ -22,6 +22,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#features">Features</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#architecture">Architecture</a> ·
@@ -33,6 +34,45 @@
 > **v1.0.0 — first public release.** The orchestration engine, provider wizard,
 > self-improving skills, multi-runtime support, the web UI (`agentplate serve`),
 > and the build→deploy pipeline are all working and tested.
+
+## Screenshots
+
+Everything below is a single running **`agentplate serve`** — the CLI, the live TUI,
+and this web UI all read the same SQLite stores, so the dashboard is a true mirror of
+the swarm, not a mock.
+
+<p align="center">
+  <img src="assets/screenshots/dashboard.png" alt="Mission Control — the whole agent swarm at a glance" width="860" />
+  <br /><sub><b>Mission Control</b> — every agent and its live state at a glance.</sub>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/office.png" alt="The Office — agents act out their work in a 3D voxel office" width="860" />
+  <br /><sub><b>The Office</b> — a 3D voxel floor where each role acts out its work and the coordinator presides from the corner office.</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="33%" align="center"><img src="assets/screenshots/costs.png" alt="Token & cost analytics" /><br /><sub><b>Costs & analytics</b><br />tokens + spend, by agent and by day</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/skills.png" alt="Self-improving skill library" /><br /><sub><b>Self-improving skills</b><br />distilled playbooks ranked by confidence</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/handoffs.png" alt="Agent-to-agent handoffs" /><br /><sub><b>Handoffs</b><br />the agent coordination protocol, live</sub></td>
+  </tr>
+  <tr>
+    <td width="33%" align="center"><img src="assets/screenshots/deploy.png" alt="Build to deploy pipeline" /><br /><sub><b>Deploy</b><br />targets + an append-only audit trail</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/tasks.png" alt="Live task queue" /><br /><sub><b>Tasks</b><br />the live work queue, rolled up from sessions</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/runs.png" alt="Runs and sessions" /><br /><sub><b>Runs & sessions</b><br />every run and the agents within it</sub></td>
+  </tr>
+  <tr>
+    <td width="33%" align="center"><img src="assets/screenshots/agents.png" alt="All agents and their states" /><br /><sub><b>Agents</b><br />every worker, every state, drill into any one</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/activity.png" alt="Live activity stream" /><br /><sub><b>Activity</b><br />a live terminal-style event stream</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/chat.png" alt="Chat with the coordinator" /><br /><sub><b>Chat</b><br />talk to the coordinator, queue tasks</sub></td>
+  </tr>
+  <tr>
+    <td width="33%" align="center"><img src="assets/screenshots/system.png" alt="Host system monitor" /><br /><sub><b>System</b><br />real-time host CPU / RAM / disk</sub></td>
+    <td width="33%" align="center"><img src="assets/screenshots/settings.png" alt="Project configuration" /><br /><sub><b>Settings</b><br />provider, model, runtime, and run state</sub></td>
+    <td width="33%"></td>
+  </tr>
+</table>
 
 ## Why Agentplate
 
