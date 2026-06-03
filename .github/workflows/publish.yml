@@ -1,9 +1,11 @@
 name: Publish
 
-# Publishes @agentplate/cli to npm on every push to main.
-# Guarded so it only runs `npm publish` when package.json's version is not
-# already on the registry (npm forbids republishing an existing version),
-# and skips cleanly when NPM_TOKEN is not yet configured.
+# Publishes @agentplate/cli to npm on every push to main, then creates the
+# matching GitHub Release. Guarded so it only runs `npm publish` when
+# package.json's version is not already on the registry (npm forbids
+# republishing an existing version), and skips cleanly when NPM_TOKEN is not yet
+# configured. The release step is idempotent — it skips if the release already
+# exists — so a manually-created release/tag never conflicts.
 
 on:
   push:
@@ -18,7 +20,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # create the GitHub Release (+ its tag)
       id-token: write # required for npm provenance (OIDC)
     steps:
       - uses: actions/checkout@v6
@@ -69,3 +71,25 @@ jobs:
             exit 0
           fi
           npm publish --provenance --access public
+
+      - name: Create GitHub Release
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.local }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::Release $tag already exists — skipping."
+            exit 0
+          fi
+          # Use this version's CHANGELOG section as the notes; fall back to
+          # auto-generated notes if the section is missing.
+          awk -v v="$VERSION" 'BEGIN{p="^## \\[" v "\\]"} $0 ~ p {f=1;next} /^## \[/{if(f)exit} f' \
+            CHANGELOG.md > /tmp/release-notes.md
+          if [ -s /tmp/release-notes.md ]; then
+            gh release create "$tag" --title "$tag" --target "$GITHUB_SHA" --notes-file /tmp/release-notes.md
+          else
+            gh release create "$tag" --title "$tag" --target "$GITHUB_SHA" --generate-notes
+          fi
+          echo "::notice::Created GitHub Release $tag."
