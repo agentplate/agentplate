@@ -81,9 +81,13 @@ const PANEL_Z = 30;
 // Palette for the room itself.
 const WOOD_TABLE = "#a9612f";
 const WOOD_TABLE_DARK = "#7c4420";
-const PLANK_A = "#b9763c";
-const PLANK_B = "#a9692f";
 const WALL = "#1b2030";
+const MARBLE_A = "#edeae3"; // polished marble tile (light)
+const MARBLE_B = "#dcd7cd"; // polished marble tile (shade)
+const MARBLE_DARK = "#cfcabf"; // center medallion slab
+const GROUT = "#b9b4a8"; // grout lines between tiles
+const FRAME_GOLD = "#c9a14a"; // gilded art frames
+const BRAND = "#fb4b38"; // Agentplate brand red (floor emblem)
 const SKY = "#bcd2e6";
 const SKIN = "#e8b690";
 const PANTS = "#2c3550";
@@ -934,14 +938,18 @@ function Desk({ agent, position }: { agent: AgentSession; position: Vec3 }): JSX
 
 /**
  * The coordinator's executive station: a rug, a wide desk with a role-colored
- * fascia and a "DIRECTOR" nameplate, set at the head of the room. The group is
- * rotated 180° so the desk front (nameplate + monitor for the team) faces +z
- * toward the workforce; the coordinator presides standing just behind it.
+ * fascia and a "DIRECTOR" nameplate, set at the head of the room. The desk front
+ * (gold strip + nameplate) faces +z toward the workforce, and the director sits
+ * behind it (facing the team) while working — see `coordStation` in {@link Scene}.
  */
-function CoordinatorOffice({ position }: { position: Vec3 }): JSX.Element {
+function CoordinatorOffice({ position, agent }: { position: Vec3; agent: AgentSession }): JSX.Element {
 	const gold = ROLE_KITS.coordinator?.color ?? "#f5b301";
+	const screen = state3d(agent.state).color;
+	const active = agent.state === "working" || agent.state === "booting";
+	// Oriented toward +z (the team): the director sits behind the desk on the back
+	// (−z) side facing the room; the desk front, monitor, and nameplate face the team.
 	return (
-		<group position={position} rotation={[0, Math.PI, 0]}>
+		<group position={position}>
 			{/* Rug */}
 			<mesh position={[0, 0.02, 0]} receiveShadow>
 				<boxGeometry args={[3.6, 0.04, 2.8]} />
@@ -956,32 +964,54 @@ function CoordinatorOffice({ position }: { position: Vec3 }): JSX.Element {
 				<boxGeometry args={[2.2, 0.12, 1.1]} />
 				<meshStandardMaterial color={WOOD_TABLE} />
 			</mesh>
+			{/* Front panel + gold strip, facing the team (+z) */}
 			<mesh position={[0, 0.62, 0.55]}>
 				<boxGeometry args={[2.2, 0.64, 0.06]} />
 				<meshStandardMaterial color={WOOD_TABLE_DARK} />
 			</mesh>
-			<mesh position={[0, 0.78, 0.58]}>
+			<mesh position={[0, 0.8, 0.585]}>
 				<boxGeometry args={[2.2, 0.16, 0.02]} />
 				<meshStandardMaterial color={gold} />
 			</mesh>
-			{/* Monitor (faces the team, +z before rotation → -z after) */}
-			<mesh position={[0, 1.36, -0.34]} castShadow>
-				<boxGeometry args={[0.8, 0.5, 0.05]} />
+			{/* Back legs */}
+			<mesh position={[-1.0, 0.5, -0.5]}>
+				<boxGeometry args={[0.1, 1.0, 0.1]} />
+				<meshStandardMaterial color={WOOD_TABLE_DARK} />
+			</mesh>
+			<mesh position={[1.0, 0.5, -0.5]}>
+				<boxGeometry args={[0.1, 1.0, 0.1]} />
+				<meshStandardMaterial color={WOOD_TABLE_DARK} />
+			</mesh>
+			{/* Monitor in front of the director; screen faces −z (toward the seat) */}
+			<mesh position={[0, 1.34, -0.28]} castShadow>
+				<boxGeometry args={[0.86, 0.5, 0.05]} />
 				<meshStandardMaterial color="#15171c" />
 			</mesh>
-			{/* Executive chair */}
-			<group position={[0, 0, -0.85]}>
+			<mesh position={[0, 1.34, -0.31]}>
+				<boxGeometry args={[0.8, 0.44, 0.02]} />
+				<meshStandardMaterial
+					color={screen}
+					emissive={screen}
+					emissiveIntensity={active ? 0.85 : 0.4}
+				/>
+			</mesh>
+			{/* Executive chair behind the desk, toward the back wall */}
+			<group position={[0, 0, -0.92]}>
 				<mesh position={[0, 0.52, 0]} castShadow>
-					<boxGeometry args={[0.6, 0.1, 0.6]} />
+					<boxGeometry args={[0.62, 0.1, 0.58]} />
 					<meshStandardMaterial color="#1b2233" />
 				</mesh>
-				<mesh position={[0, 0.95, -0.26]} castShadow>
-					<boxGeometry args={[0.6, 0.8, 0.1]} />
+				<mesh position={[0, 0.98, -0.27]} castShadow>
+					<boxGeometry args={[0.62, 0.86, 0.1]} />
 					<meshStandardMaterial color="#1b2233" />
+				</mesh>
+				<mesh position={[0, 0.28, 0]}>
+					<boxGeometry args={[0.1, 0.46, 0.1]} />
+					<meshStandardMaterial color="#15171c" />
 				</mesh>
 			</group>
 			{/* DIRECTOR nameplate on the desk front, facing the team */}
-			<Html position={[0, 1.12, -0.6]} center distanceFactor={11} zIndexRange={LABEL_Z_RANGE}>
+			<Html position={[0, 1.12, 0.62]} center distanceFactor={11} zIndexRange={LABEL_Z_RANGE}>
 				<div
 					style={{
 						fontFamily: "ui-monospace, monospace",
@@ -1061,19 +1091,81 @@ function Whiteboard({ position, busy }: { position: Vec3; busy: boolean }): JSX.
 // --- Room (floor, walls) + decorations --------------------------------------
 
 function Floor({ halfX, halfZ }: { halfX: number; halfZ: number }): JSX.Element {
-	const depth = 1.15;
-	const planks: JSX.Element[] = [];
-	let i = 0;
-	for (let z = -halfZ + depth / 2; z < halfZ; z += depth) {
-		planks.push(
-			<mesh key={i} position={[0, 0, z]} receiveShadow>
-				<boxGeometry args={[halfX * 2, 0.04, depth - 0.04]} />
-				<meshStandardMaterial color={i % 2 === 0 ? PLANK_A : PLANK_B} />
-			</mesh>,
-		);
-		i++;
+	// Polished marble: a checkerboard of large tiles over a grout-colored slab
+	// (the gaps between tiles reveal the grout as thin lines).
+	const cell = 2.2;
+	const gap = 0.06;
+	const nx = Math.ceil((halfX * 2) / cell);
+	const nz = Math.ceil((halfZ * 2) / cell);
+	const tiles: JSX.Element[] = [];
+	for (let ix = 0; ix < nx; ix++) {
+		for (let iz = 0; iz < nz; iz++) {
+			const cx = -halfX + cell / 2 + ix * cell;
+			const cz = -halfZ + cell / 2 + iz * cell;
+			tiles.push(
+				<mesh key={`${ix}-${iz}`} position={[cx, 0, cz]} receiveShadow>
+					<boxGeometry args={[cell - gap, 0.04, cell - gap]} />
+					<meshStandardMaterial
+						color={(ix + iz) % 2 === 0 ? MARBLE_A : MARBLE_B}
+						roughness={0.35}
+						metalness={0.05}
+					/>
+				</mesh>,
+			);
+		}
 	}
-	return <group>{planks}</group>;
+	return (
+		<group>
+			<mesh position={[0, -0.01, 0]} receiveShadow>
+				<boxGeometry args={[halfX * 2, 0.04, halfZ * 2]} />
+				<meshStandardMaterial color={GROUT} />
+			</mesh>
+			{tiles}
+		</group>
+	);
+}
+
+/** The Agentplate "Plate & Spark" mark, inlaid flat in the center of the floor. */
+function FloorLogo(): JSX.Element {
+	// Scale the 120-viewBox mark (ring r46, rays r11→44, hub r8.5) to world units.
+	// Kept compact so the emblem sits in the open center without reaching the desks.
+	const k = 0.022;
+	const ringOuter = 46 * k;
+	const rayMid = ((11 + 44) / 2) * k;
+	const rayLen = (44 - 11) * k;
+	const angles = [0, 45, 90, 135, 180, 225, 270, 315];
+	const mat = (): JSX.Element => (
+		<meshStandardMaterial color={BRAND} emissive={BRAND} emissiveIntensity={0.4} roughness={0.5} />
+	);
+	return (
+		<group position={[0, 0.025, 0]}>
+			{/* Polished medallion slab the emblem is inlaid into. A thin cylinder's
+			    axis is vertical, so it already lies flat — no rotation. */}
+			<mesh position={[0, -0.012, 0]} receiveShadow>
+				<cylinderGeometry args={[ringOuter + 0.3, ringOuter + 0.3, 0.02, 64]} />
+				<meshStandardMaterial color={MARBLE_DARK} roughness={0.3} metalness={0.1} />
+			</mesh>
+			{/* Plate ring. ringGeometry lies in the XY plane, so rotate it flat. */}
+			<mesh rotation={[-Math.PI / 2, 0, 0]}>
+				<ringGeometry args={[ringOuter - 0.14, ringOuter, 64]} />
+				{mat()}
+			</mesh>
+			{/* Spark rays (flat slabs radiating from the hub) */}
+			{angles.map((a) => (
+				<group key={a} rotation={[0, (a * Math.PI) / 180, 0]}>
+					<mesh position={[0, 0, -rayMid]}>
+						<boxGeometry args={[0.13, 0.03, rayLen]} />
+						{mat()}
+					</mesh>
+				</group>
+			))}
+			{/* Hub (flat cylinder, no rotation) */}
+			<mesh position={[0, 0.001, 0]}>
+				<cylinderGeometry args={[8.5 * k, 8.5 * k, 0.04, 24]} />
+				{mat()}
+			</mesh>
+		</group>
+	);
 }
 
 function Walls({ halfX, halfZ }: { halfX: number; halfZ: number }): JSX.Element {
@@ -1121,25 +1213,44 @@ function Window({ position, rotationY = 0 }: { position: Vec3; rotationY?: numbe
 	);
 }
 
-/** A small framed poster on a wall. */
-function Poster({
+/** A framed piece of wall art: a gilded frame, a white mat, and an abstract
+ *  two-tone canvas. `rotationY` orients it flat against a given wall. */
+function ArtFrame({
 	position,
 	rotationY = 0,
+	w = 1.0,
+	h = 1.3,
 	color,
+	accent = "#f0d9b5",
 }: {
 	position: Vec3;
 	rotationY?: number;
+	w?: number;
+	h?: number;
 	color: string;
+	accent?: string;
 }): JSX.Element {
 	return (
 		<group position={position} rotation={[0, rotationY, 0]}>
-			<mesh>
-				<boxGeometry args={[0.9, 1.2, 0.04]} />
-				<meshStandardMaterial color="#0f1118" />
+			{/* Gilded frame */}
+			<mesh castShadow>
+				<boxGeometry args={[w + 0.16, h + 0.16, 0.07]} />
+				<meshStandardMaterial color={FRAME_GOLD} roughness={0.4} metalness={0.5} />
 			</mesh>
-			<mesh position={[0, 0, 0.03]}>
-				<boxGeometry args={[0.78, 1.08, 0.02]} />
-				<meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.25} />
+			{/* White mat */}
+			<mesh position={[0, 0, 0.04]}>
+				<boxGeometry args={[w, h, 0.03]} />
+				<meshStandardMaterial color="#f4f1ea" />
+			</mesh>
+			{/* Canvas */}
+			<mesh position={[0, 0, 0.06]}>
+				<boxGeometry args={[w * 0.82, h * 0.82, 0.02]} />
+				<meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.18} />
+			</mesh>
+			{/* Abstract band for a touch of composition */}
+			<mesh position={[0, -h * 0.16, 0.075]}>
+				<boxGeometry args={[w * 0.82, h * 0.24, 0.01]} />
+				<meshStandardMaterial color={accent} emissive={accent} emissiveIntensity={0.12} />
 			</mesh>
 		</group>
 	);
@@ -1315,11 +1426,14 @@ function Scene({
 	// Coordinator office at the head of the room (back-center), facing the team.
 	const coordZ = -(halfZ - 1.8);
 	const coordDeskPos: Vec3 = [0, 0, coordZ];
+	// The director sits behind the desk while working/booting, else stands — always
+	// facing +z toward the team.
+	const coordWorking = coordinator?.state === "working" || coordinator?.state === "booting";
 	const coordStation: Station = {
-		pos: [0, 0, coordZ - 0.95],
+		pos: [0, 0, coordZ - 0.74],
 		faceX: 0,
 		faceZ: coordZ + 10,
-		sit: false,
+		sit: coordWorking,
 	};
 
 	// Which agents are mid-handoff → gather at the whiteboard, and who's speaking.
@@ -1385,6 +1499,7 @@ function Scene({
 			<hemisphereLight args={[SKY, "#3a2c1f", 0.4]} />
 
 			<Floor halfX={halfX} halfZ={halfZ} />
+			<FloorLogo />
 			<Walls halfX={halfX} halfZ={halfZ} />
 
 			{/* Worker desks + actors */}
@@ -1396,7 +1511,7 @@ function Scene({
 			{/* Coordinator corner office */}
 			{coordinator ? (
 				<>
-					<CoordinatorOffice position={coordDeskPos} />
+					<CoordinatorOffice position={coordDeskPos} agent={coordinator} />
 					{renderActor(coordinator, coordDeskPos, coordStation)}
 				</>
 			) : null}
@@ -1406,8 +1521,33 @@ function Scene({
 			{/* Decorations against the walls */}
 			<Window position={[-halfX * 0.45, 2.4, -halfZ + 0.18]} />
 			<Window position={[halfX * 0.45, 2.4, -halfZ + 0.18]} />
-			<Poster position={[-halfX + 0.2, 2.2, halfZ * 0.3]} rotationY={Math.PI / 2} color="#4f86f7" />
-			<Poster position={[halfX - 0.2, 2.2, -halfZ * 0.2]} rotationY={-Math.PI / 2} color="#34d399" />
+			{/* Gallery: framed art around the walls */}
+			<ArtFrame position={[-halfX * 0.78, 2.35, -halfZ + 0.2]} color="#3b5b8c" accent="#c08a3e" />
+			<ArtFrame position={[halfX * 0.78, 2.35, -halfZ + 0.2]} color="#6d4b73" accent="#5f7d5a" />
+			<ArtFrame
+				position={[-halfX + 0.2, 2.35, -halfZ * 0.4]}
+				rotationY={Math.PI / 2}
+				color="#b5613a"
+				accent="#f0d9b5"
+			/>
+			<ArtFrame
+				position={[-halfX + 0.2, 2.35, halfZ * 0.32]}
+				rotationY={Math.PI / 2}
+				color="#2f6f6a"
+				accent="#cfe3df"
+			/>
+			<ArtFrame
+				position={[halfX - 0.2, 2.35, -halfZ * 0.32]}
+				rotationY={-Math.PI / 2}
+				color="#5f7d5a"
+				accent="#e6d27a"
+			/>
+			<ArtFrame
+				position={[halfX - 0.2, 2.35, halfZ * 0.4]}
+				rotationY={-Math.PI / 2}
+				color="#7a3b8c"
+				accent="#d9b8e0"
+			/>
 			<Plant position={[-halfX + 1.4, 0, halfZ - 2]} />
 			<Plant position={[halfX - 1.6, 0, halfZ - 1.4]} />
 			<TrashBin position={[halfX - 1.2, 0, halfZ - 0.8]} />
