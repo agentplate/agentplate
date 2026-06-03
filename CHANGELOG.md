@@ -4,6 +4,24 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-06-03
+
+### Added
+
+- **Marble Office floor** — the 3D Office floor is now polished marble (a
+  checkerboard of stone tiles over a grout slab) in place of the wooden planks.
+- **Brand emblem inlaid in the floor** — the Agentplate "Plate & Spark" mark sits
+  flat in the center of the floor (ring + spark + hub on a dark-marble medallion).
+- **Gallery walls** — framed wall art (`ArtFrame`: gilded frame + mat + abstract
+  canvas) placed around the room.
+
+### Fixed
+
+- **Coordinator ("Director") seating** — the coordinator now sits behind the desk
+  while working (instead of always standing), and the executive desk faces the
+  team (front fascia, nameplate, and monitor face the room) rather than being
+  mis-rotated.
+
 ## [1.5.0] — 2026-06-02
 
 ### Added
