@@ -32,6 +32,8 @@ export interface Overview {
 	runtime: string;
 	provider: string;
 	model: string | null;
+	baseUrl: string | null;
+	authMode: string | null;
 	deployTarget: string | null;
 	currentRun: RunRecord | null;
 	agentCount: number;

@@ -153,14 +153,15 @@ function startCommand(): Command {
 				store.close();
 
 				// 3. Hand the terminal to the interactive agent (inherited stdio).
-				// In auto/bypass mode, let the runtime add its bypass env (e.g. OpenCode's
-				// OPENCODE_PERMISSION) so the coordinator runs without prompts; under
-				// `--safe` keep just the resolved provider env so the runtime's own
-				// approval prompts stay in effect.
-				const interactiveEnv =
-					permissionMode === "bypass"
-						? runtime.buildEnv({ model: resolved.model, env: resolved.env })
-						: { ...resolved.env };
+				// The runtime's provider env mapping (base URLs, auth) applies in BOTH
+				// modes; only the permission-bypass env is branch-specific: under
+				// `--safe`, strip the runtime's bypass var (e.g. OpenCode's
+				// OPENCODE_PERMISSION) so its own approval prompts stay in effect.
+				// buildEnv returns a fresh object, so deleting here is safe.
+				const interactiveEnv = runtime.buildEnv(resolved);
+				if (permissionMode !== "bypass") {
+					delete interactiveEnv.OPENCODE_PERMISSION;
+				}
 				const proc = Bun.spawn(resolveArgv(argv), {
 					cwd: root,
 					env: { ...process.env, ...interactiveEnv },

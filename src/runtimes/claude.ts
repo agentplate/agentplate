@@ -137,9 +137,32 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * Auth is never hardcoded here — it is whatever the provider layer resolved
 	 * onto the model. A fresh object is returned (rather than `model.env` itself)
 	 * so a caller mutating the result cannot leak back into shared config.
+	 *
+	 * When the model carries a `baseUrl` (local/gateway provider), it is mapped to
+	 * `ANTHROPIC_BASE_URL` (normalized — the CLI appends `/v1/messages` itself).
+	 * Only for an explicitly keyless provider (`authMode === "none"`, e.g. a local
+	 * Ollama server) a dummy `ANTHROPIC_AUTH_TOKEN` is injected — local servers
+	 * ignore the bearer, but the CLI refuses to start without one —
+	 * `ANTHROPIC_SMALL_FAST_MODEL` is pinned to the resolved model (Claude's
+	 * haiku-class background model does not exist on local servers), and
+	 * `ANTHROPIC_API_KEY` is set to "" because the caller spawns with
+	 * `{...process.env, ...thisEnv}`: without the explicit empty override, a
+	 * shell-exported real key would survive the merge and be sent to the local
+	 * endpoint. Any other authMode (api-key/env carry the real key in
+	 * `model.env`; subscription keeps the CLI's own login) gets ONLY the base
+	 * URL. Without a `baseUrl` the behavior is unchanged.
 	 */
 	buildEnv(model: ResolvedModel): Record<string, string> {
-		return { ...(model.env ?? {}) };
+		const env: Record<string, string> = { ...(model.env ?? {}) };
+		if (model.baseUrl !== undefined) {
+			env.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrl(model.baseUrl);
+			if (model.authMode === "none") {
+				env.ANTHROPIC_AUTH_TOKEN = "agentplate-local";
+				env.ANTHROPIC_SMALL_FAST_MODEL = model.model;
+				env.ANTHROPIC_API_KEY = "";
+			}
+		}
+		return env;
 	}
 
 	/**
@@ -206,6 +229,18 @@ export class ClaudeRuntime implements AgentRuntime {
 			reader.releaseLock();
 		}
 	}
+}
+
+/**
+ * Normalize a provider base URL for `ANTHROPIC_BASE_URL`.
+ *
+ * The claude CLI (via the Anthropic SDK) appends `/v1/messages` to the base URL
+ * itself, but legacy/OpenAI-style configs often store the endpoint with a `/v1`
+ * suffix (e.g. `http://localhost:11434/v1`). Strips exactly ONE trailing `/v1`
+ * or `/v1/`; anything else (including `/v1beta`) passes through untouched.
+ */
+export function normalizeAnthropicBaseUrl(url: string): string {
+	return url.replace(/\/v1\/?$/, "");
 }
 
 /**

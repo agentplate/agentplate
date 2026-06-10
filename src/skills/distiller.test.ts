@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentRuntime, DirectSpawnOpts } from "../runtimes/types.ts";
@@ -65,8 +65,8 @@ function fakeRuntime(printPayload: string): AgentRuntime {
 		buildDirectSpawn(_opts: DirectSpawnOpts): string[] {
 			return ["true"];
 		},
-		buildEnv(_model: ResolvedModel): Record<string, string> {
-			return {};
+		buildEnv(model: ResolvedModel): Record<string, string> {
+			return { ...(model.env ?? {}) };
 		},
 		buildPrintCommand(_prompt: string, _model?: string): string[] {
 			// Heredoc keeps the payload a single opaque chunk; 'EOF' (quoted) disables
@@ -75,6 +75,9 @@ function fakeRuntime(printPayload: string): AgentRuntime {
 		},
 	};
 }
+
+/** A plain resolved model with no provider env, for tests that don't probe env. */
+const RESOLVED_MODEL: ResolvedModel = { model: "test-model", env: {} };
 
 /** Run a git command in a repo, throwing on failure (test-only convenience). */
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -312,6 +315,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 
 		expect(result.action).toBe("created");
@@ -353,6 +357,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 		expect(result.action).toBe("skipped");
 	});
@@ -371,6 +376,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 
 		expect(result.action).toBe("skipped");
@@ -395,6 +401,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 		expect(result.action).toBe("skipped");
 		expect(store.list()).toHaveLength(0);
@@ -427,6 +434,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 
 		// Fatal safety violation → skipped, and nothing written to disk.
@@ -465,6 +473,7 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [targetSlug],
+			resolvedModel: RESOLVED_MODEL,
 		});
 
 		expect(result.action).toBe("updated");
@@ -491,8 +500,63 @@ describe("distillSkill", () => {
 			agentName: "builder-x",
 			capability: "builder",
 			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
 		});
 		expect(result.action).toBe("skipped");
 		expect(store.list()).toHaveLength(0);
+	});
+
+	test("spawns the one-shot call with the resolved provider env merged over process.env", async () => {
+		const baseRef = await setupRepo(dir);
+		writeFileSync(join(dir, "e.ts"), "export const e = 1;\n");
+		await git(dir, "add", ".");
+		await git(dir, "commit", "-q", "-m", "env probe");
+
+		// The print command writes the provider env var AND an inherited process.env
+		// var to a probe file, then emits a skip draft. If the spawn dropped either
+		// half of the merged env, the probe records an empty field.
+		const probeFile = join(dir, "env-probe.txt");
+		const runtime: AgentRuntime = {
+			id: "fake-env",
+			stability: "experimental",
+			instructionPath: "CLAUDE.md",
+			buildDirectSpawn(_opts: DirectSpawnOpts): string[] {
+				return ["true"];
+			},
+			buildEnv(model: ResolvedModel): Record<string, string> {
+				return { ...(model.env ?? {}) };
+			},
+			buildPrintCommand(_prompt: string, _model?: string): string[] {
+				return [
+					"bash",
+					"-lc",
+					`printf '%s|%s' "\${FAKE_PROVIDER_KEY-}" "\${AGENTPLATE_INHERITED_PROBE-}" > '${probeFile}'; echo '{"action":"skip"}'`,
+				];
+			},
+		};
+
+		process.env.AGENTPLATE_INHERITED_PROBE = "inherited-ok";
+		try {
+			store = createSkillStore(dir);
+			const result = await distillSkill({
+				store,
+				runtime,
+				root: dir,
+				worktreePath: dir,
+				baseRef,
+				taskId: null,
+				agentName: "builder-x",
+				capability: "builder",
+				appliedSlugs: [],
+				resolvedModel: {
+					model: "local-model",
+					env: { FAKE_PROVIDER_KEY: "key-from-provider" },
+				},
+			});
+			expect(result.action).toBe("skipped");
+			expect(readFileSync(probeFile, "utf8")).toBe("key-from-provider|inherited-ok");
+		} finally {
+			delete process.env.AGENTPLATE_INHERITED_PROBE;
+		}
 	});
 });

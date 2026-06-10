@@ -32,7 +32,13 @@ export function SettingsScreen({ overview }: { overview: Overview | null }): JSX
 								<Row k="Project" value={overview?.project ?? "—"} />
 								<Row k="Runtime" value={overview?.runtime ?? "—"} />
 								<Row k="Provider" value={overview?.provider ?? "—"} />
+								{overview?.authMode != null && (
+									<Row k="Auth" value={overview.authMode} />
+								)}
 								<Row k="Model" value={overview?.model ?? "—"} />
+								{overview?.baseUrl != null && (
+									<Row k="Base URL" value={overview.baseUrl} />
+								)}
 								<Row
 									k="Deploy target"
 									value={overview?.deployTarget ?? "(none)"}

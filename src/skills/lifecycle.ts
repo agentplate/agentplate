@@ -11,7 +11,9 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { loadConfig } from "../config.ts";
 import { appliedSkillsPath } from "../paths.ts";
+import { resolveModel } from "../runtimes/resolve.ts";
 import type { AgentRuntime } from "../runtimes/types.ts";
 import type { OutcomeStatus, SkillsConfig } from "../types.ts";
 import { distillSkill } from "./distiller.ts";
@@ -137,18 +139,31 @@ export async function runSkillFeedbackAndDistill(
 		// 2. Distill: only from work that passed its gates (when configured).
 		const gatesOk = !args.skills.distill.onlyOnGatesPass || args.outcomeStatus === "success";
 		if (gatesOk) {
-			result.distill = await distillSkill({
-				store,
-				runtime: args.runtime,
-				root: args.root,
-				worktreePath: args.worktreePath,
-				baseRef: args.baseRef,
-				taskId: args.taskId,
-				agentName: args.agentName,
-				capability: args.capability,
-				appliedSlugs,
-				model: args.skills.distill.model ?? args.model,
-			});
+			// The one-shot distill call must run with the active provider's env
+			// (API key, base URL) — spawning against bare process.env would silently
+			// fall back to the operator's default credentials. Resolve it fresh from
+			// config + secrets; the model string keeps the distiller's own selection.
+			const model = args.skills.distill.model ?? args.model;
+			const resolvedModel = resolveModel(loadConfig(args.root), args.root, model ?? "");
+			// resolvedModel.model is empty only when neither a distill override, a
+			// session model, nor a provider default exists — there is no concrete
+			// model to spawn with, so skip distillation rather than pass "" (which
+			// would e.g. pin a keyless runtime's small-fast model to "").
+			if (resolvedModel.model !== "") {
+				result.distill = await distillSkill({
+					store,
+					runtime: args.runtime,
+					root: args.root,
+					worktreePath: args.worktreePath,
+					baseRef: args.baseRef,
+					taskId: args.taskId,
+					agentName: args.agentName,
+					capability: args.capability,
+					appliedSlugs,
+					model,
+					resolvedModel,
+				});
+			}
 		}
 		return result;
 	} finally {
