@@ -29,6 +29,7 @@
  */
 
 import type { AgentRuntime } from "../runtimes/types.ts";
+import type { ResolvedModel } from "../types.ts";
 import { resolveArgv } from "../utils/detect.ts";
 import { sanitizeSkillDraft } from "./safety.ts";
 import type { createSkillStore } from "./store.ts";
@@ -71,6 +72,13 @@ export interface DistillSkillArgs {
 	appliedSlugs: string[];
 	/** Optional model override for the one-shot call. */
 	model?: string;
+	/**
+	 * Resolved provider model whose env (API key, base URL, auth mode) the
+	 * one-shot call runs with — passed through `runtime.buildEnv` and merged over
+	 * `process.env` so a configured gateway/local provider is honored instead of
+	 * whatever credentials happen to be in the inherited environment.
+	 */
+	resolvedModel: ResolvedModel;
 }
 
 /** Result of a distillation attempt. */
@@ -354,7 +362,7 @@ async function readSpecText(root: string, taskId: string | null): Promise<string
  *  3. Resolve the applied skills the store still knows about (dropping any that
  *     have since been removed) so the model can choose to UPDATE one.
  *  4. Render the prompt and make a single one-shot model call via the runtime's
- *     `buildPrintCommand`, capturing stdout.
+ *     `buildPrintCommand` (spawned with the resolved provider env), capturing stdout.
  *  5. Parse the output. A null parse or an explicit `skip` action → skipped.
  *  6. Scrub the draft ({@link sanitizeSkillDraft}). A FATAL violation (dangerous
  *     command / deploy verb) downgrades the whole draft to a skip — we never
@@ -363,7 +371,8 @@ async function readSpecText(root: string, taskId: string | null): Promise<string
  *     the task / agent / HEAD sha, and report the action + slug.
  */
 export async function distillSkill(args: DistillSkillArgs): Promise<DistillResult> {
-	const { store, runtime, root, worktreePath, baseRef, taskId, agentName, model } = args;
+	const { store, runtime, root, worktreePath, baseRef, taskId, agentName, model, resolvedModel } =
+		args;
 
 	// 1. Gather the diff. No diff → nothing to distill.
 	const diffResult = await runGit(worktreePath, ["diff", `${baseRef}..HEAD`]);
@@ -391,6 +400,9 @@ export async function distillSkill(args: DistillSkillArgs): Promise<DistillResul
 	try {
 		const proc = Bun.spawn(resolveArgv(runtime.buildPrintCommand(prompt, model)), {
 			cwd: worktreePath,
+			// Provider env (API key / base URL) merged over the inherited env — a
+			// bare process.env would silently call the operator's default provider.
+			env: { ...process.env, ...runtime.buildEnv(resolvedModel) },
 			stdout: "pipe",
 			stderr: "pipe",
 		});

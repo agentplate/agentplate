@@ -33,6 +33,42 @@ async function commandOutput(cmd: string, args: string[]): Promise<string | null
 	}
 }
 
+/** True when the URL's host is loopback (localhost / 127.0.0.1 / [::1]). */
+function isLoopbackHost(url: string): boolean {
+	try {
+		const { hostname } = new URL(url);
+		return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Probe a provider base URL for reachability. ANY HTTP response (any status)
+ * counts as reachable — we only care that something is listening.
+ */
+async function probeBaseUrl(url: string): Promise<DoctorCheck> {
+	try {
+		const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+		return {
+			category: "providers",
+			name: "endpoint",
+			ok: true,
+			detail: `${url} reachable (HTTP ${response.status})`,
+		};
+	} catch {
+		const hint = isLoopbackHost(url)
+			? "is the server running? (local Ollama: `ollama serve`)"
+			: "is the server running?";
+		return {
+			category: "providers",
+			name: "endpoint",
+			ok: false,
+			detail: `${url} unreachable — ${hint}`,
+		};
+	}
+}
+
 async function coreChecks(root: string): Promise<DoctorCheck[]> {
 	const checks: DoctorCheck[] = [];
 	checks.push({ category: "core", name: "bun", ok: true, detail: `v${Bun.version}` });
@@ -124,6 +160,22 @@ async function providerChecks(root: string): Promise<DoctorCheck[]> {
 				? `${envVar} is set`
 				: `${envVar} not found (add it via \`agentplate setup\` or the environment)`,
 		});
+	}
+
+	if (providerConfig?.baseUrl) {
+		const baseUrl = providerConfig.baseUrl;
+		// Plain http to a non-loopback host sends credentials unencrypted. Surfaced
+		// as a warning (ok: true + "warning:" prefix) since DoctorCheck has no warn
+		// tier and the setup may still be intentional (e.g. a trusted LAN).
+		if (baseUrl.startsWith("http://") && !isLoopbackHost(baseUrl)) {
+			checks.push({
+				category: "providers",
+				name: "transport",
+				ok: true,
+				detail: `warning: ${baseUrl} uses plain http to a non-local host — credentials travel unencrypted; prefer https`,
+			});
+		}
+		checks.push(await probeBaseUrl(baseUrl));
 	}
 	return checks;
 }

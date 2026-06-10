@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ValidationError } from "../errors.ts";
 import type { ResolvedModel, RuntimeConfig } from "../types.ts";
-import { ClaudeRuntime } from "./claude.ts";
+import { ClaudeRuntime, normalizeAnthropicBaseUrl } from "./claude.ts";
 import { CodexRuntime } from "./codex.ts";
 import { CursorRuntime } from "./cursor.ts";
 import { GeminiRuntime } from "./gemini.ts";
@@ -205,6 +205,100 @@ describe("ClaudeRuntime", () => {
 
 	test("buildEnv returns an empty object when the model has no env", () => {
 		expect(runtime.buildEnv({ model: "m" })).toEqual({});
+	});
+
+	test("buildEnv maps baseUrl to ANTHROPIC_BASE_URL, stripping a trailing /v1", () => {
+		// Keyless local server (authMode "none"): dummy bearer + small-fast pin are
+		// injected, and ANTHROPIC_API_KEY is pinned to "" so a shell-exported real
+		// key cannot survive the {...process.env, ...env} spawn merge.
+		const env = runtime.buildEnv({
+			model: "qwen3:8b",
+			baseUrl: "http://localhost:11434/v1",
+			authMode: "none",
+		});
+		expect(env).toEqual({
+			ANTHROPIC_BASE_URL: "http://localhost:11434",
+			ANTHROPIC_AUTH_TOKEN: "agentplate-local",
+			ANTHROPIC_SMALL_FAST_MODEL: "qwen3:8b",
+			ANTHROPIC_API_KEY: "",
+		});
+	});
+
+	test("buildEnv neutralizes an inherited ANTHROPIC_API_KEY for a keyless local endpoint", () => {
+		// Simulate the caller's child-env construction: {...process.env, ...runtimeEnv}.
+		// A real key exported in the operator's shell must NOT reach the local host.
+		const fakeProcessEnv = { ANTHROPIC_API_KEY: "sk-shell-exported", PATH: "/usr/bin" };
+		const runtimeEnv = runtime.buildEnv({
+			model: "qwen3:8b",
+			baseUrl: "http://localhost:11434",
+			authMode: "none",
+		});
+		const childEnv: Record<string, string> = { ...fakeProcessEnv, ...runtimeEnv };
+		expect(childEnv.ANTHROPIC_API_KEY).toBe("");
+		expect(childEnv.ANTHROPIC_AUTH_TOKEN).toBe("agentplate-local");
+		expect(childEnv.PATH).toBe("/usr/bin"); // rest of process.env untouched
+	});
+
+	test("buildEnv passes a baseUrl without /v1 through unchanged (no double-strip)", () => {
+		const env = runtime.buildEnv({
+			model: "m",
+			baseUrl: "http://localhost:11434",
+			authMode: "none",
+		});
+		expect(env.ANTHROPIC_BASE_URL).toBe("http://localhost:11434");
+	});
+
+	test("buildEnv with api-key auth + baseUrl adds ONLY the base URL (no dummy token)", () => {
+		const withKey = runtime.buildEnv({
+			model: "m",
+			env: { ANTHROPIC_API_KEY: "sk-real" },
+			baseUrl: "http://gw.example.com/v1",
+			authMode: "api-key",
+		});
+		expect(withKey).toEqual({
+			ANTHROPIC_API_KEY: "sk-real",
+			ANTHROPIC_BASE_URL: "http://gw.example.com",
+		});
+		expect(withKey.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+		expect(withKey.ANTHROPIC_SMALL_FAST_MODEL).toBeUndefined();
+
+		const withToken = runtime.buildEnv({
+			model: "m",
+			env: { ANTHROPIC_AUTH_TOKEN: "tok" },
+			baseUrl: "http://gw.example.com",
+			authMode: "env",
+		});
+		expect(withToken).toEqual({
+			ANTHROPIC_AUTH_TOKEN: "tok",
+			ANTHROPIC_BASE_URL: "http://gw.example.com",
+		});
+	});
+
+	test("buildEnv with subscription auth + baseUrl (proxy) keeps the CLI login intact", () => {
+		// A Pro/Max login proxied through a gateway: only the endpoint moves —
+		// no dummy bearer and no key neutralization, or the OAuth session breaks.
+		const env = runtime.buildEnv({
+			model: "claude-opus-4-8",
+			baseUrl: "https://proxy.example.com",
+			authMode: "subscription",
+		});
+		expect(env).toEqual({ ANTHROPIC_BASE_URL: "https://proxy.example.com" });
+	});
+
+	test("buildEnv without baseUrl is byte-identical to the legacy behavior", () => {
+		expect(runtime.buildEnv({ model: "m", env: { ANTHROPIC_API_KEY: "k" } })).toEqual({
+			ANTHROPIC_API_KEY: "k",
+		});
+		expect(runtime.buildEnv({ model: "m" })).toEqual({});
+	});
+
+	test("normalizeAnthropicBaseUrl strips exactly one trailing /v1 (with or without slash)", () => {
+		expect(normalizeAnthropicBaseUrl("http://x/v1")).toBe("http://x");
+		expect(normalizeAnthropicBaseUrl("http://x/v1/")).toBe("http://x");
+		expect(normalizeAnthropicBaseUrl("http://x")).toBe("http://x");
+		expect(normalizeAnthropicBaseUrl("http://x/v1beta")).toBe("http://x/v1beta");
+		// Only the FINAL /v1 is stripped — an inner one survives.
+		expect(normalizeAnthropicBaseUrl("http://x/v1/v1")).toBe("http://x/v1");
 	});
 
 	test("parseEvents yields one event per JSON line and captures sessionId", async () => {
@@ -430,6 +524,19 @@ describe("OpenCodeRuntime", () => {
 		expect(policy.bash["rm -rf *"]).toBe("deny"); // destructive guardrail (deny, not ask)
 	});
 
+	test("buildEnv ignores model.baseUrl (Anthropic endpoint mapping is claude-only)", () => {
+		// opencode always injects OPENCODE_PERMISSION, so compare against the
+		// no-baseUrl result rather than the bare provider env.
+		const withBaseUrl = runtime.buildEnv({
+			model: "m",
+			env: { OPENROUTER_API_KEY: "k" },
+			baseUrl: "http://localhost:11434/v1",
+		});
+		const without = runtime.buildEnv({ model: "m", env: { OPENROUTER_API_KEY: "k" } });
+		expect(withBaseUrl).toEqual(without);
+		expect(withBaseUrl.ANTHROPIC_BASE_URL).toBeUndefined();
+	});
+
 	test("opencodeModel prefixes bare ids with opencode/ and leaves provider-qualified ids", () => {
 		expect(opencodeModel("minimax-m3-free")).toBe("opencode/minimax-m3-free");
 		expect(opencodeModel("opencode/minimax-m3-free")).toBe("opencode/minimax-m3-free");
@@ -602,6 +709,15 @@ describe("CodexRuntime", () => {
 		expect(runtime.buildEnv({ model: "m" })).toEqual({});
 	});
 
+	test("buildEnv ignores model.baseUrl (Anthropic endpoint mapping is claude-only)", () => {
+		const env = runtime.buildEnv({
+			model: "m",
+			env: { OPENAI_API_KEY: "k" },
+			baseUrl: "http://localhost:11434/v1",
+		});
+		expect(env).toEqual({ OPENAI_API_KEY: "k" });
+	});
+
 	test("parseEvents captures the session id from a session_configured event", async () => {
 		const stream = streamFromChunks([
 			`${JSON.stringify({ id: "0", msg: { type: "session_configured", session_id: "sess-9" } })}\n`,
@@ -731,6 +847,15 @@ describe("GeminiRuntime", () => {
 		expect(runtime.buildEnv({ model: "m" })).toEqual({});
 	});
 
+	test("buildEnv ignores model.baseUrl (Anthropic endpoint mapping is claude-only)", () => {
+		const env = runtime.buildEnv({
+			model: "m",
+			env: { GEMINI_API_KEY: "k" },
+			baseUrl: "http://localhost:11434/v1",
+		});
+		expect(env).toEqual({ GEMINI_API_KEY: "k" });
+	});
+
 	test("parseEvents handles the real stream-json (init session_id, result usage)", async () => {
 		const stream = streamFromChunks([
 			`${JSON.stringify({ type: "init", session_id: "g-1", model: "auto" })}\n`,
@@ -825,6 +950,15 @@ describe("CursorRuntime", () => {
 			CURSOR_API_KEY: "k",
 		});
 		expect(runtime.buildEnv({ model: "m" })).toEqual({});
+	});
+
+	test("buildEnv ignores model.baseUrl (Anthropic endpoint mapping is claude-only)", () => {
+		const env = runtime.buildEnv({
+			model: "m",
+			env: { CURSOR_API_KEY: "k" },
+			baseUrl: "http://localhost:11434/v1",
+		});
+		expect(env).toEqual({ CURSOR_API_KEY: "k" });
 	});
 
 	test("parseEvents captures the chat id under any common key spelling", async () => {

@@ -68,6 +68,45 @@ export function detectQualityGates(root: string): QualityGate[] {
 	];
 }
 
+/**
+ * Warn when a keyless local provider (auth "none" + base URL) is paired with a
+ * runtime other than Claude Code. Only the claude runtime routes to local
+ * Anthropic-compatible endpoints (via ANTHROPIC_BASE_URL); any other runtime
+ * would ignore the base URL. Returns the warning text, or null when the
+ * pairing is fine.
+ */
+export function localPairingWarning(
+	authMode: AuthMode,
+	baseUrl: string | undefined,
+	runtime: string,
+): string | null {
+	if (authMode === "none" && baseUrl && runtime !== "claude") {
+		return (
+			"Local/keyless providers are currently routed only by the Claude Code runtime " +
+			`via ANTHROPIC_BASE_URL; runtime '${runtime}' will ignore the base URL and likely fail.`
+		);
+	}
+	return null;
+}
+
+/**
+ * Tip shown after model selection for the Ollama provider. Ollama loads every
+ * model with a 32k default context window regardless of capability; coding-agent
+ * runtimes need more (Claude Code's system prompt + tools alone are ~32k tokens),
+ * so the model silently returns empty replies. The fix is a context-extended
+ * derived model. Returns the note text, or null for any other provider.
+ */
+export function ollamaContextTip(providerId: string, model: string): string | null {
+	if (providerId !== "ollama") return null;
+	return (
+		"Ollama loads models with a 32k default context window — too small for coding-agent\n" +
+		"runtimes (the system prompt + tools alone are ~32k tokens), so replies come back empty.\n" +
+		"Create a context-extended model and select it instead:\n" +
+		`  printf 'FROM ${model}\\nPARAMETER num_ctx 65536\\n' > Modelfile\n` +
+		`  ollama create ${model}-64k -f Modelfile`
+	);
+}
+
 /** Abort the wizard cleanly if the user cancelled a prompt. */
 function ensure<T>(value: T | symbol): T {
 	if (p.isCancel(value)) {
@@ -226,6 +265,9 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 		).trim();
 	}
 
+	const contextTip = ollamaContextTip(providerId, model);
+	if (contextTip) p.note(contextTip, "Heads up");
+
 	// 4b. Model tiering — optionally use a faster/cheaper model for read-only
 	//     roles (scout, reviewer), keeping the chosen model for the rest.
 	let modelsByCapability: Partial<Record<Capability, string>> | undefined;
@@ -264,8 +306,14 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 	// `gemini`). Default the runtime to that CLI so the OAuth credentials are
 	// actually reused — otherwise a mismatched runtime (e.g. `claude` driving a
 	// GPT model with no key) would silently break the login.
+	// Similarly, keyless local providers (auth "none" + base URL) are routed by
+	// the claude runtime via ANTHROPIC_BASE_URL, so default to it.
 	const initialRuntime =
-		authMode === "subscription" && spec.subscriptionRuntime ? spec.subscriptionRuntime : detected;
+		authMode === "subscription" && spec.subscriptionRuntime
+			? spec.subscriptionRuntime
+			: authMode === "none" && baseUrl
+				? "claude"
+				: detected;
 	const runtime = ensure(
 		await p.select({
 			message: "Which coding-agent runtime should drive workers?",
@@ -277,6 +325,9 @@ export async function runSetupWizard(currentConfig: AgentplateConfig): Promise<W
 			})),
 		}),
 	);
+
+	const pairingWarning = localPairingWarning(authMode, baseUrl, runtime);
+	if (pairingWarning) p.note(pairingWarning, "Heads up");
 
 	// 6. Orchestration & merge --------------------------------------------
 	const canonicalBranch = currentConfig.project.canonicalBranch;

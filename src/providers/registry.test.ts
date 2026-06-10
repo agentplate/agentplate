@@ -57,6 +57,21 @@ describe("provider registry", () => {
 		expect(getProviderSpec("ollama")?.keyless).toBe(true);
 	});
 
+	test("ollama base URL is the server root (no /v1 — runtimes append API paths)", () => {
+		const ollama = getProviderSpec("ollama");
+		expect(ollama?.defaultBaseUrl).toBe("http://localhost:11434");
+		expect(ollama?.defaultBaseUrl?.endsWith("/v1")).toBe(false);
+	});
+
+	test("ollama leads with a tool-capable coding model", () => {
+		const models = getProviderSpec("ollama")?.models ?? [];
+		expect(models[0]?.id).toBe("qwen3-coder:30b");
+		expect(models[0]?.contextWindow).toBe(262_144);
+		const ids = models.map((m) => m.id);
+		expect(ids).toContain("qwen2.5-coder:32b");
+		expect(ids).toContain("llama3.3:70b");
+	});
+
 	test("meetsContextFloor enforces the minimum", () => {
 		expect(meetsContextFloor({ id: "a", label: "A", contextWindow: MIN_CONTEXT_TOKENS })).toBe(
 			true,

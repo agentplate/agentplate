@@ -6,6 +6,7 @@ import { getProviderSpec } from "./registry.ts";
 const anthropic = getProviderSpec("anthropic");
 const openrouter = getProviderSpec("openrouter");
 const custom = getProviderSpec("custom");
+const ollama = getProviderSpec("ollama");
 
 describe("buildProviderConfig", () => {
 	test("api-key auth stores the token env var", () => {
@@ -37,6 +38,15 @@ describe("buildProviderConfig", () => {
 		const cfg = buildProviderConfig(openrouter, "openai/gpt-4o", "api-key");
 		expect(cfg.type).toBe("gateway");
 		expect(cfg.baseUrl).toBe("https://openrouter.ai/api/v1");
+	});
+
+	test("keyless ollama with authMode none stores the baseUrl and no token env var", () => {
+		if (!ollama) throw new Error("ollama spec missing");
+		const cfg = buildProviderConfig(ollama, "qwen3-coder:30b", "none");
+		expect(cfg.type).toBe("gateway");
+		expect(cfg.authMode).toBe("none");
+		expect(cfg.authTokenEnv).toBeUndefined();
+		expect(cfg.baseUrl).toBe("http://localhost:11434");
 	});
 
 	test("custom baseUrl overrides the default", () => {

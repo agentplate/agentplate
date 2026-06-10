@@ -9,6 +9,7 @@
  */
 
 import type { AgentEvent, AgentRuntime } from "../runtimes/types.ts";
+import type { AuthMode } from "../types.ts";
 import { resolveArgv } from "../utils/detect.ts";
 
 export interface RunTurnOptions {
@@ -21,6 +22,10 @@ export interface RunTurnOptions {
 	prompt: string;
 	/** Provider env vars (merged over process.env for the child). */
 	env?: Record<string, string>;
+	/** Provider gateway base URL (runtimes map it to their CLI's env var). */
+	baseUrl?: string;
+	/** Provider auth mode — runtimes shape keyless-local env from it (`none`). */
+	authMode?: AuthMode;
 	/** Prior runtime session id, to resume across turns. */
 	resumeSessionId?: string;
 	/** Hard wall-clock cap in ms; the child is killed past it. 0/undefined = none. */
@@ -54,7 +59,12 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 	// OpenCode injects OPENCODE_PERMISSION so an unattended worker auto-approves
 	// tool actions instead of deadlocking on a permission prompt. For runtimes that
 	// add nothing this equals `opts.env`, so the behavior is unchanged.
-	const runtimeEnv = opts.runtime.buildEnv({ model: opts.model, env: opts.env });
+	const runtimeEnv = opts.runtime.buildEnv({
+		model: opts.model,
+		env: opts.env,
+		baseUrl: opts.baseUrl,
+		authMode: opts.authMode,
+	});
 	const proc = Bun.spawn(resolveArgv(argv), {
 		cwd: opts.worktreePath,
 		env: { ...process.env, ...runtimeEnv },

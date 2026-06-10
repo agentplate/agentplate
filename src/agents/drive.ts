@@ -109,6 +109,8 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 		model: model.model,
 		prompt: ctx.prompt,
 		env: model.env,
+		baseUrl: model.baseUrl,
+		authMode: model.authMode,
 		resumeSessionId: ctx.resumeSessionId,
 		timeoutMs:
 			config.agents.turnTimeoutMinutes > 0 ? config.agents.turnTimeoutMinutes * 60_000 : undefined,

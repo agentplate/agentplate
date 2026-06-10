@@ -253,6 +253,17 @@ export interface ResolvedModel {
 	model: string;
 	/** Provider env vars to inject into the spawned process. */
 	env?: Record<string, string>;
+	/**
+	 * Provider gateway base URL; runtimes that support endpoint override map it
+	 * to their CLI's env var.
+	 */
+	baseUrl?: string;
+	/**
+	 * Effective auth mode the provider resolved with. Runtimes use it to shape
+	 * endpoint-override env: only `none` (keyless local server) gets a dummy
+	 * bearer + inherited-credential neutralization.
+	 */
+	authMode?: AuthMode;
 }
 
 // ---------------------------------------------------------------------------

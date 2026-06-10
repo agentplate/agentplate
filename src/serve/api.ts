@@ -67,6 +67,8 @@ function overview(ctx: ApiContext): unknown {
 			runtime: config.runtime.default,
 			provider: config.activeProvider,
 			model: provider?.model ?? null,
+			baseUrl: provider?.baseUrl ?? null,
+			authMode: provider?.authMode ?? null,
 			deployTarget: config.deploy.default || null,
 			currentRun,
 			agentCount: sessions.length,

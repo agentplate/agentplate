@@ -5,17 +5,18 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../config.ts";
 import { createEventStore, type EventStore } from "../events/store.ts";
 import { createMailClient, type MailClient } from "../mail/client.ts";
 import { eventsDbPath, sessionsDbPath } from "../paths.ts";
+import { claudeRuntime } from "../runtimes/claude.ts";
 import { MockRuntime } from "../runtimes/mock.ts";
 import type { DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore, type SessionStore } from "../sessions/store.ts";
-import type { AgentplateConfig, AgentSession } from "../types.ts";
+import type { AgentplateConfig, AgentSession, ResolvedModel } from "../types.ts";
 import { driveTurn } from "./drive.ts";
 
 /** Mock runtime that records the spawn opts (so we can assert the resume id). */
@@ -24,6 +25,18 @@ class SpyRuntime extends MockRuntime {
 	override buildDirectSpawn(opts: DirectSpawnOpts): string[] {
 		this.lastOpts = opts;
 		return super.buildDirectSpawn(opts);
+	}
+}
+
+/**
+ * Mock-spawned runtime with the REAL claude env shaping: the turn still runs the
+ * scripted bash command (never a real `claude`), but the env merged into the
+ * child comes from {@link claudeRuntime.buildEnv} — so a test can prove what a
+ * keyless-local provider's worker turn actually exports to the subprocess.
+ */
+class ClaudeEnvRuntime extends MockRuntime {
+	override buildEnv(model: ResolvedModel): Record<string, string> {
+		return claudeRuntime.buildEnv(model);
 	}
 }
 
@@ -120,6 +133,43 @@ describe("driveTurn — warm start", () => {
 			prompt: "begin",
 		});
 		expect(runtime.lastOpts?.resumeSessionId).toBeUndefined();
+	});
+});
+
+describe("driveTurn — keyless-local provider env (authMode 'none')", () => {
+	test("forwards authMode so the claude keyless env reaches the spawned child", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+
+		// The probe writes the keyless-local env vars to a file from INSIDE the
+		// spawned child (`-unset` distinguishes set-but-empty from unset), proving
+		// what buildEnv actually exported through the worker path — not just what
+		// drive.ts intended to pass.
+		const probeFile = join(worktree, "env-probe.txt");
+		process.env.AGENTPLATE_MOCK_CMD = `printf '%s|%s|%s|%s' "\${ANTHROPIC_BASE_URL-unset}" "\${ANTHROPIC_AUTH_TOKEN-unset}" "\${ANTHROPIC_API_KEY-unset}" "\${ANTHROPIC_SMALL_FAST_MODEL-unset}" > '${probeFile}'`;
+
+		await driveTurn({
+			root,
+			config: cfg(),
+			runtime: new ClaudeEnvRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: {
+				model: "local-m",
+				env: {},
+				baseUrl: "http://127.0.0.1:11434",
+				authMode: "none",
+			},
+			prompt: "go",
+		});
+
+		// Base URL mapped, dummy bearer injected, inherited ANTHROPIC_API_KEY
+		// neutralized to "" (NOT unset), and the small-fast model pinned.
+		expect(readFileSync(probeFile, "utf8")).toBe(
+			"http://127.0.0.1:11434|agentplate-local||local-m",
+		);
 	});
 });
 

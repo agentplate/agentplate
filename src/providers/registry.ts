@@ -218,10 +218,14 @@ export const PROVIDERS: readonly ProviderSpec[] = [
 		description: "Run open models locally — no API key required",
 		kind: "gateway",
 		authEnvVar: "OLLAMA_API_KEY",
-		defaultBaseUrl: "http://localhost:11434/v1",
+		// Root URL, no /v1 — Ollama serves Anthropic-compat /v1/messages and
+		// OpenAI-compat /v1/chat/completions from the root; runtimes append paths.
+		defaultBaseUrl: "http://localhost:11434",
 		keyless: true,
 		docsUrl: "https://ollama.com/library",
+		// Tool-calling-capable coding models only — agents need function calling.
 		models: [
+			{ id: "qwen3-coder:30b", label: "Qwen3 Coder 30B (tool-capable)", contextWindow: 262_144 },
 			{ id: "qwen2.5-coder:32b", label: "Qwen2.5 Coder 32B", contextWindow: 128_000 },
 			{ id: "llama3.3:70b", label: "Llama 3.3 70B", contextWindow: 128_000 },
 		],

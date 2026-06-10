@@ -131,6 +131,19 @@ distilling reusable skills from work that passed its quality gates.
   key (or subscription login) for your provider. Pick one in `agentplate setup`, or per
   command with `--runtime <claude|opencode|codex>`.
 
+### Local models (Ollama)
+
+Ollama loads every model with a **32k default context window**, regardless of what the
+model actually supports. Coding-agent runtimes need more — Claude Code's system prompt +
+tool definitions alone are ~32k tokens — so against a default-context Ollama the prompt is
+truncated and the model silently returns empty replies. Create a context-extended derived
+model and select **it** in `agentplate setup`:
+
+```bash
+printf 'FROM qwen3-coder:30b\nPARAMETER num_ctx 65536\n' > Modelfile
+ollama create qwen3-coder:30b-64k -f Modelfile
+```
+
 ## Install
 
 ```bash
