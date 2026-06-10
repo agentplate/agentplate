@@ -4,6 +4,36 @@ All notable changes to Agentplate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to adhere to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-06-10
+
+### Added
+
+- **Local/keyless LLM providers work end-to-end** — provider `baseUrl` and auth
+  mode now flow from config through `resolveModel()` into every runtime spawn
+  path (worker turns, coordinator incl. `--safe`, skill distiller). The claude
+  runtime maps them to `ANTHROPIC_BASE_URL` so Ollama and other
+  Anthropic-compatible local endpoints can drive agents with no API key.
+- **Doctor endpoint check** — `agentplate doctor` now probes the active
+  provider's base URL (hard fail when unreachable) and warns when plaintext
+  `http://` points at a non-loopback host.
+- **Wizard guidance for local providers** — keyless providers with a base URL
+  default to the claude runtime, with a pairing warning for other runtimes and
+  a tip about Ollama's 32k default context window (with a `num_ctx` Modelfile
+  recipe).
+- **Provider visibility** — `/api/overview` and the web UI Settings screen show
+  the active provider's base URL and auth mode.
+
+### Fixed
+
+- **Credential hygiene around custom endpoints** — keyless mode neutralizes a
+  shell-inherited `ANTHROPIC_API_KEY` so it is never sent to a local endpoint,
+  and a warning is logged when a real credential is routed to a non-loopback
+  base URL.
+- **Skill distiller provider env** — the distiller previously spawned with bare
+  `process.env`, ignoring the configured provider entirely.
+- **Ollama registry entry** — root `defaultBaseUrl` (no `/v1`) and refreshed
+  tool-capable model presets led by `qwen3-coder:30b`.
+
 ## [1.6.0] — 2026-06-03
 
 ### Added
