@@ -8,9 +8,12 @@
  * itself spawns leads via real AI) builds on this in a later phase.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { Command } from "commander";
+import {
+	removeGeneratedInstructionFile,
+	writeGeneratedInstructionFile,
+} from "../agents/instruction-file.ts";
 import { writeCoordinatorSystemPrompt } from "../agents/system-prompt.ts";
 import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
@@ -27,11 +30,78 @@ import { createMailClient } from "../mail/client.ts";
 import { currentRunPath, sessionsDbPath } from "../paths.ts";
 import { getRuntime } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
+import type { AgentRuntime, InteractiveSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession } from "../types.ts";
 import { resolveArgv } from "../utils/detect.ts";
 
 const COORDINATOR_NAME = "coordinator";
+
+/** A runtime that can host an attended chat (`buildInteractiveSpawn` present). */
+type InteractiveRuntime = AgentRuntime & {
+	buildInteractiveSpawn(opts: InteractiveSpawnOpts): string[];
+};
+
+function isInteractiveRuntime(runtime: AgentRuntime): runtime is InteractiveRuntime {
+	return typeof runtime.buildInteractiveSpawn === "function";
+}
+
+/** How `coordinator start` hands its role prompt to the runtime. */
+export interface CoordinatorLaunch {
+	/** The interactive argv to spawn. */
+	argv: string[];
+	/** Instruction file generated at the root for this chat (removed on exit), or null. */
+	generatedFile: string | null;
+	/**
+	 * Set when the root instruction file could not be used (the operator's own
+	 * file is there, or the write failed) and the role was seeded as the first
+	 * message instead. Holds the reason, for the operator-facing warning.
+	 */
+	seededBecause: string | null;
+}
+
+/** Prefix the role prompt to the operator's optional first message. */
+function seedRole(systemPrompt: string, initialMessage: string | undefined): string {
+	if (!initialMessage) return systemPrompt;
+	return `${systemPrompt}\n\n---\n\nOperator's first message:\n\n${initialMessage}`;
+}
+
+/**
+ * Decide how the coordinator's role reaches `runtime` WITHOUT ever replacing the
+ * operator's instruction file at the project root (the file `writeOverlay`
+ * refuses to touch):
+ *
+ * 1. If the runtime carries the prompt in argv (claude's `--append-system-prompt`),
+ *    nothing is written to the root at all.
+ * 2. Otherwise (codex/opencode/cursor/gemini read only their instruction file),
+ *    write `<root>/<instructionPath>` only when it is absent or Agentplate-generated.
+ * 3. If the operator's own file is there, leave it untouched and seed the role
+ *    as the chat's first message instead.
+ */
+export function planCoordinatorLaunch(
+	root: string,
+	runtime: InteractiveRuntime,
+	opts: InteractiveSpawnOpts & { systemPrompt: string },
+): CoordinatorLaunch {
+	const argv = runtime.buildInteractiveSpawn(opts);
+	if (argv.includes(opts.systemPrompt)) {
+		return { argv, generatedFile: null, seededBecause: null };
+	}
+	let reason: string;
+	try {
+		const result = writeGeneratedInstructionFile(root, runtime.instructionPath, opts.systemPrompt);
+		if (result.written) return { argv, generatedFile: result.path, seededBecause: null };
+		reason = result.reason;
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		reason = `could not write ${runtime.instructionPath} (${detail})`;
+	}
+	const seeded = runtime.buildInteractiveSpawn({
+		...opts,
+		initialMessage: seedRole(opts.systemPrompt, opts.initialMessage),
+	});
+	return { argv: seeded, generatedFile: null, seededBecause: reason };
+}
 
 function requireInit(): string {
 	const root = findProjectRoot();
@@ -105,7 +175,7 @@ function startCommand(): Command {
 
 				// 2. Resolve the runtime + model and build the interactive session.
 				const runtime = getRuntime(opts.runtime ?? config.runtime.default, config.runtime.default);
-				if (!runtime.buildInteractiveSpawn) {
+				if (!isInteractiveRuntime(runtime)) {
 					store.close();
 					throw new ValidationError(
 						`Runtime "${runtime.id}" has no interactive mode. Use --no-attach, or set a runtime that supports interactive chat (e.g. claude).`,
@@ -122,21 +192,12 @@ function startCommand(): Command {
 					canonicalBranch: config.project.canonicalBranch,
 					instructionPath: runtime.instructionPath,
 				});
-				// Also write the role to the runtime's own instruction file (e.g.
-				// AGENTS.md for opencode/codex, .claude/CLAUDE.md for claude) so the
-				// coordinator is primed even on runtimes without a system-prompt flag.
-				try {
-					const instr = join(root, runtime.instructionPath);
-					mkdirSync(dirname(instr), { recursive: true });
-					writeFileSync(instr, systemPrompt, "utf8");
-				} catch {
-					// Non-fatal: the agent still works; --append-system-prompt covers
-					// runtimes that support it (claude).
-				}
 				// Default to auto/bypass mode so the coordinator runs unattended (no
 				// per-action permission prompts); `--safe` restores prompting.
 				const permissionMode = opts.safe ? "default" : "bypass";
-				const argv = runtime.buildInteractiveSpawn({
+				// Prime the role via argv, or a root instruction file Agentplate owns —
+				// never by overwriting the operator's AGENTS.md / CLAUDE.md / GEMINI.md.
+				const launch = planCoordinatorLaunch(root, runtime, {
 					model: resolved.model,
 					systemPrompt,
 					permissionMode,
@@ -144,6 +205,11 @@ function startCommand(): Command {
 				});
 
 				printSuccess(`${brand("coordinator")} started — run ${run.id}`);
+				if (launch.seededBecause !== null) {
+					printWarning(
+						`${launch.seededBecause}; left it untouched and sent the coordinator role as the first message instead.`,
+					);
+				}
 				if (permissionMode === "bypass") {
 					printWarning(
 						"auto mode: the coordinator runs WITHOUT permission prompts (bypassPermissions). Use --safe to prompt.",
@@ -162,14 +228,20 @@ function startCommand(): Command {
 				if (permissionMode !== "bypass") {
 					delete interactiveEnv.OPENCODE_PERMISSION;
 				}
-				const proc = Bun.spawn(resolveArgv(argv), {
-					cwd: root,
-					env: { ...process.env, ...interactiveEnv },
-					stdin: "inherit",
-					stdout: "inherit",
-					stderr: "inherit",
-				});
-				const exitCode = await proc.exited;
+				let exitCode: number;
+				try {
+					const proc = Bun.spawn(resolveArgv(launch.argv), {
+						cwd: root,
+						env: { ...process.env, ...interactiveEnv },
+						stdin: "inherit",
+						stdout: "inherit",
+						stderr: "inherit",
+					});
+					exitCode = await proc.exited;
+				} finally {
+					// Leave the root as we found it: drop the file this chat generated.
+					if (launch.generatedFile) removeGeneratedInstructionFile(launch.generatedFile);
+				}
 
 				// 4. On exit, mark the coordinator stopped.
 				const closeStore = createSessionStore(sessionsDbPath(root));
