@@ -288,7 +288,7 @@ function wilsonLowerBound(successes: number, n: number): number {
 	const lower = (center - margin) / denom;
 	// Clamp to [0,1]; weighting can push phat into ranges where the raw bound
 	// drifts a hair outside the interval.
-	return lower < 0 ? 0 : lower > 1 ? 1 : lower;
+	return Math.min(Math.max(lower, 0), 1);
 }
 
 /** Derived stats recomputed from a skill's full outcome history. */
