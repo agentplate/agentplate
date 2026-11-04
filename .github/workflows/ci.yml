@@ -5,16 +5,23 @@ on:
     branches: [main]
   pull_request:
 
+# CI only reads the repo. Third-party actions are pinned to full commit SHAs
+# (Dependabot's github-actions ecosystem still bumps them via the `# vX` comment).
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -27,3 +34,31 @@ jobs:
 
       - name: Typecheck
         run: bun run typecheck
+
+  # The web UI (ui/) has its own package + lockfile and is excluded from the root
+  # tsconfig, and `vite build` only transpiles — so type-check and build it here,
+  # otherwise a UI break (e.g. from a ui-dependencies Dependabot bump) would first
+  # surface at publish time.
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install UI dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck UI
+        run: bun run typecheck
+
+      - name: Build UI
+        run: bun run build

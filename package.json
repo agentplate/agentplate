@@ -46,7 +46,7 @@
 		"lint:fix": "biome check --write .",
 		"typecheck": "tsc --noEmit",
 		"check": "bun test && biome check . && tsc --noEmit",
-		"build:ui": "cd ui && bun install && bun run build",
+		"build:ui": "cd ui && bun install --frozen-lockfile && bun run build",
 		"prepack": "bun run build:ui"
 	},
 	"dependencies": {
