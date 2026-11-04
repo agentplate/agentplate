@@ -23,10 +23,13 @@ The header shows a live `● connected` / `○ offline` WebSocket indicator.
 
 ## Develop
 
-Run the Agentplate server in one terminal (default port `7551`):
+Run the Agentplate server in one terminal (default port `7551`), trusting the
+Vite dev origin so its proxied writes (`POST /api/*`) and `/ws` pass the
+server's Origin allowlist (the proxy rewrites `Host` but keeps
+`Origin: http://localhost:5173`):
 
 ```bash
-agentplate serve
+agentplate serve --allow-origin http://localhost:5173
 ```
 
 Then start the Vite dev server in another:

@@ -3,8 +3,9 @@
  * Centralized so every command/store agrees on where things live.
  */
 
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { AGENTPLATE_DIR } from "./config.ts";
+import { ValidationError } from "./errors.ts";
 
 export const sessionsDbPath = (root: string): string => join(root, AGENTPLATE_DIR, "sessions.db");
 export const eventsDbPath = (root: string): string => join(root, AGENTPLATE_DIR, "events.db");
@@ -35,3 +36,31 @@ export const packageAgentDefPath = (file: string): string =>
 
 /** The package root (one level above src/). Used to locate bundled ui/dist. */
 export const packageRootDir = (): string => join(import.meta.dir, "..");
+
+/**
+ * A task id names a spec file (`specs/<id>.md`), an agent name and a branch, so
+ * it must be a single safe path segment: alphanumeric first (never a leading
+ * `-` that argv would read as a flag), then `[A-Za-z0-9._-]`, at most 64 chars,
+ * and never containing `..`.
+ */
+const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+export function isSafeTaskId(taskId: string): boolean {
+	return TASK_ID_PATTERN.test(taskId) && !taskId.includes("..");
+}
+
+/** Throw a {@link ValidationError} unless `taskId` passes {@link isSafeTaskId}. */
+export function assertSafeTaskId(taskId: string): void {
+	if (!isSafeTaskId(taskId)) {
+		throw new ValidationError(
+			`Invalid task id "${taskId}": use 1-64 chars of [A-Za-z0-9._-], starting with a letter or digit, with no "..".`,
+		);
+	}
+}
+
+/** True when `path` resolves strictly inside `dir` (containment guard for fs writes/deletes). */
+export function isPathInside(dir: string, path: string): boolean {
+	const base = resolve(dir);
+	const target = resolve(path);
+	return target !== base && target.startsWith(base + sep);
+}

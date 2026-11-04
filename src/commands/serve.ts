@@ -10,20 +10,46 @@ import { Command } from "commander";
 import { findProjectRoot, isInitialized } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
-import { brand, printHint, printInfo, printSuccess } from "../logging/color.ts";
+import { accent, brand, printHint, printInfo, printSuccess } from "../logging/color.ts";
 import { packageRootDir } from "../paths.ts";
-import { startServer } from "../serve/server.ts";
+import { isLoopbackHost, startServer } from "../serve/server.ts";
+
+/**
+ * The warning printed (to stderr, never suppressed) when binding off loopback:
+ * the API has no authentication and can spawn agents that run with bypassed
+ * permissions, so anyone who can reach the port can run code as this user.
+ */
+export function remoteBindWarning(host: string): string {
+	return [
+		`${accent("!")} WARNING: binding to ${host}, which is NOT a loopback address.`,
+		"  The agentplate API has no authentication. Anyone who can reach this port can",
+		"  read all agent state AND spawn agents that run commands on this machine.",
+		"  Only do this on a network you fully trust; prefer the default 127.0.0.1.",
+	].join("\n");
+}
 
 export function createServeCommand(): Command {
 	return new Command("serve")
 		.description("Serve the web UI (HTTP + WebSocket) over the project's state")
 		.option("--port <n>", "port", "7551")
-		.option("--host <addr>", "bind host", "127.0.0.1")
+		.option("--host <addr>", "bind host (non-loopback exposes an unauthenticated API)", "127.0.0.1")
 		.option("--ui-dir <path>", "directory of the built SPA (default: bundled ui/dist)")
+		.option(
+			"--allow-origin <origin>",
+			"extra trusted browser origin for writes + /ws, repeatable (e.g. http://localhost:5173 for the Vite dev server)",
+			(value: string, previous: string[]) => [...previous, value],
+			[] as string[],
+		)
 		.option("--json", "output JSON (prints the URL and exits non-blocking info)")
 		.action(
 			async (
-				opts: { port: string; host: string; uiDir?: string; json?: boolean },
+				opts: {
+					port: string;
+					host: string;
+					uiDir?: string;
+					allowOrigin: string[];
+					json?: boolean;
+				},
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
@@ -32,11 +58,13 @@ export function createServeCommand(): Command {
 					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
 				}
 				const uiDir = opts.uiDir ?? join(packageRootDir(), "ui", "dist");
+				if (!isLoopbackHost(opts.host)) process.stderr.write(`${remoteBindWarning(opts.host)}\n`);
 				const handle = startServer({
 					root,
 					port: Number(opts.port),
 					host: opts.host,
 					uiDir,
+					allowedOrigins: opts.allowOrigin,
 				});
 
 				if (useJson) {

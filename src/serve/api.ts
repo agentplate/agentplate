@@ -15,12 +15,37 @@ import { getAllDeployTargets } from "../deploy/registry.ts";
 import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { createMailClient } from "../mail/client.ts";
-import { currentRunPath, deploysDbPath, eventsDbPath, sessionsDbPath } from "../paths.ts";
+import {
+	assertSafeTaskId,
+	currentRunPath,
+	deploysDbPath,
+	eventsDbPath,
+	isPathInside,
+	sessionsDbPath,
+	specPath,
+	specsDir,
+} from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { createSkillStore } from "../skills/store.ts";
+import type { Capability } from "../types.ts";
+import { SUPPORTED_CAPABILITIES } from "../types.ts";
 
 export interface ApiContext {
 	root: string;
+}
+
+/** Upper bound for a `?limit=` query param on list endpoints. */
+const MAX_LIST_LIMIT = 1000;
+
+/**
+ * Parse a `?limit=` query value into a positive integer clamped to
+ * [1, MAX_LIST_LIMIT]; anything missing or non-numeric falls back to `fallback`
+ * (never "unbounded", which the stores treat NaN/0 as).
+ */
+export function parseLimit(raw: string | null, fallback: number): number {
+	const n = Math.trunc(Number(raw ?? fallback));
+	if (!Number.isFinite(n) || n < 1) return fallback;
+	return Math.min(n, MAX_LIST_LIMIT);
 }
 
 /** A single REST route: method + path matcher + handler returning JSON data. */
@@ -126,7 +151,7 @@ function agentDetail(ctx: ApiContext, params: Record<string, string>): unknown {
 function events(ctx: ApiContext, _params: Record<string, string>, query: URLSearchParams): unknown {
 	const store = createEventStore(eventsDbPath(ctx.root));
 	try {
-		const limit = Number(query.get("limit") ?? "100");
+		const limit = parseLimit(query.get("limit"), 100);
 		const agentName = query.get("agent") ?? undefined;
 		return store.list({ agentName, limit });
 	} finally {
@@ -172,7 +197,7 @@ function handoffs(
 	_params: Record<string, string>,
 	query: URLSearchParams,
 ): unknown {
-	const limit = Number(query.get("limit") ?? "100");
+	const limit = parseLimit(query.get("limit"), 100);
 	const client = createMailClient(ctx.root);
 	try {
 		return client
@@ -326,7 +351,7 @@ export function buildFeed(ctx: ApiContext, limit = 60): FeedItem[] {
 }
 
 function feed(ctx: ApiContext, _params: Record<string, string>, query: URLSearchParams): unknown {
-	return buildFeed(ctx, Number(query.get("limit") ?? "60"));
+	return buildFeed(ctx, parseLimit(query.get("limit"), 60));
 }
 
 /** Agents grouped into operator-facing status buckets, with counts. */
@@ -586,10 +611,20 @@ export function matchRoute(pattern: string, path: string): Record<string, string
 // messaging the coordinator and spawning a worker; no deploy/secrets/rollback.
 // ---------------------------------------------------------------------------
 
+/** Max length (chars) of a chat message or task prompt accepted over HTTP. */
+export const MAX_TEXT_FIELD_CHARS = 64 * 1024;
+
+function assertTextLength(field: string, value: string): void {
+	if (value.length > MAX_TEXT_FIELD_CHARS) {
+		throw new ValidationError(`\`${field}\` is too long (max ${MAX_TEXT_FIELD_CHARS} chars).`);
+	}
+}
+
 /** POST /api/chat — message the coordinator over the mail bus. */
 export function postChat(ctx: ApiContext, body: { message?: unknown }): unknown {
 	const message = typeof body.message === "string" ? body.message.trim() : "";
 	if (!message) throw new ValidationError("chat requires a non-empty `message`.");
+	assertTextLength("message", message);
 	const client = createMailClient(ctx.root);
 	try {
 		const sent = client.send({
@@ -616,16 +651,27 @@ export function postTask(
 ): unknown {
 	const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
 	if (!prompt) throw new ValidationError("task requires a non-empty `prompt`.");
+	assertTextLength("prompt", prompt);
 	const capability = typeof body.capability === "string" ? body.capability : "builder";
+	if (!SUPPORTED_CAPABILITIES.includes(capability as Capability)) {
+		throw new ValidationError(
+			`Unknown capability "${capability}". One of: ${SUPPORTED_CAPABILITIES.join(", ")}`,
+		);
+	}
 	const taskId =
 		typeof body.taskId === "string" && body.taskId.trim()
 			? body.taskId.trim()
 			: `ui-${Date.now().toString(36)}`;
+	// The id becomes a file name + sling argv positional: one safe path segment only.
+	assertSafeTaskId(taskId);
 
 	// Record the task intent as a spec the worker reads, then sling detached.
-	const specDir = join(ctx.root, ".agentplate", "specs");
+	const specDir = specsDir(ctx.root);
+	const specFile = specPath(ctx.root, taskId);
+	if (!isPathInside(specDir, specFile)) {
+		throw new ValidationError(`Invalid task id "${taskId}": spec path escapes ${specDir}.`);
+	}
 	mkdirSync(specDir, { recursive: true });
-	const specFile = join(specDir, `${taskId}.md`);
 	writeFileSync(specFile, `# Task ${taskId}\n\n${prompt}\n`, "utf8");
 
 	// The spec above is the durable task intent — GET /api/tasks surfaces it as a
