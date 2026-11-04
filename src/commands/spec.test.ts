@@ -101,6 +101,14 @@ describe("resolveSpecBody", () => {
 });
 
 describe("spec write", () => {
+	test("rejects a path-traversal task id before writing anything", async () => {
+		await expect(runWrite("../agent-defs/builder", { body: "x" }, false)).rejects.toBeInstanceOf(
+			ValidationError,
+		);
+		expect(() => runShow("../../CLAUDE", false)).toThrow(ValidationError);
+		expect(existsSync(join(root, ".agentplate", "agent-defs", "builder.md"))).toBe(false);
+	});
+
 	test("writes the spec to the canonical path with a trailing newline", async () => {
 		await runWrite("task-a", { body: "Goal: A" }, false);
 		const path = specPath(root, "task-a");
