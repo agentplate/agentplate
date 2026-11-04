@@ -232,6 +232,28 @@ describe("createSessionStore — state transitions", () => {
 		const fetched = store.getSession(session.id);
 		expect(Date.parse(fetched?.lastActivity ?? "")).toBeGreaterThan(Date.parse(past));
 	});
+
+	test("transitionSessionState only moves a session still in the expected state", () => {
+		const session = makeSession({ state: "working" });
+		store.upsertSession(session);
+		expect(store.transitionSessionState(session.id, "working", "idle")).toBe(true);
+		expect(store.getSession(session.id)?.state).toBe("idle");
+
+		// Stopped mid-turn: the finishing turn's working → completed must not apply.
+		store.updateSessionState(session.id, "stopped");
+		expect(store.transitionSessionState(session.id, "working", "completed")).toBe(false);
+		expect(store.getSession(session.id)?.state).toBe("stopped");
+		expect(store.transitionSessionState("no-such-id", "working", "idle")).toBe(false);
+	});
+
+	test("setPid records and clears the live turn's pid", () => {
+		const session = makeSession({ pid: null });
+		store.upsertSession(session);
+		store.setPid(session.id, 4242);
+		expect(store.getSession(session.id)?.pid).toBe(4242);
+		store.setPid(session.id, null);
+		expect(store.getSession(session.id)?.pid).toBeNull();
+	});
 });
 
 describe("createSessionStore — listing and filtering", () => {

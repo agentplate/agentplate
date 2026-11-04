@@ -5,16 +5,22 @@
  * no live process, waiting for mail that may never come. A stalled turn can also
  * leave a session stuck `working`. Either way, an agent with no activity for the
  * configured idle window is dead weight — it counts toward the concurrency cap and
- * clutters the UI. This module reaps them: mark the session `stopped`, kill any
- * live pid, and (by default) remove its worktree + branch.
+ * clutters the UI. This module reaps them: mark the session `stopped` and (by
+ * default) remove its worktree + merged branch.
  *
- * "Activity" is the session's `last_activity`, which `sling` bumps on every
- * streamed runtime event, so an agent actively working a long turn keeps itself
- * fresh and is never reaped — only genuinely idle/stalled agents are. The
- * coordinator is excluded by default (it's a long-lived interactive session whose
- * worktree IS the project root, and it does not stream per-turn events).
+ * "Activity" is the session's `last_activity`, which `driveTurn` bumps on every
+ * streamed runtime event. A quiet turn (a long tool call, a nested synchronous
+ * `sling`) streams nothing, so staleness alone never condemns a session:
+ * - a session whose recorded turn pid is still alive is working, never idle;
+ * - a `working` session with no recorded pid can't be proven dead, so it is left
+ *   alone (`agents.turnTimeoutMinutes` and `agentplate stop` own that case);
+ * - a parent with active children is waiting on them, and a child's activity
+ *   counts as its parent's, so a lead is not reaped the moment its builders finish.
+ * The coordinator is excluded by default (it's a long-lived interactive session
+ * whose worktree IS the project root, and it does not stream per-turn events).
  */
 
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { createEventStore } from "../events/store.ts";
 import { createMailStore } from "../mail/store.ts";
 import { createMergeQueue } from "../merge/queue.ts";
@@ -37,22 +43,52 @@ export interface SelectIdleOptions {
 	now: number;
 	/** Capabilities to skip (defaults to `["coordinator"]`). */
 	excludeCapabilities?: readonly string[];
+	/** Liveness probe for a recorded pid (injectable for tests; default {@link isPidAlive}). */
+	isPidAlive?: (pid: number) => boolean;
 }
 
 /**
- * Pure selector: which sessions are idle past the window. Kept side-effect-free so
- * the reap policy is trivially unit-testable without a store or git.
+ * Is `pid` a live process? Signal 0 probes without delivering anything: ESRCH
+ * means gone, EPERM means alive but owned by someone else.
+ */
+export function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as { code?: unknown }).code === "EPERM";
+	}
+}
+
+/**
+ * Pure selector: which sessions are idle past the window. Side-effect-free apart
+ * from the (injectable) pid probe, so the reap policy is unit-testable without a
+ * store or git. `sessions` should be the full list: it is also how a session's
+ * children are found.
  */
 export function selectIdleSessions(
 	sessions: readonly AgentSession[],
 	opts: SelectIdleOptions,
 ): AgentSession[] {
 	const exclude = new Set(opts.excludeCapabilities ?? DEFAULT_EXCLUDE);
+	const alive = opts.isPidAlive ?? isPidAlive;
 	return sessions.filter((s) => {
 		if (!REAPABLE_STATES.includes(s.state)) return false;
 		if (exclude.has(s.capability)) return false;
-		const last = Date.parse(s.lastActivity);
+		// A live turn process is working, however quiet its event stream.
+		if (s.pid != null && alive(s.pid)) return false;
+		// `working` with no pid on record: the turn can't be proven dead — leave it.
+		if (s.state === "working" && s.pid == null) return false;
+		let last = Date.parse(s.lastActivity);
 		if (Number.isNaN(last)) return false;
+		for (const child of sessions) {
+			if (child.parentAgent !== s.agentName || child.runId !== s.runId) continue;
+			// A parent with live children is waiting on them, not idle.
+			if (REAPABLE_STATES.includes(child.state)) return false;
+			// A child's last move (e.g. finishing) is activity on its parent's behalf.
+			const childLast = Date.parse(child.lastActivity);
+			if (childLast > last) last = childLast;
+		}
 		return opts.now - last >= opts.idleMs;
 	});
 }
@@ -89,10 +125,12 @@ export interface ReapOptions {
 }
 
 /**
- * Reap idle sessions: kill any live pid, optionally remove the worktree + branch,
- * and mark the session `stopped`. Every side effect is best-effort and isolated
- * per session — a failure to kill a process or remove a worktree still marks the
- * session stopped and never aborts the sweep. Returns the agents that were reaped.
+ * Reap idle sessions: optionally remove the worktree + (merged) branch, and mark
+ * the session `stopped`. Live turns are never selected (see
+ * {@link selectIdleSessions}), so there is no process to kill. Every side effect
+ * is best-effort and isolated per session — a failure to remove a worktree still
+ * marks the session stopped and never aborts the sweep. Returns the agents that
+ * were reaped.
  */
 export async function reapIdleSessions(
 	store: SessionStore,
@@ -121,16 +159,7 @@ export async function reapIdleSessions(
 	const reaped: ReapedAgent[] = [];
 	try {
 		for (const s of stale) {
-			// 1. Kill any live process (spawn-per-turn workers usually have no pid).
-			if (s.pid != null) {
-				try {
-					process.kill(s.pid, "SIGTERM");
-				} catch {
-					// Already gone / not ours — nothing to do.
-				}
-			}
-
-			// 2. Remove the worktree + branch (guarded against the project root).
+			// 1. Remove the worktree + branch (guarded against the project root).
 			let worktreeRemoved = false;
 			if (removeWorktrees && isRemovableWorktree(root, s.worktreePath)) {
 				try {
@@ -138,23 +167,24 @@ export async function reapIdleSessions(
 						await removeWorktree(root, s.worktreePath, { force: true });
 					}
 					worktreeRemoved = true;
-					// Branch delete is separate and best-effort (no-op if already gone).
+					// Branch delete is separate and best-effort. deleteBranch refuses an
+					// unmerged branch, so committed-but-unlanded work always survives.
 					try {
 						await deleteBranch(root, s.branchName);
 					} catch {
-						// Branch may be merged away or shared — leave it.
+						// Unmerged, shared, or already gone — leave it.
 					}
 				} catch {
 					worktreeRemoved = false;
 				}
 			}
 
-			// 3. Mark the session terminated so it stops counting and shows as stopped.
-			//    (When purging, the row is deleted in step 4 — but we still transition it
+			// 2. Mark the session terminated so it stops counting and shows as stopped.
+			//    (When purging, the row is deleted in step 3 — but we still transition it
 			//    first so any concurrent reader observes a terminal state, never a gap.)
 			store.updateSessionState(s.id, "stopped");
 
-			// 4. Optionally erase every trace of the agent so the workspace is cleared.
+			// 3. Optionally erase every trace of the agent so the workspace is cleared.
 			let purged: PurgeReport | null = null;
 			if (aux) {
 				purged = purgeAgentData(root, s, { sessions: store, ...aux });
@@ -180,11 +210,17 @@ export async function reapIdleSessions(
 }
 
 /**
- * Only worktrees under `.agentplate/worktrees/` are removable. This refuses to
- * touch the project root (the coordinator's `worktreePath`) or any path outside
- * the managed worktrees dir — a hard safety net beyond the capability exclusion.
+ * Only worktrees strictly inside `.agentplate/worktrees/` are removable. This
+ * refuses the project root (the coordinator's and deploy sessions' `worktreePath`),
+ * the worktrees dir itself, and any path outside it — including look-alike
+ * prefixes (`worktrees-x/`) and `..` escapes. Shared by the reaper and
+ * `agentplate stop`, so every `git worktree remove --force` goes through it.
  */
-function isRemovableWorktree(root: string, worktreePath: string): boolean {
-	if (!worktreePath || worktreePath === root) return false;
-	return worktreePath.startsWith(worktreesDir(root));
+export function isRemovableWorktree(root: string, worktreePath: string): boolean {
+	if (!worktreePath) return false;
+	const target = resolve(worktreePath);
+	if (target === resolve(root)) return false;
+	const rel = relative(resolve(worktreesDir(root)), target);
+	if (rel === "" || isAbsolute(rel)) return false;
+	return rel !== ".." && !rel.startsWith(`..${sep}`);
 }

@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../config.ts";
@@ -14,7 +14,7 @@ import { createMailClient, type MailClient } from "../mail/client.ts";
 import { eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { claudeRuntime } from "../runtimes/claude.ts";
 import { MockRuntime } from "../runtimes/mock.ts";
-import type { DirectSpawnOpts } from "../runtimes/types.ts";
+import type { AgentEvent, DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore, type SessionStore } from "../sessions/store.ts";
 import type { AgentplateConfig, AgentSession, ResolvedModel } from "../types.ts";
 import { driveTurn } from "./drive.ts";
@@ -201,5 +201,169 @@ describe("driveTurn — state transition", () => {
 		});
 		expect(out.finalState).toBe("completed");
 		expect(store.getSession(session.id)?.state).toBe("completed");
+	});
+
+	test("a stop that lands mid-turn sticks: the finishing turn never resurrects it", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		// Terminal mail already sent, so without the stop this turn would be 'completed'.
+		mail.send({
+			from: session.agentName,
+			to: "lead-1",
+			subject: "d",
+			body: "",
+			type: "worker_done",
+		});
+		process.env.AGENTPLATE_MOCK_CMD = "sleep 0.4";
+		const config = cfg();
+		config.skills.enabled = false;
+
+		const pending = driveTurn({
+			root,
+			config,
+			runtime: new SpyRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+		await waitFor(() => store.getSession(session.id)?.pid != null);
+		store.updateSessionState(session.id, "stopped"); // what `agentplate stop` does
+
+		const out = await pending;
+		expect(out.finalState).toBe("stopped");
+		expect(store.getSession(session.id)?.state).toBe("stopped");
+	});
+});
+
+/** Poll `cond` until true (or fail after `ms`). */
+async function waitFor(cond: () => boolean, ms = 5000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (!cond()) {
+		if (Date.now() > deadline) throw new Error("waitFor: timed out");
+		await Bun.sleep(10);
+	}
+}
+
+/** A runtime whose binary doesn't exist, so Bun.spawn throws before any turn runs. */
+class MissingBinaryRuntime extends MockRuntime {
+	override buildDirectSpawn(_opts: DirectSpawnOpts): string[] {
+		return [join(root, "no-such-runtime-binary")];
+	}
+}
+
+/** Mock runtime that streams one runtime error event (as claude does for API errors). */
+class ErrorEventRuntime extends MockRuntime {
+	constructor(private readonly message: string) {
+		super();
+	}
+	async *parseEvents(stream: ReadableStream<Uint8Array>): AsyncIterable<AgentEvent> {
+		await new Response(stream).text();
+		yield { type: "error", error: this.message, raw: { is_error: true, result: this.message } };
+	}
+}
+
+describe("driveTurn — failure handling", () => {
+	test("a spawn that throws leaves the session 'failed' (not 'working') and records why", async () => {
+		const session = makeSession({ state: "booting" });
+		store.upsertSession(session);
+
+		await expect(
+			driveTurn({
+				root,
+				config: cfg(),
+				runtime: new MissingBinaryRuntime(),
+				store,
+				events,
+				mail,
+				session,
+				model: { model: "m", env: {} },
+				prompt: "go",
+			}),
+		).rejects.toThrow();
+
+		const row = store.getSession(session.id);
+		expect(row?.state).toBe("failed");
+		expect(row?.pid).toBeNull();
+		expect(store.countActive()).toBe(0); // no longer holds a concurrency slot
+		const errors = events.list({ agentName: session.agentName }).filter((e) => e.type === "error");
+		expect(errors.some((e) => e.detail?.startsWith("Turn failed:"))).toBe(true);
+	});
+
+	test("records the live turn's pid while it runs and clears it when the turn ends", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		const pidFile = join(worktree, "pid.txt");
+		// `$$` is the spawned bash itself — the pid runTurn hands back.
+		process.env.AGENTPLATE_MOCK_CMD = `echo $$ > '${pidFile}'; sleep 0.3`;
+
+		const pending = driveTurn({
+			root,
+			config: cfg(),
+			runtime: new SpyRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+		await waitFor(() => store.getSession(session.id)?.pid != null && existsSync(pidFile));
+		await waitFor(() => readFileSync(pidFile, "utf8").trim() !== "");
+		expect(store.getSession(session.id)?.pid).toBe(Number(readFileSync(pidFile, "utf8").trim()));
+
+		await pending;
+		expect(store.getSession(session.id)?.pid).toBeNull();
+	});
+});
+
+describe("driveTurn — secret redaction in recorded errors", () => {
+	const KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
+
+	test("redacts secrets in runtime stderr before it reaches events.db", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = `echo 'crash: ANTHROPIC_API_KEY=${KEY} rejected' >&2; exit 3`;
+
+		await driveTurn({
+			root,
+			config: cfg(),
+			runtime: new SpyRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+
+		const details = events.list({ agentName: session.agentName }).map((e) => e.detail ?? "");
+		expect(details.some((d) => d.includes("crash:") && d.includes("[REDACTED]"))).toBe(true);
+		expect(details.some((d) => d.includes(KEY))).toBe(false);
+	});
+
+	test("redacts secrets in streamed runtime error events", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+
+		await driveTurn({
+			root,
+			config: cfg(),
+			runtime: new ErrorEventRuntime(`401 from gateway: invalid x-api-key ${KEY}`),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+
+		const details = events.list({ agentName: session.agentName }).map((e) => e.detail ?? "");
+		expect(details.some((d) => d.includes("401 from gateway") && d.includes("[REDACTED]"))).toBe(
+			true,
+		);
+		expect(details.some((d) => d.includes(KEY))).toBe(false);
 	});
 });

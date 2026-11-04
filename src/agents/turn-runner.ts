@@ -32,6 +32,8 @@ export interface RunTurnOptions {
 	timeoutMs?: number;
 	/** Called for each parsed event (e.g. to record tool calls). */
 	onEvent?: (event: AgentEvent) => void;
+	/** Called once with the child's pid right after it spawns (e.g. to record it). */
+	onSpawn?: (pid: number) => void;
 }
 
 export interface TurnResult {
@@ -84,6 +86,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 					proc.kill(); // SIGTERM
 				}, opts.timeoutMs)
 			: null;
+	opts.onSpawn?.(proc.pid);
 
 	// Read stderr concurrently so a full pipe buffer can't deadlock the child.
 	const stderrPromise = new Response(proc.stderr).text();

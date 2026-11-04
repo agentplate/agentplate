@@ -1,7 +1,13 @@
 /**
  * `agentplate stop <agent>` — mark an agent session stopped (and optionally remove
  * its worktree). Headless agents are spawn-per-turn, so there is no long-lived
- * process to kill; stopping records the terminal state so no further turns run.
+ * process; stopping records the terminal state so no further turns run, and
+ * SIGTERMs the current turn's process if one is live.
+ *
+ * Worktree removal goes through the reaper's {@link isRemovableWorktree} guard:
+ * only paths inside `.agentplate/worktrees/` are ever removed — never the project
+ * root (the coordinator's and deploy sessions' `worktreePath`), which may itself
+ * be a linked git worktree that `git worktree remove --force` would delete.
  */
 
 import { Command } from "commander";
@@ -9,11 +15,12 @@ import { findProjectRoot, isInitialized } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
-import { printSuccess, printWarning } from "../logging/color.ts";
+import { printHint, printSuccess, printWarning } from "../logging/color.ts";
 import { createMailStore } from "../mail/store.ts";
 import { createMergeQueue } from "../merge/queue.ts";
 import { eventsDbPath, mailDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { type PurgeReport, purgeAgentData } from "../sessions/purge.ts";
+import { isPidAlive, isRemovableWorktree } from "../sessions/reaper.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { deleteBranch, removeWorktree } from "../worktree/manager.ts";
 
@@ -45,20 +52,41 @@ export function createStopCommand(): Command {
 					const session = store.getSessionByAgent(agent);
 					if (!session) throw new NotFoundError(`No session for agent "${agent}"`);
 					store.updateSessionState(session.id, "stopped");
+					// End a turn still in flight, so nothing keeps writing to the worktree.
+					if (session.pid != null && isPidAlive(session.pid)) {
+						try {
+							process.kill(session.pid, "SIGTERM");
+						} catch {
+							// Exited in the meantime.
+						}
+					}
 
 					let worktreeRemoved = false;
-					if (cleanWorktree) {
+					if (cleanWorktree && !isRemovableWorktree(root, session.worktreePath)) {
+						if (!useJson) {
+							printWarning(
+								`Not removing ${session.worktreePath}: not an agentplate worktree (only paths inside .agentplate/worktrees/ are removed).`,
+							);
+						}
+					} else if (cleanWorktree) {
 						try {
 							await removeWorktree(root, session.worktreePath, { force: true });
 							worktreeRemoved = true;
-							// Best-effort branch cleanup (may be merged/shared — leave it then).
+							// Best-effort branch cleanup. deleteBranch refuses an unmerged
+							// branch, so committed work is kept rather than destroyed.
 							try {
 								await deleteBranch(root, session.branchName);
 							} catch {
-								// Branch kept; not fatal.
+								if (!useJson) {
+									printHint(
+										`Kept branch ${session.branchName} (not fully merged, or already gone).`,
+									);
+								}
 							}
 						} catch (error) {
-							printWarning(`Could not remove worktree: ${(error as Error).message}`);
+							if (!useJson) {
+								printWarning(`Could not remove worktree: ${(error as Error).message}`);
+							}
 						}
 					}
 
@@ -80,7 +108,7 @@ export function createStopCommand(): Command {
 						jsonOutput({ agent, stopped: true, worktreeRemoved, purged });
 					} else if (purged) {
 						printSuccess(
-							`Purged ${agent} (worktree removed, ${purged.mailDeleted} mail/${purged.eventsDeleted} events/${purged.mergeDeleted} merges erased)`,
+							`Purged ${agent} (${worktreeRemoved ? "worktree removed, " : ""}${purged.mailDeleted} mail/${purged.eventsDeleted} events/${purged.mergeDeleted} merges erased)`,
 						);
 					} else {
 						printSuccess(`Stopped ${agent}${worktreeRemoved ? " (worktree removed)" : ""}`);

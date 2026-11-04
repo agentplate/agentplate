@@ -56,6 +56,14 @@ export interface SessionStore {
 	updateSessionState(id: string, state: SessionState): void;
 	setRuntimeSessionId(id: string, runtimeSessionId: string): void;
 	touch(id: string): void;
+	/** Record (or clear, with `null`) the OS pid of the session's live turn process. */
+	setPid(id: string, pid: number | null): void;
+	/**
+	 * Compare-and-set the session state: move it to `to` only if it is still in
+	 * `from`. Returns false (and changes nothing) otherwise — e.g. a finishing turn
+	 * must not resurrect a session an operator stopped mid-turn.
+	 */
+	transitionSessionState(id: string, from: SessionState, to: SessionState): boolean;
 	/**
 	 * Permanently delete a session row by id (no-op if absent). Unlike
 	 * {@link updateSessionState}(id, "stopped") — which keeps the row for history —
@@ -318,6 +326,20 @@ export function createSessionStore(dbPath: string): SessionStore {
 		db.query("UPDATE sessions SET last_activity = ? WHERE id = ?").run(now, id);
 	}
 
+	function setPid(id: string, pid: number | null): void {
+		db.query("UPDATE sessions SET pid = ? WHERE id = ?").run(pid, id);
+	}
+
+	function transitionSessionState(id: string, from: SessionState, to: SessionState): boolean {
+		// Single conditional UPDATE so the check and the write are atomic across
+		// processes (a concurrent `stop` either lands first and wins, or after).
+		const now = new Date().toISOString();
+		const result = db
+			.query("UPDATE sessions SET state = ?, last_activity = ? WHERE id = ? AND state = ?")
+			.run(to, now, id, from);
+		return result.changes > 0;
+	}
+
 	function deleteSession(id: string): void {
 		// Hard delete. Safe to call for a missing id (DELETE simply affects 0 rows).
 		db.query("DELETE FROM sessions WHERE id = ?").run(id);
@@ -374,6 +396,8 @@ export function createSessionStore(dbPath: string): SessionStore {
 		updateSessionState,
 		setRuntimeSessionId,
 		touch,
+		setPid,
+		transitionSessionState,
 		deleteSession,
 		countActive,
 		countActiveByParent,
