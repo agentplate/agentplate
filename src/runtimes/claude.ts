@@ -149,8 +149,16 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * `{...process.env, ...thisEnv}`: without the explicit empty override, a
 	 * shell-exported real key would survive the merge and be sent to the local
 	 * endpoint. Any other authMode (api-key/env carry the real key in
-	 * `model.env`; subscription keeps the CLI's own login) gets ONLY the base
-	 * URL. Without a `baseUrl` the behavior is unchanged.
+	 * `model.env`; subscription keeps the CLI's own login) gets no dummy bearer.
+	 *
+	 * In EVERY authMode, a `baseUrl` whose host is not Anthropic's (a gateway such
+	 * as OpenRouter, a custom endpoint, a proxy) also pins `ANTHROPIC_API_KEY` to
+	 * "" — the CLI would otherwise send a shell-exported Anthropic key as
+	 * `x-api-key` to that third-party host — UNLESS the provider explicitly
+	 * resolved `ANTHROPIC_API_KEY` itself (its `authTokenEnv`), in which case
+	 * `model.env` carries it and it is forwarded as configured. The CLI treats an
+	 * empty value as unset, so a subscription login keeps working. Without a
+	 * `baseUrl` the behavior is unchanged.
 	 */
 	buildEnv(model: ResolvedModel): Record<string, string> {
 		const env: Record<string, string> = { ...(model.env ?? {}) };
@@ -159,6 +167,8 @@ export class ClaudeRuntime implements AgentRuntime {
 			if (model.authMode === "none") {
 				env.ANTHROPIC_AUTH_TOKEN = "agentplate-local";
 				env.ANTHROPIC_SMALL_FAST_MODEL = model.model;
+				env.ANTHROPIC_API_KEY = "";
+			} else if (!isAnthropicBaseUrl(model.baseUrl) && model.env?.ANTHROPIC_API_KEY === undefined) {
 				env.ANTHROPIC_API_KEY = "";
 			}
 		}
@@ -241,6 +251,20 @@ export class ClaudeRuntime implements AgentRuntime {
  */
 export function normalizeAnthropicBaseUrl(url: string): string {
 	return url.replace(/\/v1\/?$/, "");
+}
+
+/**
+ * True when a base URL points at Anthropic's own API (`anthropic.com` or a
+ * subdomain), i.e. a host that may legitimately receive an Anthropic key. An
+ * unparseable URL is treated as NOT Anthropic (fail safe: the key is withheld).
+ */
+export function isAnthropicBaseUrl(url: string): boolean {
+	try {
+		const host = new URL(url).hostname.toLowerCase();
+		return host === "anthropic.com" || host.endsWith(".anthropic.com");
+	} catch {
+		return false;
+	}
 }
 
 /**
