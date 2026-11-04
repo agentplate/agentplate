@@ -14,12 +14,22 @@
  *                      package.json / lockfiles / framework markers.
  *   generateConfig() — deterministic, side-effect-free artifact emission
  *                      (Dockerfile, .dockerignore, deploy workflow). The engine
- *                      writes the returned content so `--dry-run` can diff.
+ *                      decides what to write: it never overwrites an existing
+ *                      file without --force, and a dry run writes nothing. A
+ *                      project we cannot profile that ships its own Dockerfile
+ *                      keeps it (no Dockerfile is generated for it).
  *   deploy()         — the ONE outward-facing mutation. Honors `ctx.dryRun`:
  *                      a dry run plans (no `docker` invoked) and a real run
  *                      builds (and pushes when a token is present).
  *   verify()         — read-only smoke check (HTTP GET, else local image probe).
- *   rollback()       — best-effort re-tag/redeploy of the previous image ref.
+ *   rollback()       — best-effort re-point of the environment tag at the image
+ *                      of the release being restored.
+ *
+ * Image tags: every deploy builds an immutable `<repo>:<commit>` image (the
+ * deployment id; the commit is `settings.sha`/`commit`, else the worktree's
+ * HEAD) and moves a per-environment tag `<repo>:<environment>` to it. The
+ * environment tag is what an environment should pull; rollback moves it back to
+ * the previous release's immutable image.
  *
  * Secrets enter exclusively through {@link DockerGhaTarget.buildSecretEnv}
  * (env-by-name), and every captured CLI line is run through {@link sanitize}
@@ -28,6 +38,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { ValidationError } from "../../errors.ts";
 import { sanitize } from "../../logging/sanitizer.ts";
 import type {
 	AppProfile,
@@ -293,21 +304,86 @@ function settingString(
 }
 
 /**
- * Compute the fully-qualified image reference for a deploy context:
- *   <registry>/<app>:<sha-ish>
+ * The image repository (no tag) for a deploy context: `<registry>/<app>`.
  * `registry` and `app` come from non-secret settings, with GHCR-shaped
  * fallbacks so a partially-configured target still produces a sane ref.
  */
-function imageRef(ctx: DeployContext): string {
+function imageRepo(ctx: DeployContext): string {
 	const registry =
 		settingString(ctx.settings, "registry") ?? settingString(ctx.settings, "image") ?? "ghcr.io";
 	const appSetting =
 		settingString(ctx.settings, "app") ?? settingString(ctx.settings, "appName") ?? "app";
 	const app = slugForApp(appSetting);
-	const tag = shaTag(settingString(ctx.settings, "sha") ?? settingString(ctx.settings, "commit"));
-	// If `registry` already includes a path (a/b), append only the tag; else add app.
-	const base = registry.includes("/") ? registry : `${registry}/${app}`;
-	return `${base}:${tag}`;
+	// If `registry` already includes a path (a/b), it names the repo; else add app.
+	return registry.includes("/") ? registry : `${registry}/${app}`;
+}
+
+/** The commit pinned in settings (`sha`, else `commit`), if any. */
+function configuredSha(ctx: DeployContext): string | undefined {
+	const sha = settingString(ctx.settings, "sha") ?? settingString(ctx.settings, "commit");
+	return sha === undefined || sha.trim() === "" ? undefined : sha;
+}
+
+/**
+ * Compute the immutable image reference for a deploy context:
+ *   <registry>/<app>:<sha-ish>
+ * The tag is the commit pinned in settings, else `headSha` when given, else
+ * "latest".
+ */
+function imageRef(ctx: DeployContext, headSha?: string): string {
+	return `${imageRepo(ctx)}:${shaTag(configuredSha(ctx) ?? headSha)}`;
+}
+
+/**
+ * The moving per-environment image reference (`<repo>:<environment>`). Every
+ * deploy points it at the new image; rollback points it back.
+ */
+function environmentRef(repo: string, environment: string): string {
+	const tag = environment
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^[.-]+/, "")
+		.slice(0, 128);
+	return `${repo}:${tag === "" ? "env" : tag}`;
+}
+
+/** The repository part of an image ref (drops `:tag` / `@digest`; keeps a registry port). */
+function repositoryOf(ref: string): string {
+	const at = ref.indexOf("@");
+	const name = at === -1 ? ref : ref.slice(0, at);
+	const colon = name.lastIndexOf(":");
+	return colon > name.lastIndexOf("/") ? name.slice(0, colon) : name;
+}
+
+/** The worktree's HEAD commit sha, or undefined (not a git repo / no commits). */
+async function readHeadSha(cwd: string): Promise<string | undefined> {
+	const result = await runCommand(["git", "rev-parse", "HEAD"], cwd);
+	if (result.spawnFailed || result.exitCode !== 0) return undefined;
+	const sha = result.stdout.trim();
+	return sha === "" ? undefined : sha;
+}
+
+/**
+ * Resolve the immutable image ref for a deploy: tag with the pinned commit, else
+ * the worktree's HEAD, so consecutive releases get distinct, restorable refs.
+ */
+async function resolveImageRef(ctx: DeployContext): Promise<string> {
+	if (configuredSha(ctx) !== undefined) return imageRef(ctx);
+	return imageRef(ctx, await readHeadSha(ctx.worktreePath));
+}
+
+/**
+ * Reject an environment the target does not declare before it is interpolated
+ * into generated YAML. Declared environments are plain slugs, so an allowlisted
+ * value can never break out of the workflow's scalars or `${{ }}` expressions.
+ */
+function assertKnownEnvironment(environment: string, known: readonly string[]): void {
+	if (!known.includes(environment) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(environment)) {
+		throw new ValidationError(
+			`Unknown environment ${JSON.stringify(environment)} for docker-gha. ` +
+				`Known environments: ${known.join(", ")}`,
+		);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -440,11 +516,13 @@ function renderDockerignore(): string {
 
 /**
  * GitHub Actions workflow: build the image, log in to GHCR with
- * `secrets.GHCR_TOKEN`, and push the tag. Exposes an `environment` input so the
- * same workflow drives preview/staging/production.
+ * `secrets.GHCR_TOKEN`, and push it tagged with the commit being built
+ * (`github.sha`) plus the moving environment tag. Exposes an `environment` input
+ * so the same workflow drives preview/staging/production. `ctx.environment`
+ * must already be validated (see {@link assertKnownEnvironment}).
  */
 function renderDeployWorkflow(ctx: DeployContext): string {
-	const ref = imageRef(ctx);
+	const repo = imageRepo(ctx);
 	const environment = ctx.environment;
 	return `name: deploy
 
@@ -476,7 +554,8 @@ jobs:
       contents: read
       packages: write
     env:
-      IMAGE_REF: ${ref}
+      IMAGE_REF: ${repo}:\${{ github.sha }}
+      ENVIRONMENT_REF: ${repo}:\${{ github.event.inputs.environment || '${environment}' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -498,6 +577,7 @@ jobs:
           push: true
           tags: |
             \${{ env.IMAGE_REF }}
+            \${{ env.ENVIRONMENT_REF }}
 `;
 }
 
@@ -572,18 +652,33 @@ export class DockerGhaTarget implements DeployTarget {
 	}
 
 	async generateConfig(ctx: DeployContext): Promise<GeneratedConfig> {
+		assertKnownEnvironment(ctx.environment, this.caps.environments);
 		const profile = ctx.profile;
-		const artifacts: GeneratedArtifact[] = [
-			{ path: "Dockerfile", content: renderDockerfile(profile), kind: "dockerfile" },
+		// A project we could not profile (Go, Python, …) that ships its own
+		// Dockerfile builds with it: a generated Node image would be wrong for it.
+		const useOwnDockerfile =
+			profile.language === "unknown" && existsSync(join(ctx.worktreePath, "Dockerfile"));
+		const artifacts: GeneratedArtifact[] = [];
+		if (!useOwnDockerfile) {
+			artifacts.push({
+				path: "Dockerfile",
+				content: renderDockerfile(profile),
+				kind: "dockerfile",
+			});
+		}
+		artifacts.push(
 			{ path: ".dockerignore", content: renderDockerignore(), kind: "ignore" },
 			{
 				path: ".github/workflows/deploy.yml",
 				content: renderDeployWorkflow(ctx),
 				kind: "ci",
 			},
-		];
+		);
+		const dockerfileNote = useOwnDockerfile
+			? "Using the project's existing Dockerfile; generated a "
+			: `Generated a ${profile.kind === "static" ? "static (nginx)" : profile.language} Dockerfile, `;
 		const summary =
-			`Generated a ${profile.kind === "static" ? "static (nginx)" : profile.language} Dockerfile, ` +
+			dockerfileNote +
 			`.dockerignore, and a GitHub Actions deploy workflow (GHCR push, ` +
 			`environment=${ctx.environment}). Requires secret GHCR_TOKEN.`;
 		return {
@@ -594,11 +689,13 @@ export class DockerGhaTarget implements DeployTarget {
 	}
 
 	async deploy(ctx: DeployContext): Promise<DeployResult> {
-		const ref = imageRef(ctx);
+		const ref = await resolveImageRef(ctx);
+		const envRef = environmentRef(imageRepo(ctx), ctx.environment);
+		const baseOutputs = { imageRef: ref, environmentRef: envRef, environment: ctx.environment };
 		const hasToken =
 			typeof ctx.secretEnv[GHCR_TOKEN_KEY] === "string" && ctx.secretEnv[GHCR_TOKEN_KEY] !== "";
 
-		// Dry-run: plan only. No subprocess, no outward mutation.
+		// Dry-run: plan only. No docker invoked, no outward mutation.
 		if (ctx.dryRun) {
 			const pushNote = hasToken ? "and push" : "(no GHCR_TOKEN present — would skip push)";
 			return {
@@ -606,9 +703,10 @@ export class DockerGhaTarget implements DeployTarget {
 				urls: [],
 				deploymentId: null,
 				log: sanitize(
-					`[dry-run] would build+push image ${ref} ${pushNote} from ${ctx.worktreePath}`,
+					`[dry-run] would build+push image ${ref} (tagged ${envRef}) ${pushNote} ` +
+						`from ${ctx.worktreePath}`,
 				),
-				outputs: { imageRef: ref, environment: ctx.environment, pushed: "false" },
+				outputs: { ...baseOutputs, pushed: "false" },
 				errorMessage: null,
 			};
 		}
@@ -616,7 +714,7 @@ export class DockerGhaTarget implements DeployTarget {
 		// Real run: build the image. `docker` may be unavailable — degrade, don't throw.
 		const logLines: string[] = [];
 		const build = await runCommand(
-			["docker", "build", "-t", ref, "."],
+			["docker", "build", "-t", ref, "-t", envRef, "."],
 			ctx.worktreePath,
 			ctx.secretEnv,
 		);
@@ -626,36 +724,39 @@ export class DockerGhaTarget implements DeployTarget {
 				urls: [],
 				deploymentId: null,
 				log: sanitize(`docker is unavailable: ${build.stderr}`.trim()),
-				outputs: { imageRef: ref, environment: ctx.environment, pushed: "false" },
+				outputs: { ...baseOutputs, pushed: "false" },
 				errorMessage: "docker CLI not found or could not be spawned",
 			};
 		}
-		logLines.push(`$ docker build -t ${ref} .`, build.stdout, build.stderr);
+		logLines.push(`$ docker build -t ${ref} -t ${envRef} .`, build.stdout, build.stderr);
 		if (build.exitCode !== 0) {
 			return {
 				ok: false,
 				urls: [],
 				deploymentId: null,
 				log: sanitize(logLines.join("\n").trim()),
-				outputs: { imageRef: ref, environment: ctx.environment, pushed: "false" },
+				outputs: { ...baseOutputs, pushed: "false" },
 				errorMessage: `docker build failed (exit ${build.exitCode})`,
 			};
 		}
 
-		// Push only when a token is present (GHCR auth is the operator's via env/CI).
+		// Push only when a token is present (GHCR auth is the operator's via env/CI):
+		// the immutable ref first, then the environment tag that now points at it.
 		let pushed = false;
 		if (hasToken) {
-			const push = await runCommand(["docker", "push", ref], ctx.worktreePath, ctx.secretEnv);
-			logLines.push(`$ docker push ${ref}`, push.stdout, push.stderr);
-			if (push.exitCode !== 0 || push.spawnFailed) {
-				return {
-					ok: false,
-					urls: [],
-					deploymentId: ref,
-					log: sanitize(logLines.join("\n").trim()),
-					outputs: { imageRef: ref, environment: ctx.environment, pushed: "false" },
-					errorMessage: `docker push failed (exit ${push.exitCode})`,
-				};
+			for (const pushRef of [ref, envRef]) {
+				const push = await runCommand(["docker", "push", pushRef], ctx.worktreePath, ctx.secretEnv);
+				logLines.push(`$ docker push ${pushRef}`, push.stdout, push.stderr);
+				if (push.exitCode !== 0 || push.spawnFailed) {
+					return {
+						ok: false,
+						urls: [],
+						deploymentId: ref,
+						log: sanitize(logLines.join("\n").trim()),
+						outputs: { ...baseOutputs, pushed: "false" },
+						errorMessage: `docker push failed (exit ${push.exitCode})`,
+					};
+				}
 			}
 			pushed = true;
 		}
@@ -665,7 +766,7 @@ export class DockerGhaTarget implements DeployTarget {
 			urls: [],
 			deploymentId: ref,
 			log: sanitize(logLines.join("\n").trim()),
-			outputs: { imageRef: ref, environment: ctx.environment, pushed: String(pushed) },
+			outputs: { ...baseOutputs, pushed: String(pushed) },
 			errorMessage: null,
 		};
 	}
@@ -719,10 +820,32 @@ export class DockerGhaTarget implements DeployTarget {
 		return { healthy: ok, checks, probedUrl: null };
 	}
 
+	/**
+	 * Restore `deployment` — the previous release, resolved by the engine from the
+	 * audit log — by re-pointing the environment tag at its immutable image and
+	 * pushing that tag. Never falls back to the current image: a release with no
+	 * recorded image ref cannot be restored and fails.
+	 */
 	async rollback(ctx: DeployContext, deployment: DeployResult): Promise<DeployResult> {
-		// The previous image ref is the rollback artifact; outputs carry it.
-		const previousRef =
-			deployment.outputs.previousImageRef ?? deployment.outputs.imageRef ?? imageRef(ctx);
+		const restoreRef = deployment.outputs.imageRef ?? deployment.deploymentId ?? "";
+		// Re-point the environment tag in the restored image's own repository.
+		const envRef = environmentRef(repositoryOf(restoreRef), ctx.environment);
+		const failed = (log: string, errorMessage: string): DeployResult => ({
+			ok: false,
+			urls: [],
+			deploymentId: null,
+			log: sanitize(log.trim()),
+			outputs: {
+				imageRef: restoreRef,
+				environmentRef: envRef,
+				environment: ctx.environment,
+				rolledBack: "false",
+			},
+			errorMessage,
+		});
+		if (restoreRef === "") {
+			return failed("", "the release to restore has no recorded image ref");
+		}
 		const hasToken =
 			typeof ctx.secretEnv[GHCR_TOKEN_KEY] === "string" && ctx.secretEnv[GHCR_TOKEN_KEY] !== "";
 
@@ -731,66 +854,68 @@ export class DockerGhaTarget implements DeployTarget {
 				ok: true,
 				urls: [],
 				deploymentId: null,
-				log: sanitize(`[dry-run] would roll back by redeploying previous image ${previousRef}`),
-				outputs: { imageRef: previousRef, environment: ctx.environment, rolledBack: "planned" },
+				log: sanitize(`[dry-run] would roll back by re-pointing ${envRef} at ${restoreRef}`),
+				outputs: {
+					imageRef: restoreRef,
+					environmentRef: envRef,
+					environment: ctx.environment,
+					rolledBack: "planned",
+				},
 				errorMessage: null,
 			};
 		}
 
 		const logLines: string[] = [];
-		// Best-effort: confirm the previous image is present, then re-push it.
+		// Best-effort: confirm the previous image is present, re-tag it as the
+		// environment's image, then push that tag.
 		const inspect = await runCommand(
-			["docker", "image", "inspect", previousRef],
+			["docker", "image", "inspect", restoreRef],
 			ctx.worktreePath,
 			ctx.secretEnv,
 		);
 		if (inspect.spawnFailed) {
-			return {
-				ok: false,
-				urls: [],
-				deploymentId: null,
-				log: sanitize(`docker is unavailable: ${inspect.stderr}`.trim()),
-				outputs: { imageRef: previousRef, environment: ctx.environment, rolledBack: "false" },
-				errorMessage: "docker CLI not found or could not be spawned",
-			};
+			return failed(
+				`docker is unavailable: ${inspect.stderr}`,
+				"docker CLI not found or could not be spawned",
+			);
 		}
-		logLines.push(`$ docker image inspect ${previousRef}`, inspect.stdout, inspect.stderr);
+		logLines.push(`$ docker image inspect ${restoreRef}`, inspect.stdout, inspect.stderr);
 		if (inspect.exitCode !== 0) {
-			return {
-				ok: false,
-				urls: [],
-				deploymentId: null,
-				log: sanitize(logLines.join("\n").trim()),
-				outputs: { imageRef: previousRef, environment: ctx.environment, rolledBack: "false" },
-				errorMessage: `previous image ${previousRef} not available locally`,
-			};
+			return failed(logLines.join("\n"), `previous image ${restoreRef} not available locally`);
 		}
 
+		const tag = await runCommand(
+			["docker", "tag", restoreRef, envRef],
+			ctx.worktreePath,
+			ctx.secretEnv,
+		);
+		logLines.push(`$ docker tag ${restoreRef} ${envRef}`, tag.stdout, tag.stderr);
+		if (tag.exitCode !== 0 || tag.spawnFailed) {
+			return failed(logLines.join("\n"), `docker tag (rollback) failed (exit ${tag.exitCode})`);
+		}
+
+		let pushed = false;
 		if (hasToken) {
-			const push = await runCommand(
-				["docker", "push", previousRef],
-				ctx.worktreePath,
-				ctx.secretEnv,
-			);
-			logLines.push(`$ docker push ${previousRef}`, push.stdout, push.stderr);
+			const push = await runCommand(["docker", "push", envRef], ctx.worktreePath, ctx.secretEnv);
+			logLines.push(`$ docker push ${envRef}`, push.stdout, push.stderr);
 			if (push.exitCode !== 0 || push.spawnFailed) {
-				return {
-					ok: false,
-					urls: [],
-					deploymentId: previousRef,
-					log: sanitize(logLines.join("\n").trim()),
-					outputs: { imageRef: previousRef, environment: ctx.environment, rolledBack: "false" },
-					errorMessage: `docker push (rollback) failed (exit ${push.exitCode})`,
-				};
+				return failed(logLines.join("\n"), `docker push (rollback) failed (exit ${push.exitCode})`);
 			}
+			pushed = true;
 		}
 
 		return {
 			ok: true,
 			urls: [],
-			deploymentId: previousRef,
+			deploymentId: restoreRef,
 			log: sanitize(logLines.join("\n").trim()),
-			outputs: { imageRef: previousRef, environment: ctx.environment, rolledBack: "true" },
+			outputs: {
+				imageRef: restoreRef,
+				environmentRef: envRef,
+				environment: ctx.environment,
+				pushed: String(pushed),
+				rolledBack: "true",
+			},
 			errorMessage: null,
 		};
 	}

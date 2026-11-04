@@ -38,6 +38,7 @@ import {
 	createRollbackCommand,
 	createTargetCommand,
 	detectTargets,
+	gatePolicyFor,
 	readAuditHistory,
 	runDeploy,
 	runRollback,
@@ -101,6 +102,70 @@ function configWith(overrides: {
 		for (const [env, policy] of Object.entries(overrides.gates)) cfg.deploy.gates[env] = policy;
 	}
 	return cfg;
+}
+
+/**
+ * Run `fn` with a stand-in `docker` first on PATH (a shell script that records
+ * its argv and exits 0) and a dummy GHCR_TOKEN, so the real deploy/rollback
+ * paths run end to end without ever invoking the real docker binary. Returns
+ * whatever `fn` returns; `calls()` lists each recorded docker invocation.
+ */
+async function withFakeDocker<T>(fn: (calls: () => string[]) => Promise<T>): Promise<T> {
+	const bin = mkdtempSync(join(tmpdir(), "agentplate-fake-docker-"));
+	const log = join(bin, "calls.log");
+	writeFileSync(log, "", "utf8");
+	writeFileSync(join(bin, "docker"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`, {
+		mode: 0o755,
+	});
+	const savedPath = process.env.PATH;
+	const savedToken = process.env.GHCR_TOKEN;
+	process.env.PATH = `${bin}:${savedPath ?? ""}`;
+	process.env.GHCR_TOKEN = "fake-token-for-tests";
+	try {
+		return await fn(() =>
+			readFileSync(log, "utf8")
+				.split("\n")
+				.filter((line) => line !== ""),
+		);
+	} finally {
+		process.env.PATH = savedPath;
+		if (savedToken === undefined) delete process.env.GHCR_TOKEN;
+		else process.env.GHCR_TOKEN = savedToken;
+		rmSync(bin, { recursive: true, force: true });
+	}
+}
+
+/** Seed one audit row directly (no docker), defaulting to a successful staging deploy. */
+function seedRow(
+	dir: string,
+	overrides: Partial<Parameters<ReturnType<typeof createDeployAudit>["record"]>[0]>,
+): void {
+	const audit = createDeployAudit(deploysDbPath(dir));
+	try {
+		audit.record({
+			runId: null,
+			agentName: "deployer-seed",
+			target: "docker-gha",
+			environment: "staging",
+			action: "deploy",
+			dryRun: false,
+			gateDecision: "auto",
+			approvedBy: null,
+			status: "success",
+			deploymentId: null,
+			urls: [],
+			outputs: {},
+			commitSha: "deadbeef",
+			...overrides,
+		});
+	} finally {
+		audit.close();
+	}
+}
+
+/** Seed a successful release whose immutable image ref is `ref`. */
+function seedRelease(dir: string, ref: string, environment = "staging"): void {
+	seedRow(dir, { environment, deploymentId: ref, outputs: { imageRef: ref } });
 }
 
 beforeEach(() => {
@@ -215,7 +280,7 @@ describe("target configure", () => {
 // --- deploy --dry-run (the core scenario) ----------------------------------
 
 describe("deploy --dry-run", () => {
-	test("writes Dockerfile + workflow, plans, and records a dryRun row but NO success deploy", async () => {
+	test("plans Dockerfile + workflow without writing them, and records a dryRun row but NO success deploy", async () => {
 		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
 
 		const result = await runDeploy(root, {
@@ -232,18 +297,28 @@ describe("deploy --dry-run", () => {
 		expect(result.deploy).toBeNull();
 		expect(result.verify).toBeNull();
 
-		// Artifacts written to the project root.
-		expect(existsSync(join(root, "Dockerfile"))).toBe(true);
-		expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(true);
-		expect(existsSync(join(root, ".dockerignore"))).toBe(true);
-		const dockerfile = readFileSync(join(root, "Dockerfile"), "utf8");
-		expect(dockerfile).toContain("FROM");
-		const workflow = readFileSync(join(root, ".github", "workflows", "deploy.yml"), "utf8");
-		expect(workflow).toContain("name: deploy");
-		expect(workflow).toContain("GHCR_TOKEN");
+		// A dry run writes NOTHING to the project root.
+		expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+		expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(false);
+		expect(existsSync(join(root, ".dockerignore"))).toBe(false);
+		expect(result.writtenArtifacts).toEqual([]);
 
-		// The written-artifact list is absolute and includes the Dockerfile.
-		expect(result.writtenArtifacts.some((p) => p.endsWith("/Dockerfile"))).toBe(true);
+		// ...but the plan carries each artifact (absolute path + content) for diffing.
+		expect(result.artifacts.map((a) => a.path).sort()).toEqual([
+			".dockerignore",
+			".github/workflows/deploy.yml",
+			"Dockerfile",
+		]);
+		for (const plan of result.artifacts) {
+			expect(plan.action).toBe("create");
+			expect(plan.written).toBe(false);
+			expect(plan.absolutePath.startsWith(root)).toBe(true);
+		}
+		const dockerfile = result.artifacts.find((a) => a.path === "Dockerfile");
+		expect(dockerfile?.content).toContain("FROM");
+		const workflow = result.artifacts.find((a) => a.path === ".github/workflows/deploy.yml");
+		expect(workflow?.content).toContain("name: deploy");
+		expect(workflow?.content).toContain("GHCR_TOKEN");
 
 		// Required secret surfaced, not deployed.
 		expect(result.requiredSecretKeys).toContain("GHCR_TOKEN");
@@ -337,7 +412,9 @@ describe("deploy gate", () => {
 		});
 		expect(result.refused).toBe(false);
 		expect(result.gateDecision).toBe("auto");
-		expect(existsSync(join(root, "Dockerfile"))).toBe(true);
+		// Planned, never written (dry run).
+		expect(result.artifacts.some((a) => a.path === "Dockerfile")).toBe(true);
+		expect(existsSync(join(root, "Dockerfile"))).toBe(false);
 	});
 
 	test("--yes maps a confirm-gated deploy to gateDecision 'approved' (docker-free dry-run)", async () => {
@@ -359,6 +436,76 @@ describe("deploy gate", () => {
 		expect(result.gateDecision).toBe("approved");
 		const rows = readAuditHistory(root, {});
 		expect(rows[0]?.gateDecision).toBe("approved");
+	});
+});
+
+describe("deploy gate fails closed", () => {
+	test("an environment the target does not declare is rejected before anything runs", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		// `prod` has no gates entry: it must not be auto-approved.
+		for (const environment of ["prod", "Production", "production'\n  injected: true"]) {
+			await expect(
+				runDeploy(root, {
+					target: "docker-gha",
+					environment,
+					dryRun: false,
+					yes: false,
+					agentName: "operator",
+				}),
+			).rejects.toThrow(/Unknown environment/i);
+		}
+		// No audit row, no artifacts.
+		expect(readAuditHistory(root, {})).toEqual([]);
+		expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+		await expect(configureTarget(root, "docker-gha", "prod")).rejects.toThrow(
+			/Unknown environment/i,
+		);
+	});
+
+	test("production requires --yes even when its gate is configured 'auto'", async () => {
+		root = await initRepo({
+			pkg: servicePkg(),
+			config: configWith({ default: "docker-gha", gates: { production: "auto" } }),
+		});
+		const result = await runDeploy(root, {
+			target: "docker-gha",
+			environment: "production",
+			dryRun: false,
+			yes: false,
+			agentName: "operator",
+		});
+		expect(result.refused).toBe(true);
+		expect(result.gateDecision).toBe("denied");
+	});
+
+	test("a malformed gate value (e.g. 'Confirm', 'manual') means confirm, not auto", async () => {
+		for (const bogus of ["Confirm", "manual"]) {
+			const cfg = configWith({ default: "docker-gha" });
+			// Simulate a hand-edited config.yaml carrying a value outside the union.
+			(cfg.deploy.gates as Record<string, string>).staging = bogus;
+			root = await initRepo({ pkg: servicePkg(), config: cfg });
+			const result = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				agentName: "operator",
+			});
+			expect(result.refused).toBe(true);
+			expect(result.gateDecision).toBe("denied");
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("gatePolicyFor: only an explicit 'auto' on a non-production env skips confirmation", () => {
+		const cfg = configWith({ gates: { staging: "auto", "prod-eu": "auto" } });
+		expect(gatePolicyFor(cfg, "staging")).toBe("auto");
+		expect(gatePolicyFor(cfg, "preview")).toBe("auto");
+		expect(gatePolicyFor(cfg, "production")).toBe("confirm");
+		// Production-like names always confirm, whatever the config says.
+		expect(gatePolicyFor(cfg, "prod-eu")).toBe("confirm");
+		// No gates entry at all → confirm (fail closed).
+		expect(gatePolicyFor(cfg, "qa")).toBe("confirm");
 	});
 });
 
@@ -427,48 +574,272 @@ describe("rollback", () => {
 		).rejects.toThrow(/No prior successful deploy/i);
 	});
 
-	test("rolls back to the latest successful deploy and records a rollback row", async () => {
+	test("throws NotFoundError when the only release on record is the live one", async () => {
 		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
-		// Seed a real successful deploy row directly through the audit store so
-		// latest() has something to revert to (without invoking docker).
-		const seedAudit = createDeployAudit(deploysDbPath(root));
-		try {
-			seedAudit.record({
-				runId: null,
-				agentName: "deployer-seed",
+		seedRelease(root, "ghcr.io/demo/app:aaaaaaaaaaaa");
+		await withFakeDocker(async (calls) => {
+			await expect(
+				runRollback(root, { target: "docker-gha", environment: "staging", agentName: "operator" }),
+			).rejects.toThrow(/No prior successful deploy/i);
+			// Nothing was re-pushed: there is nothing earlier to restore.
+			expect(calls()).toEqual([]);
+		});
+	});
+
+	test("restores the PREVIOUS release (not the live one) and records a rollback row", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		const good = "ghcr.io/demo/app:aaaaaaaaaaaa";
+		const bad = "ghcr.io/demo/app:bbbbbbbbbbbb";
+		seedRelease(root, good);
+		seedRelease(root, bad);
+
+		await withFakeDocker(async (calls) => {
+			const result = await runRollback(root, {
 				target: "docker-gha",
 				environment: "staging",
-				action: "deploy",
-				dryRun: false,
-				gateDecision: "auto",
-				approvedBy: null,
-				status: "success",
-				deploymentId: "ghcr.io/demo/app:abc123",
-				urls: [],
-				outputs: { imageRef: "ghcr.io/demo/app:abc123" },
-				commitSha: "deadbeef",
+				agentName: "operator",
 			});
-		} finally {
-			seedAudit.close();
-		}
 
-		const result = await runRollback(root, {
-			target: "docker-gha",
-			environment: "staging",
-			agentName: "operator",
+			expect(result.refused).toBe(false);
+			expect(result.current?.deploymentId).toBe(bad);
+			expect(result.previous?.deploymentId).toBe(good);
+			expect(result.rollback?.ok).toBe(true);
+			expect(result.rollback?.deploymentId).toBe(good);
+			expect(result.audit?.action).toBe("rollback");
+			expect(result.audit?.deploymentId).toBe(good);
+			expect(result.audit?.gateDecision).toBe("auto");
+
+			// The environment tag is re-pointed at the GOOD image and pushed; the bad
+			// image is never touched.
+			expect(calls()).toEqual([
+				`image inspect ${good}`,
+				`tag ${good} ghcr.io/demo/app:staging`,
+				"push ghcr.io/demo/app:staging",
+			]);
 		});
 
-		expect(result.previous).not.toBeNull();
-		expect(result.previous?.deploymentId).toBe("ghcr.io/demo/app:abc123");
-		expect(result.rollback).not.toBeNull();
-		expect(result.audit?.action).toBe("rollback");
-		expect(result.audit?.gateDecision).toBe("n/a");
-
-		// History now has two rows (the seeded deploy + the rollback), newest first.
+		// History now has three rows (two seeded deploys + the rollback), newest first.
 		const rows = readAuditHistory(root, { target: "docker-gha", environment: "staging" });
-		expect(rows.length).toBe(2);
-		expect(rows[0]?.action).toBe("rollback");
-		expect(rows[1]?.action).toBe("deploy");
+		expect(rows.map((r) => r.action)).toEqual(["rollback", "deploy", "deploy"]);
+	});
+
+	test("a second rollback never rolls forward to the release that was rolled back", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		seedRelease(root, "ghcr.io/demo/app:aaaaaaaaaaaa");
+		seedRelease(root, "ghcr.io/demo/app:bbbbbbbbbbbb");
+		await withFakeDocker(async (calls) => {
+			await runRollback(root, { target: "docker-gha", environment: "staging", agentName: "op" });
+			const afterFirst = calls().length;
+			// A is live again; there is nothing older than A, so this must fail
+			// rather than re-push the bad release B.
+			await expect(
+				runRollback(root, { target: "docker-gha", environment: "staging", agentName: "op" }),
+			).rejects.toThrow(/No prior successful deploy/i);
+			expect(calls().length).toBe(afterFirst);
+		});
+	});
+
+	test("a rollback to a commit-tagged release works after two real deploys at different commits", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		await withFakeDocker(async (calls) => {
+			const first = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				agentName: "operator",
+			});
+			await git(root, ["commit", "-q", "--allow-empty", "-m", "second"]);
+			const second = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				agentName: "operator",
+			});
+			const firstRef = first.deploy?.deploymentId ?? "";
+			const secondRef = second.deploy?.deploymentId ?? "";
+			// Each release is tagged with its own commit, so the two refs differ.
+			expect(firstRef).toMatch(/^ghcr\.io\/app:[0-9a-f]{12}$/);
+			expect(secondRef).toMatch(/^ghcr\.io\/app:[0-9a-f]{12}$/);
+			expect(secondRef).not.toBe(firstRef);
+			expect(first.audit?.commitSha.startsWith(firstRef.split(":")[1] ?? "?")).toBe(true);
+
+			const rollback = await runRollback(root, {
+				target: "docker-gha",
+				environment: "staging",
+				agentName: "operator",
+			});
+			expect(rollback.rollback?.ok).toBe(true);
+			expect(rollback.rollback?.deploymentId).toBe(firstRef);
+			expect(calls()).toContain(`tag ${firstRef} ghcr.io/app:staging`);
+			expect(calls().at(-1)).toBe("push ghcr.io/app:staging");
+		});
+	});
+
+	test("a confirm-gated rollback is refused without --yes and runs with it", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		seedRelease(root, "ghcr.io/demo/app:aaaaaaaaaaaa", "production");
+		seedRelease(root, "ghcr.io/demo/app:bbbbbbbbbbbb", "production");
+		await withFakeDocker(async (calls) => {
+			const refused = await runRollback(root, {
+				target: "docker-gha",
+				environment: "production",
+				agentName: "operator",
+			});
+			expect(refused.refused).toBe(true);
+			expect(refused.gateDecision).toBe("denied");
+			expect(refused.refusalReason).toContain("--yes");
+			expect(refused.rollback).toBeNull();
+			expect(refused.audit?.gateDecision).toBe("denied");
+			expect(refused.audit?.status).toBe("failed");
+			expect(calls()).toEqual([]);
+
+			const approved = await runRollback(root, {
+				target: "docker-gha",
+				environment: "production",
+				yes: true,
+				agentName: "operator",
+			});
+			expect(approved.refused).toBe(false);
+			expect(approved.gateDecision).toBe("approved");
+			expect(approved.rollback?.deploymentId).toBe("ghcr.io/demo/app:aaaaaaaaaaaa");
+			expect(calls()).toContain("push ghcr.io/demo/app:production");
+		});
+	});
+
+	test("rejects an unknown environment", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		await expect(
+			runRollback(root, { target: "docker-gha", environment: "prod", agentName: "operator" }),
+		).rejects.toThrow(/Unknown environment/i);
+	});
+});
+
+// --- generated config never clobbers existing files ------------------------
+
+describe("deploy keeps existing files", () => {
+	const customDockerfile = 'FROM golang:1.23\nCOPY . .\nRUN go build -o /app\nCMD ["/app"]\n';
+	const customWorkflow = "name: my-own-deploy\non: push\n";
+
+	/** Seed the repo with a hand-written Dockerfile, .dockerignore and workflow. */
+	function writeCustomFiles(dir: string): void {
+		writeFileSync(join(dir, "Dockerfile"), customDockerfile, "utf8");
+		writeFileSync(join(dir, ".dockerignore"), "secret-stuff\n", "utf8");
+		mkdirSync(join(dir, ".github", "workflows"), { recursive: true });
+		writeFileSync(join(dir, ".github", "workflows", "deploy.yml"), customWorkflow, "utf8");
+	}
+
+	function readCustomFiles(dir: string): string[] {
+		return [
+			readFileSync(join(dir, "Dockerfile"), "utf8"),
+			readFileSync(join(dir, ".dockerignore"), "utf8"),
+			readFileSync(join(dir, ".github", "workflows", "deploy.yml"), "utf8"),
+		];
+	}
+
+	test("--dry-run never modifies existing files, even with --force", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		writeCustomFiles(root);
+		const before = readCustomFiles(root);
+
+		const plain = await runDeploy(root, {
+			target: "docker-gha",
+			environment: "staging",
+			dryRun: true,
+			yes: false,
+			agentName: "operator",
+		});
+		expect(plain.artifacts.map((a) => a.action)).toEqual(["keep", "keep", "keep"]);
+		expect(readCustomFiles(root)).toEqual(before);
+
+		const forced = await runDeploy(root, {
+			target: "docker-gha",
+			environment: "staging",
+			dryRun: true,
+			yes: false,
+			force: true,
+			agentName: "operator",
+		});
+		expect(forced.artifacts.map((a) => a.action)).toEqual(["overwrite", "overwrite", "overwrite"]);
+		expect(forced.writtenArtifacts).toEqual([]);
+		expect(readCustomFiles(root)).toEqual(before);
+	});
+
+	test("a real deploy keeps existing files unless --force, and builds with the kept Dockerfile", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		writeCustomFiles(root);
+		const before = readCustomFiles(root);
+
+		await withFakeDocker(async () => {
+			const kept = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				agentName: "operator",
+			});
+			expect(kept.deploy?.ok).toBe(true);
+			expect(kept.writtenArtifacts).toEqual([]);
+			expect(kept.artifacts.every((a) => a.action === "keep" && !a.written)).toBe(true);
+			expect(readCustomFiles(root)).toEqual(before);
+
+			const forced = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				force: true,
+				agentName: "operator",
+			});
+			expect(forced.writtenArtifacts.length).toBe(3);
+			expect(readFileSync(join(root, "Dockerfile"), "utf8")).not.toBe(customDockerfile);
+		});
+	});
+
+	test("a Dockerfile-only (non-Node) project uses its own Dockerfile; none is generated", async () => {
+		root = await initRepo({ config: configWith({ default: "docker-gha" }) });
+		writeFileSync(join(root, "Dockerfile"), customDockerfile, "utf8");
+		writeFileSync(join(root, "main.go"), "package main\nfunc main() {}\n", "utf8");
+
+		await withFakeDocker(async (calls) => {
+			const result = await runDeploy(root, {
+				target: "docker-gha",
+				environment: "staging",
+				dryRun: false,
+				yes: false,
+				force: true,
+				agentName: "operator",
+			});
+			expect(result.deploy?.ok).toBe(true);
+			expect(result.summary).toContain("existing Dockerfile");
+			// No Dockerfile artifact at all — not even --force can replace it with a
+			// Node image.
+			expect(result.artifacts.some((a) => a.path === "Dockerfile")).toBe(false);
+			expect(readFileSync(join(root, "Dockerfile"), "utf8")).toBe(customDockerfile);
+			expect(calls()[0]).toMatch(/^build -t /);
+		});
+	});
+
+	test("a real deploy that fails on missing secrets writes nothing", async () => {
+		root = await initRepo({ pkg: servicePkg(), config: configWith({ default: "docker-gha" }) });
+		const saved = process.env.GHCR_TOKEN;
+		delete process.env.GHCR_TOKEN;
+		try {
+			await expect(
+				runDeploy(root, {
+					target: "docker-gha",
+					environment: "staging",
+					dryRun: false,
+					yes: false,
+					agentName: "operator",
+				}),
+			).rejects.toThrow(/missing required secret/i);
+			expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+			expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(false);
+		} finally {
+			if (saved !== undefined) process.env.GHCR_TOKEN = saved;
+		}
 	});
 });
 

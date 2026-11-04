@@ -50,7 +50,7 @@ describe("createShipCommand", () => {
 });
 
 describe("runShip (dry-run)", () => {
-	test("plans a deploy without mutation and writes artifacts", async () => {
+	test("plans a deploy without mutation and without writing artifacts", async () => {
 		const result = await runShip(root, "a tiny web app", {
 			target: "docker-gha",
 			env: "preview",
@@ -68,9 +68,10 @@ describe("runShip (dry-run)", () => {
 		expect(deployStage?.status).toBe("ok");
 		// A dry-run records a dryRun audit row, never a success deploy.
 		expect(result.deploy?.dryRun).toBe(true);
-		// docker-gha generateConfig wrote a Dockerfile to the project root.
-		expect(existsSync(join(root, "Dockerfile"))).toBe(true);
-		expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(true);
+		// docker-gha generateConfig planned a Dockerfile, but a dry run writes nothing.
+		expect(result.deploy?.artifacts.some((a) => a.path === "Dockerfile")).toBe(true);
+		expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+		expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(false);
 		// No real deployment URL in dry-run.
 		expect(result.urls).toEqual([]);
 	});
