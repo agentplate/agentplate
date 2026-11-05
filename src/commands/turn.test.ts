@@ -15,6 +15,7 @@ import {
 	setProjectRootOverride,
 } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
+import { createMailClient } from "../mail/client.ts";
 import { sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, SessionState } from "../types.ts";
@@ -88,6 +89,19 @@ describe("agentplate turn — refusals", () => {
 	test("refuses a terminal (completed) agent", async () => {
 		seedSession({ state: "completed" });
 		await expect(runTurnCmd("builder-1")).rejects.toBeInstanceOf(ValidationError);
+	});
+
+	test("refuses an agent whose turn another driver is running, leaving its mail unread", async () => {
+		seedSession({ state: "working" });
+		const mail = createMailClient(root);
+		try {
+			mail.send({ from: "lead-1", to: "builder-1", subject: "s", body: "b", type: "status" });
+			await expect(runTurnCmd("builder-1")).rejects.toBeInstanceOf(ValidationError);
+			expect(mail.check("builder-1", { unreadOnly: true })).toHaveLength(1);
+		} finally {
+			mail.close();
+		}
+		expect(sessionState("builder-1")).toBe("working");
 	});
 });
 

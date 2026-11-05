@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AGENTPLATE_DIR, CONFIG_FILE, DEFAULT_CONFIG, serializeConfig } from "../config.ts";
+import { ValidationError } from "../errors.ts";
 import { createEventStore, type EventStore } from "../events/store.ts";
 import { createMailClient, type MailClient } from "../mail/client.ts";
 import { eventsDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
@@ -436,6 +437,72 @@ describe("driveTurn — failure handling", () => {
 
 		await pending;
 		expect(store.getSession(session.id)?.pid).toBeNull();
+	});
+});
+
+describe("driveTurn — atomic turn claim", () => {
+	test("refuses a session another driver already claimed, without building its prompt", async () => {
+		const session = makeSession({ state: "idle" });
+		store.upsertSession(session);
+		expect(store.claimTurn(session.id)).toBe(true); // the other driver won
+		const log = join(worktree, "turns.log");
+		process.env.AGENTPLATE_MOCK_CMD = `echo turn >> '${log}'`;
+		let promptBuilt = false;
+
+		await expect(
+			driveTurn({
+				root,
+				config: cfg(),
+				runtime: new SpyRuntime(),
+				store,
+				events,
+				mail,
+				session, // stale snapshot: still says 'idle'
+				model: { model: "m", env: {} },
+				prompt: () => {
+					promptBuilt = true;
+					return "go";
+				},
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
+
+		expect(promptBuilt).toBe(false); // no mail consumed by the loser
+		expect(existsSync(log)).toBe(false); // and no second runtime spawned
+		expect(store.getSession(session.id)?.state).toBe("working"); // winner's claim intact
+	});
+
+	test("two drivers racing for one idle agent: one turn runs, the loser leaves new mail unread", async () => {
+		const session = makeSession({ state: "idle", runtimeSessionId: "sess-prior" });
+		store.upsertSession(session);
+		mail.send({ from: "lead-1", to: session.agentName, subject: "m1", body: "a", type: "status" });
+		const log = join(worktree, "turns.log");
+		process.env.AGENTPLATE_MOCK_CMD = `echo turn >> '${log}'; sleep 0.3`;
+		const config = cfg();
+		config.runtime.default = "mock";
+
+		// Driver A (e.g. `watch`) claims the turn and is mid-turn…
+		const first = driveAgentTurn({ root, config, session, store, events, mail });
+		await waitFor(() => store.getSession(session.id)?.pid != null);
+		// …new mail lands, and driver B (a manual `turn`, from its own stale
+		// 'idle' snapshot and its own DB handles) tries to drive the same agent.
+		mail.send({ from: "lead-1", to: session.agentName, subject: "m2", body: "b", type: "status" });
+		const storeB = createSessionStore(sessionsDbPath(root));
+		const mailB = createMailClient(root);
+		try {
+			await expect(
+				driveAgentTurn({ root, config, session, store: storeB, events, mail: mailB }),
+			).rejects.toBeInstanceOf(ValidationError);
+		} finally {
+			storeB.close();
+			mailB.close();
+		}
+		await first;
+
+		expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["turn"]); // exactly one turn
+		// m1 went to A's turn; m2 is still waiting for the NEXT turn, not swallowed by B.
+		expect(mail.check(session.agentName, { unreadOnly: true }).map((m) => m.subject)).toEqual([
+			"m2",
+		]);
 	});
 });
 

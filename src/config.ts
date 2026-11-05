@@ -10,7 +10,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import yaml from "js-yaml";
 import { ConfigError } from "./errors.ts";
 import type { AgentplateConfig, AutoMergeMode } from "./types.ts";
@@ -93,12 +93,34 @@ export function setProjectRootOverride(root: string | null): void {
 	projectRootOverride = root === null ? null : resolve(root);
 }
 
+/** Where agent worktrees live under the project root (mirrors worktree/manager.ts). */
+const WORKTREES_SUBDIR = join(AGENTPLATE_DIR, "worktrees");
+
+/**
+ * The project root owning the agent worktree `dir` sits in, or null when `dir`
+ * is not inside one. Agent worktrees always live at
+ * `<root>/.agentplate/worktrees/<agent>/`, and when `.agentplate/config.yaml` is
+ * committed each one carries its own copy — so a plain walk-up would stop at the
+ * worktree and route the agent's mail/sling state into it. The FIRST (outermost)
+ * match wins, so even a nested worktree resolves to the real root.
+ */
+function agentWorktreeRoot(dir: string): string | null {
+	const marker = `${sep}${WORKTREES_SUBDIR}${sep}`;
+	const at = dir.indexOf(marker);
+	if (at === -1) return null;
+	const root = dir.slice(0, at) || sep;
+	return existsSync(join(root, AGENTPLATE_DIR)) ? root : null;
+}
+
 /**
  * Find the project root by walking up from `start` looking for a `.agentplate/`
- * directory. Falls back to the override or the current working directory.
+ * directory. Inside an agent worktree it resolves to the owning project root,
+ * not the worktree. Falls back to the override or the current working directory.
  */
 export function findProjectRoot(start: string = process.cwd()): string {
 	if (projectRootOverride) return projectRootOverride;
+	const worktreeRoot = agentWorktreeRoot(resolve(start));
+	if (worktreeRoot) return worktreeRoot;
 	let dir = resolve(start);
 	while (true) {
 		if (existsSync(join(dir, AGENTPLATE_DIR))) return dir;

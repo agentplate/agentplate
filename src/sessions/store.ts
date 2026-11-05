@@ -32,6 +32,12 @@ import type { AgentSession, Capability, RunRecord, SessionState } from "../types
 const ACTIVE_STATES: readonly SessionState[] = ["booting", "working", "idle"];
 
 /**
+ * States a turn may be claimed from (see {@link SessionStore.claimTurn}): booting
+ * (awaiting its first turn) or idle (paused between turns, awaiting mail).
+ */
+export const CLAIMABLE_STATES: readonly SessionState[] = ["idle", "booting"];
+
+/**
  * Filter for {@link SessionStore.listSessions}. Both fields are optional and
  * AND-combined; omit both to list every session. Local to this store (purely a
  * query convenience), so it is defined here rather than in shared types.
@@ -64,6 +70,20 @@ export interface SessionStore {
 	 * must not resurrect a session an operator stopped mid-turn.
 	 */
 	transitionSessionState(id: string, from: SessionState, to: SessionState): boolean;
+	/**
+	 * Atomically claim the session's next turn: move it to `working` only if it is
+	 * in one of {@link CLAIMABLE_STATES}. Returns false (and changes nothing) when
+	 * another driver already claimed it, or it was stopped/finished meanwhile — so
+	 * two drivers can never run the same agent at once.
+	 */
+	claimTurn(id: string): boolean;
+	/**
+	 * Run `fn` inside a `BEGIN IMMEDIATE` transaction: the database write lock is
+	 * taken up front, so a read-check-write in `fn` (e.g. a capacity count followed
+	 * by the session insert it admits) is serialized against every other process.
+	 * `fn` must be synchronous; if it throws, its writes are rolled back.
+	 */
+	immediateTransaction<T>(fn: () => T): T;
 	/**
 	 * Permanently delete a session row by id (no-op if absent). Unlike
 	 * {@link updateSessionState}(id, "stopped") — which keeps the row for history —
@@ -170,10 +190,13 @@ function rowToSession(row: SessionRow): AgentSession {
 	};
 }
 
-// SQL IN-list of active states, built from the single ACTIVE_STATES source.
-// Values are hard-coded literals (no user input), so quoting them is safe; we
-// still derive the list programmatically so it never drifts from the constant.
-const ACTIVE_STATES_SQL = `(${ACTIVE_STATES.map((s) => `'${s}'`).join(", ")})`;
+// SQL IN-lists of states, built from the single ACTIVE_STATES / CLAIMABLE_STATES
+// sources. Values are hard-coded literals (no user input), so quoting them is
+// safe; we still derive the lists programmatically so they never drift.
+const statesSql = (states: readonly SessionState[]): string =>
+	`(${states.map((s) => `'${s}'`).join(", ")})`;
+const ACTIVE_STATES_SQL = statesSql(ACTIVE_STATES);
+const CLAIMABLE_STATES_SQL = statesSql(CLAIMABLE_STATES);
 
 /**
  * Open (or create) the session/run store at `dbPath`.
@@ -340,6 +363,22 @@ export function createSessionStore(dbPath: string): SessionStore {
 		return result.changes > 0;
 	}
 
+	function claimTurn(id: string): boolean {
+		// One conditional UPDATE: the state check and the claim are a single atomic
+		// write, so of two racing drivers exactly one sees `changes === 1`.
+		const now = new Date().toISOString();
+		const result = db
+			.query(
+				`UPDATE sessions SET state = 'working', last_activity = ? WHERE id = ? AND state IN ${CLAIMABLE_STATES_SQL}`,
+			)
+			.run(now, id);
+		return result.changes > 0;
+	}
+
+	function immediateTransaction<T>(fn: () => T): T {
+		return db.transaction(fn).immediate();
+	}
+
 	function deleteSession(id: string): void {
 		// Hard delete. Safe to call for a missing id (DELETE simply affects 0 rows).
 		db.query("DELETE FROM sessions WHERE id = ?").run(id);
@@ -398,6 +437,8 @@ export function createSessionStore(dbPath: string): SessionStore {
 		touch,
 		setPid,
 		transitionSessionState,
+		claimTurn,
+		immediateTransaction,
 		deleteSession,
 		countActive,
 		countActiveByParent,

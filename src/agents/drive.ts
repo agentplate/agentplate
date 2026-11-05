@@ -13,6 +13,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { ValidationError } from "../errors.ts";
 import type { EventStore } from "../events/store.ts";
 import { runQualityGates } from "../insights/quality-gates.ts";
 import { createLogger } from "../logging/logger.ts";
@@ -35,6 +36,7 @@ import type {
 	AgentplateConfig,
 	AgentSession,
 	Capability,
+	MailMessage,
 	OutcomeStatus,
 	ResolvedModel,
 	SessionState,
@@ -148,8 +150,12 @@ export interface DriveTurnCtx {
 	session: AgentSession;
 	/** Resolved concrete model + provider env for this capability. */
 	model: ResolvedModel;
-	/** The user-turn text (dispatch / injected mail / nudge). */
-	prompt: string;
+	/**
+	 * The user-turn text (dispatch / injected mail / nudge). Pass a function when
+	 * building it consumes mail (checkInject marks it read): it is called only
+	 * after this driver has claimed the turn, so a losing driver delivers nothing.
+	 */
+	prompt: string | (() => string);
 	/** Prior runtime session id to resume — omit on the first turn (warm start). */
 	resumeSessionId?: string;
 	/** Called right after the runtime child spawns (not when the spawn fails). */
@@ -175,7 +181,14 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 		branchName,
 	} = session;
 
-	store.updateSessionState(sessionId, "working");
+	// Atomic claim (idle/booting → working): of two drivers racing for the same
+	// agent (`watch` + a manual `turn`, two watchers…) exactly one proceeds.
+	if (!store.claimTurn(sessionId)) {
+		const current = store.getSession(sessionId)?.state ?? "gone";
+		throw new ValidationError(
+			`Agent "${name}" is ${current}; its turn was already claimed or it is no longer idle.`,
+		);
+	}
 
 	// Spawn → final state runs under try/finally: if the spawn throws (runtime
 	// binary missing, worktree gone) or anything before the final state lands
@@ -189,11 +202,12 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 		let sawError = false;
 		// Only terminal mail sent from here on can complete this turn.
 		const turnStartedAt = new Date().toISOString();
+		const prompt = typeof ctx.prompt === "function" ? ctx.prompt() : ctx.prompt;
 		turn = await runTurn({
 			runtime,
 			worktreePath,
 			model: model.model,
-			prompt: ctx.prompt,
+			prompt,
 			// The agent's own identity: `agentplate mail` inside the turn sends as it.
 			env: { ...model.env, [AGENT_IDENTITY_ENV]: name },
 			baseUrl: model.baseUrl,
@@ -384,8 +398,9 @@ export interface DriveAgentTurnCtx {
  * Run the next (resumed) turn for an existing session: resolve its runtime + model
  * + manifest def, inject its unread mail as the prompt, and {@link driveTurn} with
  * the stored `runtimeSessionId` (warm start). Shared by `agentplate turn` (single)
- * and `agentplate watch` (the mail pump). Assumes the caller has already decided
- * the session is drivable.
+ * and `agentplate watch` (the mail pump). The caller's state check is only a fast
+ * path: driveTurn claims the turn atomically and throws if another driver won it,
+ * and the mail is injected only after that claim.
  */
 export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnResult> {
 	const { root, config, session } = ctx;
@@ -399,14 +414,16 @@ export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnR
 	const model = resolveModel(config, root, def.model, session.capability);
 
 	// The turn's user text is the agent's unread mail (a child's reply / operator
-	// direction); fall back to a continue nudge. The mail is marked read only once
-	// the runtime has spawned: a turn that fails to start leaves it unread for the
-	// next attempt instead of silently consuming it.
-	const unread = ctx.mail.check(session.agentName, { unreadOnly: true });
-	const prompt =
-		unread.length > 0
+	// direction); fall back to a continue nudge. It is read lazily, only once
+	// driveTurn has claimed the turn, and marked read only once the runtime has
+	// spawned: a turn that loses the claim or fails to start leaves it unread.
+	let unread: MailMessage[] = [];
+	const prompt = (): string => {
+		unread = ctx.mail.check(session.agentName, { unreadOnly: true });
+		return unread.length > 0
 			? formatInjection(unread)
 			: "Continue your task. If it is complete, send your terminal mail.";
+	};
 
 	return driveTurn({
 		root,
