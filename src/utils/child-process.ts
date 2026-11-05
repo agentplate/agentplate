@@ -129,7 +129,8 @@ export const BASE_ENV_ALLOWLIST: readonly string[] = [
  * Operator escape hatch: a comma/space-separated list of extra variable names
  * (a trailing `*` matches a prefix; a lone `*` inherits everything) that
  * agent-facing children may inherit — e.g. `AWS_ACCESS_KEY_ID` for a Bedrock
- * login, or a toolchain variable a quality gate needs.
+ * login, or a toolchain variable a quality gate needs. The variable itself is
+ * always forwarded, so the list applies at every level of the agent hierarchy.
  */
 export const ENV_PASSTHROUGH_VAR = "AGENTPLATE_ENV_PASSTHROUGH";
 
@@ -155,6 +156,11 @@ export function agentChildEnv(
 	const parent = opts.parent ?? process.env;
 	const allowed = compileAllowlist([
 		...BASE_ENV_ALLOWLIST,
+		// Forward the operator's list itself, so it survives nesting: a lead runs
+		// `agentplate sling` in its own turn, and the builder's first turn (plus
+		// its gates and distiller) is built from the lead's already-filtered env.
+		// This widens nothing — a child can only pass on vars it already has.
+		ENV_PASSTHROUGH_VAR,
 		...(opts.passthrough ?? []),
 		...splitPassthrough(parent[ENV_PASSTHROUGH_VAR]),
 	]);

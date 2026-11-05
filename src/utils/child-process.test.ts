@@ -90,6 +90,23 @@ describe("agentChildEnv", () => {
 		expect(everything.GHCR_TOKEN).toBe(GHCR);
 	});
 
+	test(`${ENV_PASSTHROUGH_VAR} survives nesting (operator → lead → builder)`, () => {
+		// A lead runs `agentplate sling` inside its own turn, so the builder's env
+		// is agentChildEnv applied to the lead's already-filtered env.
+		const operator = { ...parent, [ENV_PASSTHROUGH_VAR]: "AWS_*" };
+		const lead = agentChildEnv({}, { parent: operator });
+		expect(lead[ENV_PASSTHROUGH_VAR]).toBe("AWS_*");
+		expect(lead.AWS_SECRET_ACCESS_KEY).toBe(AWS_SECRET);
+
+		const builder = agentChildEnv({}, { parent: lead });
+		expect(builder[ENV_PASSTHROUGH_VAR]).toBe("AWS_*");
+		expect(builder.AWS_SECRET_ACCESS_KEY).toBe(AWS_SECRET);
+		expect(builder.PATH).toBe("/usr/bin:/bin");
+		// Nesting widens nothing: what the lead lacked, the builder lacks too.
+		expect(builder.GHCR_TOKEN).toBeUndefined();
+		expect(builder.CI_DEPLOY_TOKEN).toBeUndefined();
+	});
+
 	test("defaults to filtering the real process.env", () => {
 		const saved = process.env.GHCR_TOKEN;
 		process.env.GHCR_TOKEN = GHCR;
