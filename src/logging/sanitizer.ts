@@ -84,7 +84,7 @@ const ENV_ASSIGNMENT = new RegExp(
 	"g",
 );
 const CODE_ASSIGNMENT = new RegExp(
-	String.raw`((?<![\w$-])["']?((?:[A-Za-z][\w-]*?)?(?:key|token|secret|password|passwd))${ASSIGNMENT_SEPARATOR})${ASSIGNMENT_VALUE}`,
+	String.raw`((?<![A-Za-z0-9$])["']?((?:[A-Za-z_][\w-]*?)?(?:key|token|secret|password|passwd))${ASSIGNMENT_SEPARATOR})${ASSIGNMENT_VALUE}`,
 	"gi",
 );
 

@@ -175,6 +175,20 @@ describe("sanitizer — assignment rules do not over-redact ordinary code", () =
 		];
 		for (const [input, expected] of cases) expect(sanitize(input)).toBe(expected);
 	});
+
+	test("CLI-flag and .npmrc secrets are redacted", () => {
+		// High-entropy letters+digits value, built by concatenation for push protection.
+		const v = ["Zx9fQ2Lm", "P0aB7tYc", "Wq8"].join("");
+		const cases: Array<[string, string]> = [
+			[`docker login --password=${v}`, "docker login --password=[REDACTED]"],
+			[`vercel deploy --token=${v}`, "vercel deploy --token=[REDACTED]"],
+			[`cli --api-key=${v}`, "cli --api-key=[REDACTED]"],
+			[`cli --client-secret=${v}`, "cli --client-secret=[REDACTED]"],
+			[`//registry.npmjs.org/:_authToken=${v}`, "//registry.npmjs.org/:_authToken=[REDACTED]"],
+			[`_authToken=${v}`, "_authToken=[REDACTED]"],
+		];
+		for (const [input, expected] of cases) expect(sanitize(input)).toBe(expected);
+	});
 });
 
 describe("sanitizer — escaped quotes inside JSON secret values", () => {
