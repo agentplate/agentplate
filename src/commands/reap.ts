@@ -2,10 +2,13 @@
  * `agentplate reap` — terminate agents idle past the timeout.
  *
  * Sweeps the session store for workers with no activity for the idle window
- * (default `config.agents.idleTimeoutMinutes`, 10), marks each `stopped`, kills any
- * live process, and removes its worktree + branch. The coordinator is never
- * reaped. Run it manually or on a cron; `agentplate serve` also reaps on its own
- * loop. Use `--dry-run` to preview and `--keep-worktrees` to leave worktrees.
+ * (default `config.agents.idleTimeoutMinutes`, 10), marks each `stopped`, and
+ * removes its worktree + merged branch. It never signals a process: a session whose
+ * turn process is still alive is not idle and is never selected (use
+ * `agentplate stop` to end a live turn). A worktree with uncommitted changes is
+ * kept and reported, never force-removed. The coordinator is never reaped. Run it
+ * manually or on a cron; `agentplate serve` also reaps on its own loop. Use
+ * `--dry-run` to preview and `--keep-worktrees` to leave worktrees.
  *
  * `--purge` goes further than a normal reap: it erases every trace of each reaped
  * agent — mail, events, queued merges, the on-disk `.agentplate/agents/<name>/`
@@ -17,16 +20,18 @@ import { Command } from "commander";
 import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
-import { muted, printInfo, printSuccess } from "../logging/color.ts";
+import { muted, printInfo, printSuccess, printWarning } from "../logging/color.ts";
 import { sessionsDbPath } from "../paths.ts";
 import { reapIdleSessions, selectIdleSessions } from "../sessions/reaper.ts";
 import { createSessionStore } from "../sessions/store.ts";
 
 export function createReapCommand(): Command {
 	return new Command("reap")
-		.description("Terminate agents idle past the timeout (stop + kill + remove worktree)")
+		.description(
+			"Stop agents idle past the timeout and remove their worktrees (live turns are never touched)",
+		)
 		.option("--minutes <n>", "idle timeout in minutes (default: config.agents.idleTimeoutMinutes)")
-		.option("--keep-worktrees", "mark stopped + kill process but keep worktrees/branches")
+		.option("--keep-worktrees", "mark stopped but keep worktrees/branches")
 		.option(
 			"--purge",
 			"fully erase each reaped agent (mail, events, merges, state dir, session row)",
@@ -93,12 +98,22 @@ export function createReapCommand(): Command {
 						const verb = opts.purge ? "Reaped + purged" : "Reaped";
 						printSuccess(`${verb} ${reaped.length} idle agent(s) (>${minutes}m):`);
 						for (const r of reaped) {
-							const wt = r.worktreeRemoved ? "worktree removed" : "worktree kept";
+							const wt = r.worktreeRemoved
+								? "worktree removed"
+								: r.worktreeDirty
+									? "worktree kept: uncommitted changes"
+									: "worktree kept";
 							const extra = r.purged
 								? `, purged ${r.purged.mailDeleted} mail/${r.purged.eventsDeleted} events/${r.purged.mergeDeleted} merges`
 								: "";
 							process.stdout.write(
 								`  ${r.agentName} ${muted(`(${r.capability}, ${wt}${extra})`)}\n`,
+							);
+						}
+						const dirty = reaped.filter((r) => r.worktreeDirty);
+						if (dirty.length > 0) {
+							printWarning(
+								`Kept ${dirty.length} worktree(s) with uncommitted changes. Inspect and commit them, or remove with \`agentplate stop <agent> --clean-worktree\`.`,
 							);
 						}
 					}

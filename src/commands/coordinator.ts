@@ -9,6 +9,7 @@
  */
 
 import { writeFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { Command } from "commander";
 import {
 	removeGeneratedInstructionFile,
@@ -101,6 +102,105 @@ export function planCoordinatorLaunch(
 		initialMessage: seedRole(opts.systemPrompt, opts.initialMessage),
 	});
 	return { argv: seeded, generatedFile: null, seededBecause: reason };
+}
+
+/** Signals forwarded to the attached chat before the coordinator cleans up and exits. */
+const FORWARDED_SIGNALS = ["SIGTERM", "SIGHUP"] as const;
+
+export interface AttachedChildOptions {
+	cwd: string;
+	env: Record<string, string | undefined>;
+	/** stdio for the child (default: inherit all three). */
+	stdio?: "inherit" | "ignore";
+	/** After a forwarded signal, how long to wait for the child before SIGKILL + exit (ms). */
+	killGraceMs?: number;
+}
+
+/**
+ * Run the attended chat `argv` with inherited stdio and guarantee `cleanup` runs
+ * exactly once however the coordinator ends — normal exit, or a signal that would
+ * otherwise kill this process before any `finally` block ran.
+ *
+ * - SIGTERM / SIGHUP: forwarded to the chat; once it exits (or after
+ *   `killGraceMs`, when it is SIGKILLed) cleanup runs and the process exits with
+ *   the conventional `128 + signal` code.
+ * - SIGINT: a terminal Ctrl+C goes to the whole foreground process group, so the
+ *   chat already received it and decides what it means (claude uses it to cancel a
+ *   turn). It is swallowed here so this process keeps waiting; cleanup runs when the
+ *   chat exits.
+ *
+ * Returns the chat's exit code when it ended without a forwarded signal.
+ */
+export async function runAttachedChild(
+	argv: string[],
+	opts: AttachedChildOptions,
+	cleanup: () => void,
+): Promise<number> {
+	const stdio = opts.stdio ?? "inherit";
+	const proc = Bun.spawn(argv, {
+		cwd: opts.cwd,
+		env: opts.env,
+		stdin: stdio,
+		stdout: stdio,
+		stderr: stdio,
+	});
+
+	let cleaned = false;
+	const runCleanup = (): void => {
+		if (cleaned) return;
+		cleaned = true;
+		try {
+			cleanup();
+		} catch {
+			// Best-effort: never let cleanup mask the exit path.
+		}
+	};
+	const exitFor = (sig: NodeJS.Signals): number => 128 + (osConstants.signals[sig] ?? 0);
+
+	let received: NodeJS.Signals | null = null;
+	const onSigint = (): void => {};
+	const onForwarded = (sig: NodeJS.Signals): void => {
+		if (received) return;
+		received = sig;
+		try {
+			proc.kill(sig);
+		} catch {
+			// Already gone.
+		}
+		setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// Already gone.
+			}
+			runCleanup();
+			process.exit(exitFor(sig));
+		}, opts.killGraceMs ?? 5_000).unref();
+	};
+	process.on("SIGINT", onSigint);
+	for (const sig of FORWARDED_SIGNALS) process.on(sig, onForwarded);
+
+	let exitCode: number;
+	try {
+		exitCode = await proc.exited;
+	} finally {
+		process.off("SIGINT", onSigint);
+		for (const sig of FORWARDED_SIGNALS) process.off(sig, onForwarded);
+		runCleanup();
+	}
+	if (received) process.exit(exitFor(received));
+	return exitCode;
+}
+
+/** Mark the coordinator session stopped (used on every exit path of `start`). */
+function markCoordinatorStopped(root: string): void {
+	const store = createSessionStore(sessionsDbPath(root));
+	try {
+		const current = store.getSessionByAgent(COORDINATOR_NAME);
+		if (current) store.updateSessionState(current.id, "stopped");
+	} finally {
+		store.close();
+	}
 }
 
 function requireInit(): string {
@@ -230,29 +330,20 @@ function startCommand(): Command {
 				}
 				// Mail the coordinator sends from its chat is sent as "coordinator", never "operator".
 				interactiveEnv[AGENT_IDENTITY_ENV] = COORDINATOR_NAME;
-				let exitCode: number;
-				try {
-					const proc = Bun.spawn(resolveArgv(launch.argv), {
-						cwd: root,
-						env: { ...process.env, ...interactiveEnv },
-						stdin: "inherit",
-						stdout: "inherit",
-						stderr: "inherit",
-					});
-					exitCode = await proc.exited;
-				} finally {
-					// Leave the root as we found it: drop the file this chat generated.
-					if (launch.generatedFile) removeGeneratedInstructionFile(launch.generatedFile);
-				}
-
-				// 4. On exit, mark the coordinator stopped.
-				const closeStore = createSessionStore(sessionsDbPath(root));
-				try {
-					const current = closeStore.getSessionByAgent(COORDINATOR_NAME);
-					if (current) closeStore.updateSessionState(current.id, "stopped");
-				} finally {
-					closeStore.close();
-				}
+				// 4. However the chat ends (exit, SIGTERM, SIGHUP), leave the root as we
+				// found it (drop the file this chat generated) and mark the coordinator
+				// stopped.
+				const exitCode = await runAttachedChild(
+					resolveArgv(launch.argv),
+					{ cwd: root, env: { ...process.env, ...interactiveEnv } },
+					() => {
+						try {
+							if (launch.generatedFile) removeGeneratedInstructionFile(launch.generatedFile);
+						} finally {
+							markCoordinatorStopped(root);
+						}
+					},
+				);
 				if (exitCode !== 0) {
 					printWarning(`coordinator session exited with code ${exitCode}`);
 				}

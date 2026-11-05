@@ -239,6 +239,19 @@ export function loadConfig(root?: string): AgentplateConfig {
 	return merged;
 }
 
+/**
+ * Load only the committed layer: DEFAULT_CONFIG ← config.yaml, WITHOUT the gitignored
+ * config.local.yaml and without stamping `project.root`. Used by commands that rewrite
+ * config.yaml (`setup`, `model`) so machine-local overrides are never promoted into the
+ * tracked file. Not validated: the committed layer alone may legitimately be incomplete.
+ */
+export function loadCommittedConfig(root: string): AgentplateConfig {
+	const base = readYamlIfExists(join(resolve(root), AGENTPLATE_DIR, CONFIG_FILE));
+	const committed = deepMerge(DEFAULT_CONFIG, base);
+	committed.project = { ...committed.project, root: "" };
+	return committed;
+}
+
 /** Serialize a config object to YAML for writing to `config.yaml`. */
 export function serializeConfig(config: AgentplateConfig): string {
 	return yaml.dump(config, { indent: 2, lineWidth: 100, sortKeys: false });

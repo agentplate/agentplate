@@ -10,10 +10,11 @@ import { Command } from "commander";
 import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { brand, printHint, printSuccess } from "../logging/color.ts";
-import { ensureAgentplateDirs, scaffoldAgentplateDir } from "../scaffold.ts";
+import { ensureAgentplateDirs } from "../scaffold.ts";
 import { setSecret } from "../secrets.ts";
 import { runSetupWizard } from "../wizard/setup.ts";
 import { buildInitialConfig } from "./init.ts";
+import { persistWizardConfig } from "./model.ts";
 
 export function createSetupCommand(): Command {
 	return new Command("setup")
@@ -36,7 +37,9 @@ export function createSetupCommand(): Command {
 			const result = await runSetupWizard(currentConfig);
 
 			// Write config (+ supporting files), then the secret (after .gitignore exists).
-			scaffoldAgentplateDir(root, result.config);
+			// Only the committed layer + the user's changes go to config.yaml — never
+			// config.local.yaml overrides or the absolute project root.
+			persistWizardConfig(root, currentConfig, result.config);
 			if (result.secret) {
 				setSecret(root, result.secret.key, result.secret.value);
 			}

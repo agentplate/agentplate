@@ -201,3 +201,87 @@ describe("planCoordinatorLaunch", () => {
 		expect(onDisk).not.toContain("stale role");
 	});
 });
+
+describe("runAttachedChild — signal cleanup", () => {
+	/**
+	 * Run a real `bun` process standing in for `coordinator start`: it attaches a
+	 * `sleep` "chat" through runAttachedChild, whose cleanup writes a marker file.
+	 */
+	function launchHost(): { host: ReturnType<typeof Bun.spawn>; marker: string; pidFile: string } {
+		const marker = join(root, "cleaned");
+		const pidFile = join(root, "child.pid");
+		const script = join(root, "host.ts");
+		writeFileSync(
+			script,
+			[
+				`import { writeFileSync } from "node:fs";`,
+				`import { runAttachedChild } from ${JSON.stringify(join(import.meta.dir, "coordinator.ts"))};`,
+				`const [marker, pidFile] = process.argv.slice(2) as [string, string];`,
+				"const code = await runAttachedChild(",
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: emitted source
+				'\t["sh", "-c", `echo $$ > "${pidFile}"; exec sleep 30`],',
+				`\t{ cwd: process.cwd(), env: process.env, stdio: "ignore", killGraceMs: 2000 },`,
+				`\t() => writeFileSync(marker, "cleaned"),`,
+				");",
+				"process.exit(code === 0 ? 0 : 3);",
+			].join("\n"),
+		);
+		const host = Bun.spawn([process.execPath, script, marker, pidFile], {
+			cwd: root,
+			stdout: "ignore",
+			stderr: "inherit",
+		});
+		return { host, marker, pidFile };
+	}
+
+	async function childPid(pidFile: string): Promise<number> {
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			if (existsSync(pidFile)) {
+				const pid = Number(readFileSync(pidFile, "utf8").trim());
+				if (pid > 0) return pid;
+			}
+			await Bun.sleep(25);
+		}
+		throw new Error("attached child never started");
+	}
+
+	function alive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	test("SIGTERM forwards to the chat, runs cleanup, and exits 143", async () => {
+		const { host, marker, pidFile } = launchHost();
+		try {
+			const pid = await childPid(pidFile);
+			host.kill("SIGTERM");
+			const code = await host.exited;
+			expect(code).toBe(143);
+			expect(existsSync(marker)).toBe(true);
+			expect(alive(pid)).toBe(false);
+		} finally {
+			host.kill("SIGKILL");
+		}
+	}, 15_000);
+
+	test("SIGINT alone does not kill the host; cleanup runs when the chat exits", async () => {
+		const { host, marker, pidFile } = launchHost();
+		try {
+			const pid = await childPid(pidFile);
+			host.kill("SIGINT");
+			await Bun.sleep(300);
+			expect(host.exitCode).toBeNull();
+			expect(existsSync(marker)).toBe(false);
+			process.kill(pid, "SIGTERM"); // the chat ends on its own terms
+			await host.exited;
+			expect(existsSync(marker)).toBe(true);
+		} finally {
+			host.kill("SIGKILL");
+		}
+	}, 15_000);
+});
