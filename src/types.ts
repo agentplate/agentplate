@@ -205,7 +205,11 @@ export type AutoMergeMode = "off" | "on-gates-pass" | "on-complete";
 
 /** Conflict-resolution and auto-merge behavior for merging agent branches. */
 export interface MergeConfig {
-	/** Allow AI-assisted resolution of semantic conflicts. */
+	/**
+	 * Allow the auto-resolve tier for conflicted merges (default false). It only
+	 * takes the incoming side of a file the target never changed since the merge
+	 * base; any real two-sided conflict still fails the merge. (No AI tier yet.)
+	 */
 	aiResolveEnabled: boolean;
 	/** When to auto-merge a completed worker's branch into the canonical branch. */
 	autoMerge: AutoMergeMode;
