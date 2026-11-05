@@ -69,6 +69,13 @@ describe("coordinator start", () => {
 		}
 	});
 
+	test("the coordinator chat carries its own mail identity, so it never mails as 'operator'", async () => {
+		initProject("mock");
+		process.env.AGENTPLATE_MOCK_INTERACTIVE = `printf '%s' "\${AGENTPLATE_AGENT_NAME-unset}" > who.txt`;
+		await runCoordinator(["start"]);
+		expect(readFileSync(join(root, "who.txt"), "utf8")).toBe("coordinator");
+	});
+
 	test("interactive start never overwrites the operator's root instruction file", async () => {
 		initProject("mock");
 		// The mock runtime reads its role from <root>/CLAUDE.md (no system-prompt flag).

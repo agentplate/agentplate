@@ -26,7 +26,7 @@ import {
 	printSuccess,
 	printWarning,
 } from "../logging/color.ts";
-import { createMailClient } from "../mail/client.ts";
+import { AGENT_IDENTITY_ENV, createMailClient } from "../mail/client.ts";
 import { currentRunPath, sessionsDbPath } from "../paths.ts";
 import { getRuntime } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
@@ -228,6 +228,8 @@ function startCommand(): Command {
 				if (permissionMode !== "bypass") {
 					delete interactiveEnv.OPENCODE_PERMISSION;
 				}
+				// Mail the coordinator sends from its chat is sent as "coordinator", never "operator".
+				interactiveEnv[AGENT_IDENTITY_ENV] = COORDINATOR_NAME;
 				let exitCode: number;
 				try {
 					const proc = Bun.spawn(resolveArgv(launch.argv), {

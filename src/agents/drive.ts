@@ -15,8 +15,14 @@
 import { existsSync } from "node:fs";
 import type { EventStore } from "../events/store.ts";
 import { runQualityGates } from "../insights/quality-gates.ts";
+import { createLogger } from "../logging/logger.ts";
 import { sanitize } from "../logging/sanitizer.ts";
-import { formatInjection, type MailClient } from "../mail/client.ts";
+import {
+	AGENT_IDENTITY_ENV,
+	formatInjection,
+	type MailClient,
+	OPERATOR_SENDER,
+} from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { maybeAutoMerge } from "../merge/auto.ts";
 import { mailDbPath, manifestFilePath } from "../paths.ts";
@@ -55,27 +61,80 @@ function errorDetail(text: string): string {
 	return clean.length > MAX_ERROR_DETAIL ? `${clean.slice(0, MAX_ERROR_DETAIL)}…` : clean;
 }
 
+/** Warnings for best-effort post-turn steps that failed (stderr, so `--json` stdout stays clean). */
+const log = createLogger({ scope: "drive" });
+
+/** Supervisors a terminal report may be addressed to besides the agent's own parent. */
+const SUPERVISORS: ReadonlySet<string> = new Set(["coordinator", OPERATOR_SENDER]);
+
+/** Which terminal mail may complete a turn (see {@link resolveFinalState}). */
+export interface TerminalMailScope {
+	/**
+	 * ISO time the turn started: only terminal mail stamped strictly after it counts.
+	 * Strict, so mail from an earlier turn in the same millisecond is never taken for
+	 * this one; the agent can't send anything within a millisecond of its spawn.
+	 */
+	since: string;
+	/** The agent's parent, if any: a terminal report must be addressed to it (or a supervisor). */
+	parent: string | null;
+}
+
 /**
  * Resolve a turn's end state from the agent's own mail + exit code:
- * - emitted terminal mail → `completed`
- * - clean exit, no terminal mail → `idle` (paused, awaiting its next turn)
- * - non-zero exit → `failed`
+ * - non-zero exit → `failed` (whatever mail it sent: no gates/skills/merge on it)
+ * - clean exit + terminal mail it sent THIS turn to its parent (or the
+ *   coordinator/operator) → `completed`
+ * - clean exit otherwise → `idle` (paused, awaiting its next turn)
+ *
+ * The `from` of mail an agent sends via the CLI is stamped with its own identity
+ * (`resolveSender`), so a sibling can't send terminal mail "from" this agent, and
+ * a stale `worker_done` from an earlier turn can't complete a later one.
  */
 export function resolveFinalState(
 	root: string,
 	name: string,
 	capability: Capability,
 	exitCode: number,
+	scope: TerminalMailScope,
 ): SessionState {
+	if (exitCode !== 0) return "failed";
 	const terminal = terminalTypesFor(capability);
 	const store = createMailStore(mailDbPath(root));
 	try {
-		const sent = store.list({ from: name });
-		if (sent.some((m) => terminal.includes(m.type))) return "completed";
+		const reported = store
+			.list({ from: name })
+			.some(
+				(m) =>
+					terminal.includes(m.type) &&
+					m.createdAt > scope.since &&
+					(m.to === scope.parent || SUPERVISORS.has(m.to)),
+			);
+		return reported ? "completed" : "idle";
 	} finally {
 		store.close();
 	}
-	return exitCode === 0 ? "idle" : "failed";
+}
+
+/**
+ * A best-effort post-turn step (gates, skills loop, auto-merge) failed: make it
+ * visible as a sanitized error event plus a stderr warning instead of swallowing
+ * it. Never throws — the turn's outcome must not hinge on reporting.
+ */
+function reportPostTurnFailure(
+	events: EventStore,
+	agentName: string,
+	runId: string,
+	step: string,
+	error: unknown,
+): void {
+	const message = error instanceof Error ? error.message : String(error);
+	const detail = errorDetail(`${step} failed: ${message}`);
+	try {
+		log.warn(`${agentName}: ${detail}`);
+		events.record({ agentName, runId, type: "error", tool: null, detail });
+	} catch {
+		// The event store itself is broken; nothing more can be done here.
+	}
 }
 
 export interface DriveTurnCtx {
@@ -128,12 +187,15 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 	let finalState: SessionState;
 	try {
 		let sawError = false;
+		// Only terminal mail sent from here on can complete this turn.
+		const turnStartedAt = new Date().toISOString();
 		turn = await runTurn({
 			runtime,
 			worktreePath,
 			model: model.model,
 			prompt: ctx.prompt,
-			env: model.env,
+			// The agent's own identity: `agentplate mail` inside the turn sends as it.
+			env: { ...model.env, [AGENT_IDENTITY_ENV]: name },
 			baseUrl: model.baseUrl,
 			authMode: model.authMode,
 			resumeSessionId: ctx.resumeSessionId,
@@ -199,7 +261,10 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 			}
 		}
 
-		const resolved = resolveFinalState(root, name, capability, turn.exitCode);
+		const resolved = resolveFinalState(root, name, capability, turn.exitCode, {
+			since: turnStartedAt,
+			parent: session.parentAgent,
+		});
 		// Compare-and-set: a session stopped mid-turn (`agentplate stop`) stays
 		// stopped — never resurrected, and no gates/skills/auto-merge run for it.
 		if (!store.transitionSessionState(sessionId, "working", resolved)) {
@@ -251,12 +316,14 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 	const wantGates = !config.agents.skipGates && (runSkills || autoMergeWants);
 	let gateStatus: OutcomeStatus | null = null;
 	if (finalState === "completed" && (wantGates || runSkills)) {
+		let step = "Quality gates";
 		try {
 			if (wantGates) {
 				const gateOutcome = await runQualityGates(config.project.qualityGates ?? [], worktreePath);
 				gateStatus = gateOutcome?.status ?? null;
 			}
 			if (runSkills) {
+				step = "Skill feedback/distillation";
 				await runSkillFeedbackAndDistill({
 					root,
 					agentName: name,
@@ -270,8 +337,10 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 					model: model.model,
 				});
 			}
-		} catch {
-			// Skill loop is advisory; a failure here must not fail the turn.
+		} catch (error) {
+			// Skill loop is advisory; a failure here must not fail the turn — but it
+			// must be visible, or a broken distiller silently disables the loop.
+			reportPostTurnFailure(events, name, runId, step, error);
 		}
 	}
 
@@ -292,8 +361,10 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 				gateStatus,
 				mail,
 			});
-		} catch {
-			// Auto-merge is best-effort; never fail the turn over a landing.
+		} catch (error) {
+			// Auto-merge is best-effort; never fail the turn over a landing — but say
+			// so, or the branch silently never lands and the parent waits forever.
+			reportPostTurnFailure(events, name, runId, "Auto-merge", error);
 		}
 	}
 

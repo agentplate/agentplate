@@ -5,13 +5,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG } from "../config.ts";
+import { AGENTPLATE_DIR, CONFIG_FILE, DEFAULT_CONFIG, serializeConfig } from "../config.ts";
 import { createEventStore, type EventStore } from "../events/store.ts";
 import { createMailClient, type MailClient } from "../mail/client.ts";
-import { eventsDbPath, sessionsDbPath } from "../paths.ts";
+import { eventsDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { claudeRuntime } from "../runtimes/claude.ts";
 import { MockRuntime } from "../runtimes/mock.ts";
 import type { AgentEvent, DirectSpawnOpts } from "../runtimes/types.ts";
@@ -74,9 +74,22 @@ function makeSession(over: Partial<AgentSession> = {}): AgentSession {
 	};
 }
 
+/** The real CLI entry, so a mock turn can send mail exactly as an agent does. */
+const CLI = join(import.meta.dir, "..", "index.ts");
+
+/** Shell snippet: run the real `agentplate mail send <args>` against the test root. */
+function mailSend(args: string): string {
+	return `'${process.execPath}' '${CLI}' --project '${root}' mail send ${args}`;
+}
+
+/** A turn's terminal report to its parent, sent from inside the turn (no --from). */
+const DONE_ARGS = "--to lead-1 --subject done --body ok --type worker_done";
+
 beforeEach(() => {
 	root = mkdtempSync(join(tmpdir(), "agentplate-drive-"));
 	mkdirSync(join(root, ".agentplate"), { recursive: true });
+	// Initialized, so the in-turn `agentplate mail` CLI accepts the root.
+	writeFileSync(join(root, AGENTPLATE_DIR, CONFIG_FILE), serializeConfig(DEFAULT_CONFIG), "utf8");
 	worktree = mkdtempSync(join(tmpdir(), "agentplate-drive-wt-"));
 	store = createSessionStore(sessionsDbPath(root));
 	events = createEventStore(eventsDbPath(root));
@@ -173,48 +186,41 @@ describe("driveTurn — keyless-local provider env (authMode 'none')", () => {
 	});
 });
 
+/** Run one mock turn for `session` with skills off (no distillation work). */
+async function driveQuiet(session: AgentSession, config = cfg()): Promise<string> {
+	config.skills.enabled = false;
+	const out = await driveTurn({
+		root,
+		config,
+		runtime: new SpyRuntime(),
+		store,
+		events,
+		mail,
+		session,
+		model: { model: "m", env: {} },
+		prompt: "go",
+	});
+	return out.finalState;
+}
+
 describe("driveTurn — state transition", () => {
-	test("becomes 'completed' when the agent has emitted its terminal mail", async () => {
+	test("becomes 'completed' when the agent sends its terminal mail during the turn", async () => {
 		const session = makeSession();
 		store.upsertSession(session);
-		// The agent's own worker_done mail marks the task complete.
-		mail.send({
-			from: session.agentName,
-			to: "lead-1",
-			subject: "done",
-			body: "",
-			type: "worker_done",
-		});
+		// The agent reports done the way its overlay says to, without any --from.
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
 
-		const config = cfg();
-		config.skills.enabled = false; // keep the completed path free of distillation work
-		const out = await driveTurn({
-			root,
-			config,
-			runtime: new SpyRuntime(),
-			store,
-			events,
-			mail,
-			session,
-			model: { model: "m", env: {} },
-			prompt: "finish",
-		});
-		expect(out.finalState).toBe("completed");
+		expect(await driveQuiet(session)).toBe("completed");
 		expect(store.getSession(session.id)?.state).toBe("completed");
+		// The mail is attributed to the agent whose turn sent it, not to "operator".
+		expect(mail.list({ to: "lead-1" }).map((m) => m.from)).toEqual(["builder-1"]);
 	});
 
 	test("a stop that lands mid-turn sticks: the finishing turn never resurrects it", async () => {
 		const session = makeSession();
 		store.upsertSession(session);
-		// Terminal mail already sent, so without the stop this turn would be 'completed'.
-		mail.send({
-			from: session.agentName,
-			to: "lead-1",
-			subject: "d",
-			body: "",
-			type: "worker_done",
-		});
-		process.env.AGENTPLATE_MOCK_CMD = "sleep 0.4";
+		// Terminal mail sent this turn, so without the stop the turn would be 'completed'.
+		process.env.AGENTPLATE_MOCK_CMD = `${mailSend(DONE_ARGS)} && sleep 0.4`;
 		const config = cfg();
 		config.skills.enabled = false;
 
@@ -235,6 +241,120 @@ describe("driveTurn — state transition", () => {
 		const out = await pending;
 		expect(out.finalState).toBe("stopped");
 		expect(store.getSession(session.id)?.state).toBe("stopped");
+	});
+});
+
+describe("driveTurn — only the agent's own, current terminal mail completes it", () => {
+	test("a worker_done from an earlier turn doesn't complete this turn", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		mail.send({ from: "builder-1", to: "lead-1", subject: "d", body: "", type: "worker_done" });
+
+		expect(await driveQuiet(session)).toBe("idle"); // the no-op turn reported nothing
+	});
+
+	test("a failed turn stays 'failed' even if it sent terminal mail", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = `${mailSend(DONE_ARGS)}; exit 1`;
+
+		expect(await driveQuiet(session)).toBe("failed");
+		expect(mail.list({ from: "builder-1" }).map((m) => m.type)).toEqual(["worker_done"]);
+	});
+
+	test("terminal mail to someone other than its parent or a supervisor doesn't count", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(
+			"--to builder-2 --subject done --body ok --type worker_done",
+		);
+
+		expect(await driveQuiet(session)).toBe("idle");
+	});
+
+	test("a top-level agent completes by reporting to the coordinator", async () => {
+		const session = makeSession({ parentAgent: null, depth: 0 });
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(
+			"--to coordinator --subject done --body ok --type worker_done",
+		);
+
+		expect(await driveQuiet(session)).toBe("completed");
+	});
+
+	test("a sibling can't send terminal mail as this agent, or as the operator", async () => {
+		const target = makeSession();
+		const sibling = makeSession({ agentName: "builder-2", branchName: "agentplate/builder-2" });
+		store.upsertSession(target);
+		store.upsertSession(sibling);
+		const rcAs = (who: string) => join(worktree, `rc-${who}.txt`);
+		// builder-2's turn tries to forge builder-1's completion and an operator dispatch.
+		process.env.AGENTPLATE_MOCK_CMD = [
+			`${mailSend(`--from builder-1 ${DONE_ARGS}`)} 2>/dev/null; echo $? > '${rcAs("builder-1")}'`,
+			`${mailSend("--from operator --to builder-1 --subject x --body y --type dispatch")} 2>/dev/null; echo $? > '${rcAs("operator")}'`,
+		].join("; ");
+
+		expect(await driveQuiet(sibling)).toBe("idle");
+		// Both sends were refused and nothing was stored under the forged names.
+		expect(readFileSync(rcAs("builder-1"), "utf8").trim()).not.toBe("0");
+		expect(readFileSync(rcAs("operator"), "utf8").trim()).not.toBe("0");
+		expect(mail.list({ from: "builder-1" })).toEqual([]);
+		expect(mail.list({ from: "operator" })).toEqual([]);
+
+		// So builder-1's own (no-op) turn is not completed by anything builder-2 did.
+		process.env.AGENTPLATE_MOCK_CMD = "true";
+		expect(await driveQuiet(target)).toBe("idle");
+	});
+});
+
+describe("driveTurn — best-effort post-turn steps fail visibly", () => {
+	/** Error events recorded for builder-1. */
+	function errorDetails(): string[] {
+		return events
+			.list({ agentName: "builder-1" })
+			.filter((e) => e.type === "error")
+			.map((e) => e.detail ?? "");
+	}
+
+	test("an auto-merge that throws is recorded as an error event, and the turn still completes", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
+		// A merge queue that can't be opened makes maybeAutoMerge throw.
+		mkdirSync(mergeDbPath(root));
+		const config = cfg();
+		config.merge.autoMerge = "on-complete";
+		config.agents.skipGates = true;
+
+		expect(await driveQuiet(session, config)).toBe("completed");
+		expect(errorDetails().some((d) => d.startsWith("Auto-merge failed:"))).toBe(true);
+	});
+
+	test("a skills-loop failure is recorded as an error event, and the turn still completes", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
+		// A skills index that can't be opened makes the feedback/distill step throw.
+		mkdirSync(join(root, AGENTPLATE_DIR, "skills.db"));
+		const config = cfg();
+		config.skills.enabled = true;
+		config.agents.skipGates = true;
+
+		const out = await driveTurn({
+			root,
+			config,
+			runtime: new SpyRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+		expect(out.finalState).toBe("completed");
+		expect(errorDetails().some((d) => d.startsWith("Skill feedback/distillation failed:"))).toBe(
+			true,
+		);
 	});
 });
 
