@@ -23,7 +23,7 @@ import { resolve, sep } from "node:path";
 import type { EventStore } from "../events/store.ts";
 import type { MailStore } from "../mail/store.ts";
 import type { MergeQueue } from "../merge/queue.ts";
-import { agentStateDir, specPath } from "../paths.ts";
+import { agentStateDir, isPathInside, specPath, specsDir } from "../paths.ts";
 import type { AgentSession } from "../types.ts";
 import type { SessionStore } from "./store.ts";
 
@@ -122,11 +122,12 @@ export function purgeAgentData(
 
 	// Spec file: shared by task id, so only remove it once no remaining session
 	// references the task. (A multi-agent task keeps its spec until the last one
-	// is purged.)
+	// is purged.) The task id is caller-supplied (`sling <task-id>`), so confine the
+	// delete to `.agentplate/specs/` — a `../` id must never reach a file outside it.
 	try {
 		const stillUsed = stores.sessions.listSessions().some((s) => s.taskId === session.taskId);
 		const spec = specPath(root, session.taskId);
-		if (!stillUsed && existsSync(spec)) {
+		if (!stillUsed && isPathInside(specsDir(root), spec) && existsSync(spec)) {
 			rmSync(spec, { force: true });
 			report.specRemoved = true;
 		}

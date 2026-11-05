@@ -226,7 +226,7 @@ function score(skill: Skill, opts: SelectOpts, now: number): number {
 /** Clamp a possibly out-of-range number into `[0, 1]` (NaN → 0). */
 function clamp01(value: number): number {
 	if (!Number.isFinite(value)) return 0;
-	return value < 0 ? 0 : value > 1 ? 1 : value;
+	return Math.min(Math.max(value, 0), 1);
 }
 
 /**

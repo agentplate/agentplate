@@ -86,12 +86,11 @@ async function readCommitSha(root: string): Promise<string> {
 }
 
 /**
- * Write a generated artifact under `root`, creating parent directories as
- * needed. The artifact `path` is contract-defined as *relative to the worktree
- * root*; an absolute path is rejected so a target can never escape the project
- * tree. Honors the optional file `mode` (default 0o644).
+ * Resolve a generated artifact's absolute path under `root`. The artifact `path`
+ * is contract-defined as *relative to the worktree root*; an absolute path is
+ * rejected so a target can never escape the project tree.
  */
-function writeArtifact(root: string, artifact: GeneratedArtifact): string {
+function artifactPath(root: string, artifact: GeneratedArtifact): string {
 	if (isAbsolute(artifact.path)) {
 		throw new ValidationError(
 			`Generated artifact path must be relative to the project root: "${artifact.path}"`,
@@ -105,20 +104,104 @@ function writeArtifact(root: string, artifact: GeneratedArtifact): string {
 			`Generated artifact path escapes the project root: "${artifact.path}"`,
 		);
 	}
-	mkdirSync(dirname(target), { recursive: true });
-	writeFileSync(target, artifact.content, { mode: artifact.mode ?? 0o644 });
 	return target;
 }
 
+/** What the engine does (or, on a dry run, would do) with one generated artifact. */
+export interface ArtifactPlan {
+	/** Path relative to the project root, as the target emitted it. */
+	path: string;
+	/** Absolute path under the project root. */
+	absolutePath: string;
+	kind: GeneratedArtifact["kind"];
+	/**
+	 * "create" — no file exists yet; "unchanged" — the existing file already
+	 * matches; "keep" — an existing, different file is left alone (no --force);
+	 * "overwrite" — an existing, different file is replaced (--force).
+	 */
+	action: "create" | "unchanged" | "keep" | "overwrite";
+	/** True only once the file has actually been written (never on a dry run). */
+	written: boolean;
+	/** The generated content (so a dry run can be diffed without writing). */
+	content: string;
+}
+
 /**
- * Resolve the gate policy for an environment, mirroring the registry's
- * fail-loud stance: an environment with no explicit policy defaults to "auto".
+ * Decide, per artifact, whether writing it would create, overwrite, or leave a
+ * file alone. An existing file the operator (or an agent) wrote is never
+ * replaced unless `force` is set. Read-only.
  */
-function gatePolicyFor(
+function planArtifacts(
+	root: string,
+	artifacts: GeneratedArtifact[],
+	force: boolean,
+): ArtifactPlan[] {
+	return artifacts.map((artifact) => {
+		const absolutePath = artifactPath(root, artifact);
+		let action: ArtifactPlan["action"] = "create";
+		if (existsSync(absolutePath)) {
+			let existing: string | null = null;
+			try {
+				existing = readFileSync(absolutePath, "utf8");
+			} catch {
+				existing = null;
+			}
+			if (existing === artifact.content) action = "unchanged";
+			else action = force ? "overwrite" : "keep";
+		}
+		return {
+			path: artifact.path,
+			absolutePath,
+			kind: artifact.kind,
+			action,
+			written: false,
+			content: artifact.content,
+		};
+	});
+}
+
+/**
+ * Write the artifacts planned as "create" or "overwrite", creating parent
+ * directories as needed and honoring the optional file `mode` (default 0o644).
+ */
+function writePlannedArtifacts(plans: ArtifactPlan[], artifacts: GeneratedArtifact[]): void {
+	plans.forEach((plan, i) => {
+		if (plan.action !== "create" && plan.action !== "overwrite") return;
+		mkdirSync(dirname(plan.absolutePath), { recursive: true });
+		writeFileSync(plan.absolutePath, plan.content, { mode: artifacts[i]?.mode ?? 0o644 });
+		plan.written = true;
+	});
+}
+
+/** Environments named like production (prod, production, prod-eu, preprod, …). */
+const PRODUCTION_LIKE = /prod/i;
+
+/**
+ * Resolve the gate policy for an environment. Fails closed:
+ *  - a production-like environment always requires confirmation (`--yes`);
+ *  - otherwise only an explicit `"auto"` skips confirmation — a missing entry or
+ *    any other value (a typo like `Confirm`, `manual`, `true`) means "confirm".
+ */
+export function gatePolicyFor(
 	config: ReturnType<typeof loadConfig>,
 	environment: string,
 ): "confirm" | "auto" {
-	return config.deploy.gates[environment] ?? "auto";
+	if (PRODUCTION_LIKE.test(environment)) return "confirm";
+	const configured: unknown = config.deploy.gates[environment];
+	return configured === "auto" ? "auto" : "confirm";
+}
+
+/**
+ * Reject an environment the target does not declare. An unknown (or mistyped)
+ * `--env` must never slip past the gate or reach generated config.
+ */
+function assertKnownEnvironment(target: DeployTarget, environment: string): void {
+	if (!target.caps.environments.includes(environment)) {
+		throw new ValidationError(
+			`Unknown environment ${JSON.stringify(environment)} for target "${target.id}". ` +
+				`Known environments: ${target.caps.environments.join(", ")}`,
+		);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +294,7 @@ export async function configureTarget(
 ): Promise<ConfigureReport> {
 	const config = loadConfig(root);
 	const target = getDeployTarget(name, config);
+	assertKnownEnvironment(target, environment);
 	const detect = await target.detect(root);
 	const ctx = buildDeployContext({
 		root,
@@ -243,6 +327,8 @@ export interface DeployOptions {
 	environment: string;
 	dryRun: boolean;
 	yes: boolean;
+	/** Overwrite existing files that differ from the generated config. */
+	force?: boolean;
 	agentName: string;
 }
 
@@ -261,8 +347,10 @@ export interface DeployRunResult {
 	/** Human-readable reason for a refusal (else null). */
 	refusalReason: string | null;
 	summary: string;
-	/** Paths (absolute) of artifacts written to the project root. */
+	/** Paths (absolute) of artifacts written to the project root (none on a dry run). */
 	writtenArtifacts: string[];
+	/** Per-artifact plan: created, unchanged, kept (existing file), or overwritten. */
+	artifacts: ArtifactPlan[];
 	requiredSecretKeys: string[];
 	missingSecretKeys: string[];
 	/** The deploy execution result (null when refused, or when dry-run skips it). */
@@ -277,26 +365,30 @@ export interface DeployRunResult {
  * Execute (or plan) a deployment end to end.
  *
  * Sequence:
- *  1. Resolve the target (explicit `--target`, else `config.deploy.default`).
+ *  1. Resolve the target (explicit `--target`, else `config.deploy.default`) and
+ *     reject an environment the target does not declare.
  *  2. Detect the {@link AppProfile} on the project root.
  *  3. Build a {@link DeployContext} (`dryRun` from `--dry-run`).
- *  4. Apply the gate: with policy `gates[env] ?? "auto"`, refuse when
+ *  4. Apply the gate (see {@link gatePolicyFor}, which fails closed): refuse when
  *     `(policy === "confirm" || caps.irreversible)` and neither `--yes` nor a
  *     dry-run is in play — recording a "denied" audit row and stopping.
- *  5. `generateConfig` → write each artifact to the project root.
- *  6. Real run only: fail fast when any required secret is missing; then
- *     `deploy()` and, on success, `verify()`.
+ *  5. `generateConfig` → plan each artifact against the project root. Existing
+ *     files that differ are kept unless `--force`.
+ *  6. Real run only: fail fast when any required secret is missing (before any
+ *     file is written); write the planned artifacts; then `deploy()` and, on
+ *     success, `verify()`.
  *  7. Write one audit row (carrying the dryRun flag, gate decision, status).
  *
- * A dry-run writes artifacts and reports the plan but never calls `deploy()` and
- * never records a *success*; it records a `dryRun:true` row so the plan is
- * auditable without implying anything shipped. `ctx.secretEnv` is never printed
- * or persisted.
+ * A dry-run writes nothing: it reports the artifact plan (with content, so it
+ * can be diffed) but never calls `deploy()` and never records a *success*; it
+ * records a `dryRun:true` row so the plan is auditable without implying anything
+ * shipped. `ctx.secretEnv` is never printed or persisted.
  */
 export async function runDeploy(root: string, opts: DeployOptions): Promise<DeployRunResult> {
 	const config = loadConfig(root);
 	const target = getDeployTarget(opts.target, config);
 	const environment = opts.environment;
+	assertKnownEnvironment(target, environment);
 
 	const detect = await target.detect(root);
 	const ctx: DeployContext = buildDeployContext({
@@ -348,6 +440,7 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 				refusalReason: reason,
 				summary: reason,
 				writtenArtifacts: [],
+				artifacts: [],
 				requiredSecretKeys: [],
 				missingSecretKeys: [],
 				deploy: null,
@@ -363,17 +456,14 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 		// live approval, so without --yes it stays "auto").
 		const gateDecision: GateOutcome = opts.yes ? "approved" : "auto";
 
-		// --- Generate + write artifacts (both dry-run and real runs write them,
-		// so a dry-run can diff exactly what a real run would produce).
+		// --- Generate + plan artifacts. Nothing is written yet: a dry run never
+		// writes, and an existing file is never replaced without --force.
 		const generated = await target.generateConfig(ctx);
-		const writtenArtifacts: string[] = [];
-		for (const artifact of generated.artifacts) {
-			writtenArtifacts.push(writeArtifact(root, artifact));
-		}
+		const artifacts = planArtifacts(root, generated.artifacts, opts.force === true);
 
 		const missing = missingSecretKeys(root, generated.requiredSecretKeys);
 
-		// --- Dry-run: plan only. No deploy(), no verify(), no success row.
+		// --- Dry-run: plan only. No writes, no deploy(), no verify(), no success row.
 		if (opts.dryRun) {
 			const row = audit.record({
 				runId: ctx.runId,
@@ -400,7 +490,8 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 				refused: false,
 				refusalReason: null,
 				summary: generated.summary,
-				writtenArtifacts,
+				writtenArtifacts: [],
+				artifacts,
 				requiredSecretKeys: generated.requiredSecretKeys,
 				missingSecretKeys: missing,
 				deploy: null,
@@ -416,6 +507,9 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 					`${missing.join(", ")}. Add them with \`agentplate setup\` or via the environment.`,
 			);
 		}
+
+		writePlannedArtifacts(artifacts, generated.artifacts);
+		const writtenArtifacts = artifacts.filter((a) => a.written).map((a) => a.absolutePath);
 
 		// --- Execute + verify.
 		const deployResult = await target.deploy(ctx);
@@ -449,6 +543,7 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 			refusalReason: null,
 			summary: generated.summary,
 			writtenArtifacts,
+			artifacts,
 			requiredSecretKeys: generated.requiredSecretKeys,
 			missingSecretKeys: [],
 			deploy: deployResult,
@@ -468,6 +563,8 @@ export async function runDeploy(root: string, opts: DeployOptions): Promise<Depl
 export interface RollbackOptions {
 	target?: string;
 	environment: string;
+	/** Approve a rollback into an environment whose gate requires confirmation. */
+	yes?: boolean;
 	agentName: string;
 }
 
@@ -475,25 +572,37 @@ export interface RollbackOptions {
 export interface RollbackRunResult {
 	target: string;
 	environment: string;
-	/** The audit row of the deployment being rolled back from (null if none). */
+	/** The audit row of the release live now, being rolled back from. */
+	current: DeployAuditRow | null;
+	/** The audit row of the previous release, being restored. */
 	previous: DeployAuditRow | null;
+	/** "auto" | "approved" | "denied" — what the gate decided. */
+	gateDecision: GateOutcome;
+	/** Set when the gate denied the rollback (target.rollback was not called). */
+	refused: boolean;
+	/** Human-readable reason for a refusal (else null). */
+	refusalReason: string | null;
 	rollback: DeployResult | null;
 	audit: DeployAuditRow | null;
 }
 
 /**
- * Roll a target+environment back to its previous successful deployment. Loads
- * the most recent successful deploy from the audit store ({@link DeployAudit.latest}),
- * reconstructs a minimal {@link DeployResult} carrying that deployment's id and
- * outputs, calls the target's `rollback`, and records a "rollback" audit row.
+ * Roll a target+environment back to the release that was live before the
+ * current one. Resolves both from the audit store ({@link DeployAudit.releases}:
+ * rolled-back releases are unwound, so a bad release is never restored),
+ * applies the same gate as a deploy, reconstructs a minimal {@link DeployResult}
+ * carrying the previous release's id and outputs, calls the target's `rollback`
+ * with it, and records a "rollback" audit row.
  *
- * Throws {@link NotFoundError} when there is no prior successful deploy to revert
- * to, and {@link ValidationError} when the target declares it cannot roll back.
+ * Throws {@link NotFoundError} when there is no earlier release to revert to, and
+ * {@link ValidationError} for an unknown environment or a target that cannot
+ * roll back.
  */
 export async function runRollback(root: string, opts: RollbackOptions): Promise<RollbackRunResult> {
 	const config = loadConfig(root);
 	const target = getDeployTarget(opts.target, config);
 	const environment = opts.environment;
+	assertKnownEnvironment(target, environment);
 
 	if (!target.caps.canRollback) {
 		throw new ValidationError(`Target "${target.id}" does not support rollback.`);
@@ -501,12 +610,52 @@ export async function runRollback(root: string, opts: RollbackOptions): Promise<
 
 	const audit = createDeployAudit(deploysDbPath(root));
 	try {
-		const previous = audit.latest(target.id, environment);
-		if (previous === null) {
+		const releases = audit.releases(target.id, environment);
+		const current = releases[releases.length - 1] ?? null;
+		const previous = releases[releases.length - 2] ?? null;
+		if (current === null || previous === null) {
+			const live = current?.deploymentId ? ` (only ${current.deploymentId} is on record)` : "";
 			throw new NotFoundError(
-				`No prior successful deploy found for "${target.id}" in "${environment}" to roll back to.`,
+				`No prior successful deploy found for "${target.id}" in "${environment}" to roll back to` +
+					`${live}.`,
 			);
 		}
+
+		const policy = gatePolicyFor(config, environment);
+		const gateRequiresConfirm = policy === "confirm" || target.caps.irreversible;
+		if (gateRequiresConfirm && opts.yes !== true) {
+			const reason =
+				`Rollback of "${environment}" via "${target.id}" requires confirmation` +
+				(target.caps.irreversible ? " (target is irreversible)" : ` (gate policy: ${policy})`) +
+				". Re-run with --yes to approve.";
+			const row = audit.record({
+				runId: readCurrentRun(root),
+				agentName: opts.agentName,
+				target: target.id,
+				environment,
+				action: "rollback",
+				dryRun: false,
+				gateDecision: "denied",
+				approvedBy: null,
+				status: "failed",
+				deploymentId: null,
+				urls: [],
+				outputs: {},
+				commitSha: previous.commitSha,
+			});
+			return {
+				target: target.id,
+				environment,
+				current,
+				previous,
+				gateDecision: "denied",
+				refused: true,
+				refusalReason: reason,
+				rollback: null,
+				audit: row,
+			};
+		}
+		const gateDecision: GateOutcome = opts.yes === true ? "approved" : "auto";
 
 		const detect = await target.detect(root);
 		const ctx: DeployContext = buildDeployContext({
@@ -521,7 +670,7 @@ export async function runRollback(root: string, opts: RollbackOptions): Promise<
 			config,
 		});
 
-		// Reconstruct the deployment to roll back from, from its audit row.
+		// Reconstruct the release to restore, from its audit row.
 		const priorDeployment: DeployResult = {
 			ok: true,
 			urls: previous.urls,
@@ -532,7 +681,6 @@ export async function runRollback(root: string, opts: RollbackOptions): Promise<
 		};
 
 		const rollbackResult = await target.rollback(ctx, priorDeployment);
-		const commitSha = await readCommitSha(root);
 		const row = audit.record({
 			runId: ctx.runId,
 			agentName: ctx.agentName,
@@ -540,16 +688,27 @@ export async function runRollback(root: string, opts: RollbackOptions): Promise<
 			environment,
 			action: "rollback",
 			dryRun: false,
-			gateDecision: "n/a",
-			approvedBy: null,
+			gateDecision,
+			approvedBy: gateDecision === "approved" ? ctx.agentName : null,
 			status: rollbackResult.ok ? "success" : "failed",
 			deploymentId: rollbackResult.deploymentId,
 			urls: rollbackResult.urls,
 			outputs: rollbackResult.outputs,
-			commitSha,
+			// The restored release's commit is what is live after a rollback.
+			commitSha: previous.commitSha,
 		});
 
-		return { target: target.id, environment, previous, rollback: rollbackResult, audit: row };
+		return {
+			target: target.id,
+			environment,
+			current,
+			previous,
+			gateDecision,
+			refused: false,
+			refusalReason: null,
+			rollback: rollbackResult,
+			audit: row,
+		};
 	} finally {
 		audit.close();
 	}
@@ -585,6 +744,19 @@ function printAuditRow(row: DeployAuditRow): void {
 	);
 	if (row.urls.length > 0) printInfo(muted(`    urls: ${row.urls.join(", ")}`));
 	if (row.deploymentId) printInfo(muted(`    deployment: ${row.deploymentId}`));
+}
+
+function printArtifactPlan(plan: ArtifactPlan, dryRun: boolean): void {
+	const verb: Record<ArtifactPlan["action"], string> = dryRun
+		? {
+				create: "would create",
+				unchanged: "unchanged",
+				keep: "would keep existing",
+				overwrite: "would overwrite",
+			}
+		: { create: "wrote", unchanged: "unchanged", keep: "kept existing", overwrite: "overwrote" };
+	const hint = plan.action === "keep" ? " (differs from generated; pass --force to overwrite)" : "";
+	printInfo(muted(`    ${verb[plan.action]} ${plan.absolutePath}${hint}`));
 }
 
 // ---------------------------------------------------------------------------
@@ -764,8 +936,9 @@ export function createDeployCommand(): Command {
 		.description("Build, gate-check, deploy, and verify the project to a target")
 		.option("--target <name>", "deploy target id (default: config.deploy.default)")
 		.option("--env <e>", "environment", "production")
-		.option("--dry-run", "generate config + plan only; never deploy")
+		.option("--dry-run", "plan only: generate config in memory; never write files or deploy")
 		.option("--yes", "approve a deploy that requires confirmation")
+		.option("--force", "overwrite existing Dockerfile/CI files that differ from the generated ones")
 		.option("--json", "output JSON")
 		.addCommand(deployStatusCommand())
 		.addCommand(deployHistoryCommand())
@@ -776,6 +949,7 @@ export function createDeployCommand(): Command {
 					env: string;
 					dryRun?: boolean;
 					yes?: boolean;
+					force?: boolean;
 					json?: boolean;
 				},
 				command: Command,
@@ -787,6 +961,7 @@ export function createDeployCommand(): Command {
 					environment: opts.env,
 					dryRun: opts.dryRun === true,
 					yes: opts.yes === true,
+					force: opts.force === true,
 					agentName: "operator",
 				});
 
@@ -805,7 +980,7 @@ export function createDeployCommand(): Command {
 
 				if (result.dryRun) {
 					printSuccess(`[dry-run] ${result.summary}`);
-					for (const path of result.writtenArtifacts) printInfo(muted(`    wrote ${path}`));
+					for (const plan of result.artifacts) printArtifactPlan(plan, true);
 					if (result.requiredSecretKeys.length > 0) {
 						printInfo(
 							muted(
@@ -820,7 +995,7 @@ export function createDeployCommand(): Command {
 					return;
 				}
 
-				for (const path of result.writtenArtifacts) printInfo(muted(`    wrote ${path}`));
+				for (const plan of result.artifacts) printArtifactPlan(plan, false);
 				if (result.deploy?.ok) {
 					printSuccess(`Deployed ${result.target} → ${result.environment}`);
 					for (const url of result.deploy.urls) printInfo(`    ${url}`);
@@ -842,33 +1017,46 @@ export function createDeployCommand(): Command {
 		);
 }
 
-/** `agentplate rollback` — revert a target+environment to its last good deploy. */
+/** `agentplate rollback` — revert a target+environment to the release before the live one. */
 export function createRollbackCommand(): Command {
 	return new Command("rollback")
-		.description("Roll a target back to its previous successful deployment")
+		.description("Roll a target back to the release before the one live now")
 		.option("--target <name>", "deploy target id (default: config.deploy.default)")
 		.option("--env <e>", "environment", "production")
+		.option("--yes", "approve a rollback that requires confirmation")
 		.option("--json", "output JSON")
-		.action(async (opts: { target?: string; env: string; json?: boolean }, command: Command) => {
-			const useJson = command.optsWithGlobals().json === true;
-			const root = requireInit();
-			const result = await runRollback(root, {
-				target: opts.target,
-				environment: opts.env,
-				agentName: "operator",
-			});
-			if (useJson) {
-				jsonOutput(result);
-				return;
-			}
-			if (result.rollback?.ok) {
-				printSuccess(
-					`Rolled back ${result.target} → ${result.environment}` +
-						(result.rollback.deploymentId ? ` to ${result.rollback.deploymentId}` : ""),
-				);
-			} else {
-				printError(`Rollback failed: ${result.rollback?.errorMessage ?? "unknown error"}`);
-				process.exitCode = 1;
-			}
-		});
+		.action(
+			async (
+				opts: { target?: string; env: string; yes?: boolean; json?: boolean },
+				command: Command,
+			) => {
+				const useJson = command.optsWithGlobals().json === true;
+				const root = requireInit();
+				const result = await runRollback(root, {
+					target: opts.target,
+					environment: opts.env,
+					yes: opts.yes === true,
+					agentName: "operator",
+				});
+				if (useJson) {
+					jsonOutput(result);
+					if (result.refused) process.exitCode = new ValidationError("").exitCode;
+					return;
+				}
+				if (result.refused) {
+					printError(result.refusalReason ?? "Rollback refused by gate.");
+					process.exitCode = new ValidationError("").exitCode;
+					return;
+				}
+				if (result.rollback?.ok) {
+					printSuccess(
+						`Rolled back ${result.target} → ${result.environment}` +
+							(result.rollback.deploymentId ? ` to ${result.rollback.deploymentId}` : ""),
+					);
+				} else {
+					printError(`Rollback failed: ${result.rollback?.errorMessage ?? "unknown error"}`);
+					process.exitCode = 1;
+				}
+			},
+		);
 }

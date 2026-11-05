@@ -18,11 +18,17 @@ const WHOLE_SECRET_PATTERNS: RegExp[] = [
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 	// Provider API keys with recognizable prefixes.
 	/\bsk-ant-[a-zA-Z0-9_-]{16,}\b/g,
+	// OpenAI project / service-account / admin keys and OpenRouter keys: a
+	// dashed sub-prefix, so the plain `sk-` rule below would stop at the dash.
+	/\bsk-(?:proj|svcacct|admin|or-v1)-[A-Za-z0-9_-]{20,}/g,
 	/\bsk-[a-zA-Z0-9]{20,}\b/g,
-	/\bghp_[a-zA-Z0-9]{20,}\b/g,
-	/\bgho_[a-zA-Z0-9]{20,}\b/g,
-	// AWS access key ids.
-	/\bAKIA[0-9A-Z]{16}\b/g,
+	// GitHub fine-grained PATs, then classic PAT / OAuth / user / server / refresh tokens.
+	/\bgithub_pat_[A-Za-z0-9_]{22,}/g,
+	/\bgh[pousr]_[a-zA-Z0-9]{20,}\b/g,
+	// AWS access key ids: long-term (AKIA) and STS temporary (ASIA).
+	/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+	// Google API keys (e.g. GEMINI_API_KEY).
+	/\bAIza[0-9A-Za-z_-]{35,}/g,
 ];
 
 /**
@@ -30,8 +36,15 @@ const WHOLE_SECRET_PATTERNS: RegExp[] = [
  * to redact (so logs stay readable: `ANTHROPIC_API_KEY=[REDACTED]`).
  */
 const PREFIXED_SECRET_PATTERNS: RegExp[] = [
-	// Bearer tokens in Authorization headers.
-	/\b(Authorization:\s*Bearer\s+)[^\s"']+/gi,
+	// Bearer tokens in Authorization headers — raw (`Authorization: Bearer …`) or
+	// as a JSON field (`"authorization":"Bearer …"`, `\"Authorization\": \"Bearer …`
+	// inside an already-JSON-encoded string).
+	/\b(Authorization\\?["']?\s*:\s*\\?["']?Bearer\s+)[^\s"'\\]+/gi,
+	// JSON fields named like an env-var secret: `"GHCR_TOKEN": "…"` (or the escaped
+	// `\"GHCR_TOKEN\": \"…\"`). Deliberately case-SENSITIVE and limited to quoted
+	// string values so it adds no new over-redaction of ordinary code (`"maxTokens":
+	// 4096`, `"primaryKey": true`); the closing quote is kept, so JSON stays valid.
+	/(\\?"[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\\?"\s*:\s*\\?")[^"\\\n]+/g,
 	// `KEY=value` / `TOKEN: value` / `SECRET="value"` assignments.
 	/\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*[=:]\s*)["']?[^\s"']+["']?/gi,
 ];

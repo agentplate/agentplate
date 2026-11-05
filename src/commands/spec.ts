@@ -27,7 +27,7 @@ import { findProjectRoot, isInitialized } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printSuccess } from "../logging/color.ts";
-import { specPath, specsDir } from "../paths.ts";
+import { assertSafeTaskId, specPath, specsDir } from "../paths.ts";
 
 /** Resolve the project root, throwing if Agentplate is not initialized there. */
 function requireInit(): string {
@@ -90,6 +90,7 @@ export async function runWrite(
 	opts: WriteOptions,
 	useJson: boolean,
 ): Promise<void> {
+	assertSafeTaskId(taskId);
 	const root = requireInit();
 	const body = await resolveSpecBody(opts);
 	const dir = specsDir(root);
@@ -104,6 +105,7 @@ export async function runWrite(
 }
 
 export function runShow(taskId: string, useJson: boolean): void {
+	assertSafeTaskId(taskId);
 	const root = requireInit();
 	const path = specPath(root, taskId);
 	if (!existsSync(path)) {
@@ -135,6 +137,7 @@ export function runList(useJson: boolean): void {
 }
 
 export function runPath(taskId: string, useJson: boolean): void {
+	assertSafeTaskId(taskId);
 	const root = requireInit();
 	const path = specPath(root, taskId);
 	if (useJson) jsonOutput({ taskId, path });

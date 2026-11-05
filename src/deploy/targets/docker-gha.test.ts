@@ -195,6 +195,52 @@ describe("DockerGhaTarget.generateConfig", () => {
 		expect(workflow?.content).toContain("production");
 	});
 
+	test("the workflow tags images with github.sha + the environment, never a frozen tag", async () => {
+		const ctx = makeContext({
+			profile: serviceProfile,
+			environment: "production",
+			settings: { app: "svc", sha: "abcdef1234567890" },
+		});
+		const config = await new DockerGhaTarget().generateConfig(ctx);
+		const workflow = config.artifacts.find((a) => a.path === ".github/workflows/deploy.yml");
+		expect(workflow?.content).toContain(`IMAGE_REF: ghcr.io/svc:\${{ github.sha }}`);
+		expect(workflow?.content).toContain(
+			`ENVIRONMENT_REF: ghcr.io/svc:\${{ github.event.inputs.environment || 'production' }}`,
+		);
+		expect(workflow?.content).not.toContain("abcdef123456");
+	});
+
+	test("rejects an environment the target does not declare (no YAML injection)", async () => {
+		const target = new DockerGhaTarget();
+		for (const environment of [
+			"prod",
+			"production\n  injected: true",
+			"staging' }}\n      - run: curl evil",
+			"",
+		]) {
+			await expect(
+				target.generateConfig(makeContext({ profile: serviceProfile, environment })),
+			).rejects.toThrow(/Unknown environment/);
+		}
+	});
+
+	test("keeps a Dockerfile-only (unprofiled) project's own Dockerfile", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "fg-docker-gha-own-"));
+		try {
+			await writeFile(join(dir, "Dockerfile"), "FROM golang:1.23\n");
+			const target = new DockerGhaTarget();
+			const detected = await target.detect(dir);
+			const config = await target.generateConfig(
+				makeContext({ profile: detected.profile, worktreePath: dir, projectRoot: dir }),
+			);
+			const paths = config.artifacts.map((a) => a.path).sort();
+			expect(paths).toEqual([".dockerignore", ".github/workflows/deploy.yml"]);
+			expect(config.summary).toContain("existing Dockerfile");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("is deterministic for the same context", async () => {
 		const ctx = makeContext({ profile: serviceProfile });
 		const a = await new DockerGhaTarget().generateConfig(ctx);
@@ -279,28 +325,104 @@ describe("DockerGhaTarget.deploy (dry-run only)", () => {
 		const ctx = makeContext({ profile: serviceProfile, dryRun: true });
 		const result = await new DockerGhaTarget().deploy(ctx);
 		expect(result.outputs.imageRef).toBe("ghcr.io/app:latest");
+		expect(result.outputs.environmentRef).toBe("ghcr.io/app:staging");
+	});
+
+	test("tags the image with the worktree's HEAD commit when no sha is pinned", async () => {
+		const repo = await mkdtemp(join(tmpdir(), "fg-docker-gha-git-"));
+		try {
+			const git = async (args: string[]): Promise<string> => {
+				const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+				const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+				if (code !== 0) throw new Error(`git ${args.join(" ")} failed`);
+				return out.trim();
+			};
+			await git(["init", "-q"]);
+			await git([
+				"-c",
+				"user.email=t@t.dev",
+				"-c",
+				"user.name=T",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				"a",
+			]);
+			const head = await git(["rev-parse", "HEAD"]);
+
+			const ctx = makeContext({
+				profile: serviceProfile,
+				dryRun: true,
+				worktreePath: repo,
+				settings: { app: "svc" },
+			});
+			const result = await new DockerGhaTarget().deploy(ctx);
+			expect(result.outputs.imageRef).toBe(`ghcr.io/svc:${head.slice(0, 12)}`);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
 	});
 });
 
 describe("DockerGhaTarget.rollback (dry-run only)", () => {
-	test("dry-run plans a redeploy of the previous image ref", async () => {
+	test("dry-run plans re-pointing the environment tag at the given release's image", async () => {
 		const prior: DeployResult = {
 			ok: true,
 			urls: [],
 			deploymentId: "ghcr.io/acme/my-api:oldsha123456",
 			log: "",
-			outputs: { previousImageRef: "ghcr.io/acme/my-api:oldsha123456" },
+			outputs: { imageRef: "ghcr.io/acme/my-api:oldsha123456" },
 			errorMessage: null,
 		};
-		const ctx = makeContext({ profile: serviceProfile, dryRun: true });
+		// The context's own (current) ref differs: rollback must not fall back to it.
+		const ctx = makeContext({
+			profile: serviceProfile,
+			dryRun: true,
+			environment: "production",
+			settings: { registry: "ghcr.io/acme/my-api", sha: "newsha999999" },
+		});
 		const result = await new DockerGhaTarget().rollback(ctx, prior);
 
 		expect(result.ok).toBe(true);
 		expect(result.deploymentId).toBeNull();
 		expect(result.log).toContain("[dry-run]");
 		expect(result.log).toContain("ghcr.io/acme/my-api:oldsha123456");
+		expect(result.log).not.toContain("newsha999999");
 		expect(result.outputs.imageRef).toBe("ghcr.io/acme/my-api:oldsha123456");
+		expect(result.outputs.environmentRef).toBe("ghcr.io/acme/my-api:production");
 		expect(result.outputs.rolledBack).toBe("planned");
+	});
+
+	test("re-points the environment tag in the restored image's own repository", async () => {
+		const prior: DeployResult = {
+			ok: true,
+			urls: [],
+			deploymentId: "localhost:5000/team/api:oldsha123456",
+			log: "",
+			outputs: { imageRef: "localhost:5000/team/api:oldsha123456" },
+			errorMessage: null,
+		};
+		// Settings now point elsewhere; the env tag must follow the restored image.
+		const ctx = makeContext({ profile: serviceProfile, dryRun: true, settings: { app: "other" } });
+		const result = await new DockerGhaTarget().rollback(ctx, prior);
+		expect(result.outputs.environmentRef).toBe("localhost:5000/team/api:staging");
+	});
+
+	test("fails (never re-pushes the current image) when the release has no recorded ref", async () => {
+		const prior: DeployResult = {
+			ok: true,
+			urls: [],
+			deploymentId: null,
+			log: "",
+			outputs: {},
+			errorMessage: null,
+		};
+		const ctx = makeContext({ profile: serviceProfile, dryRun: true, settings: { app: "svc" } });
+		const result = await new DockerGhaTarget().rollback(ctx, prior);
+		expect(result.ok).toBe(false);
+		expect(result.errorMessage).toContain("no recorded image ref");
+		expect(result.outputs.rolledBack).toBe("false");
 	});
 });
 

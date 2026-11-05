@@ -36,14 +36,6 @@ export interface SafetyReport {
 }
 
 /**
- * Matches a fenced code block whose info string is `bash` or `sh` (optionally
- * with trailing words, e.g. ```` ```bash title=x ````). Capture group 1 is the
- * block's interior. The `m` flag lets the fences sit on their own lines and `g`
- * walks every block in the body.
- */
-const BASH_FENCE_RE = /```(?:bash|sh)\b[^\n]*\n([\s\S]*?)```/gim;
-
-/**
  * Matches a POSIX home-directory absolute path: `/Users/<name>/...` (macOS) or
  * `/home/<name>/...` (Linux). Capture group 1 is everything AFTER the user's
  * home root, which we graft onto the `<repo>` placeholder. The leading `(?<![\w])`
@@ -53,24 +45,6 @@ const HOME_PATH_RE = /(?<![\w/])\/(?:Users|home)\/[^/\s"'`]+((?:\/[^\s"'`]*)?)/g
 
 /** Neutral placeholder substituted for an operator's home-directory root. */
 const REPO_PLACEHOLDER = "<repo>";
-
-/**
- * Extract the interiors of every ```bash / ```sh fenced code block in `body`.
- *
- * Returns one string per matched block (fences stripped, interior preserved).
- * If the body contains no fenced bash/sh blocks the array is empty — callers
- * fall back to scanning the whole body so an unfenced snippet is not missed.
- */
-export function extractBashBlocks(body: string): string[] {
-	const blocks: string[] = [];
-	// A fresh lastIndex per call: the regex is module-level and stateful with /g.
-	BASH_FENCE_RE.lastIndex = 0;
-	for (let m = BASH_FENCE_RE.exec(body); m !== null; m = BASH_FENCE_RE.exec(body)) {
-		const interior = m[1];
-		if (interior !== undefined) blocks.push(interior);
-	}
-	return blocks;
-}
 
 /**
  * Redact a single string field via {@link sanitize}; if {@link containsSecret}
@@ -140,10 +114,13 @@ function rewriteHomePaths(body: string, violations: string[]): string {
  *  2. Redact secrets in `title`, `goal`, `body`, `whenToUse`, and `tags`. A hit
  *     records a non-fatal `secret redacted in <field>` violation but the cleaned
  *     copy proceeds.
- *  3. Scan the body's ```bash/```sh blocks (falling back to the whole body) for
- *     dangerous commands — each hit is a FATAL `dangerous command: <hit>`
- *     violation. A deploy verb anywhere in the body is a FATAL
- *     `deploy verb in skill (reserved for deployer)` violation.
+ *  3. Scan the whole body (prose and every code fence, whatever its language)
+ *     plus `title`, `goal`, each `whenToUse` entry and each tag for dangerous
+ *     commands and deploy verbs. A hit is FATAL: `dangerous command: <hit>` /
+ *     `deploy verb in skill (reserved for deployer)` for the body, and
+ *     `dangerous command in <field>: <hit>` / `deploy verb in <field> (reserved
+ *     for deployer)` for the other fields. `filePatterns` are globs, not
+ *     instructions, and are not scanned.
  *  4. Rewrite home-absolute paths in the body to `<repo>/...` (non-fatal
  *     `rewrote absolute path`).
  *  5. `ok` is true iff no dangerous-command and no deploy-verb violation fired.
@@ -165,39 +142,45 @@ export function sanitizeSkillDraft(draft: SkillDraft): SafetyReport {
 	const tags = redactArrayField(draft.tags, "tags", violations);
 	let body = redactField(draft.body, "body", violations);
 
-	// Steps 3-4 operate on the body. Track dangerous/deploy hits separately from
-	// the (non-fatal) redaction/rewrite violations so `ok` reflects only fatals.
+	// Track dangerous/deploy hits separately from the (non-fatal) redaction and
+	// rewrite violations so `ok` reflects only fatals.
 	let dangerous = false;
 	let deploy = false;
 
-	if (body !== undefined) {
-		// Step 3a: scan fenced bash/sh blocks; fall back to the whole body when the
-		// snippet was left unfenced so a raw `rm -rf /` is still caught.
-		const blocks = extractBashBlocks(body);
-		const scanTargets = blocks.length > 0 ? blocks : [body];
-		const seenHits = new Set<string>();
-		for (const target of scanTargets) {
-			for (const hit of findDangerousCommands(target)) {
-				dangerous = true;
-				// De-duplicate identical hits (same command in body + a block) so the
-				// violation list stays signal-dense.
-				if (!seenHits.has(hit)) {
-					seenHits.add(hit);
-					violations.push(`dangerous command: ${hit}`);
-				}
-			}
-		}
+	// Step 3: scan every free-text field. title, goal and body are rendered into
+	// agent overlays, whenToUse into the distiller prompt, and tags show up in
+	// `skill list` / search. The body is scanned whole: a command in prose, in a
+	// ```shell or bare fence, or in a ~~~ fence is as hazardous as one in ```bash.
+	const scanTargets: Array<{ field: string; text: string }> = [];
+	if (title !== undefined) scanTargets.push({ field: "title", text: title });
+	if (goal !== undefined) scanTargets.push({ field: "goal", text: goal });
+	for (const text of whenToUse ?? []) scanTargets.push({ field: "whenToUse", text });
+	for (const text of tags ?? []) scanTargets.push({ field: "tags", text });
+	if (body !== undefined) scanTargets.push({ field: "body", text: body });
 
-		// Step 3b: deploy verbs are checked against the entire body (they may sit in
-		// prose, not just a code fence) and are reserved for the gated deployer.
-		if (hasDeployVerb(body)) {
+	// De-duplicate identical fatal violations (the same command twice in the body,
+	// or in two whenToUse entries) so the violation list stays signal-dense.
+	const seenFatal = new Set<string>();
+	const pushFatal = (violation: string): void => {
+		if (seenFatal.has(violation)) return;
+		seenFatal.add(violation);
+		violations.push(violation);
+	};
+	for (const { field, text } of scanTargets) {
+		const isBody = field === "body";
+		for (const hit of findDangerousCommands(text)) {
+			dangerous = true;
+			pushFatal(isBody ? `dangerous command: ${hit}` : `dangerous command in ${field}: ${hit}`);
+		}
+		// Deploy verbs are reserved for the gated deployer.
+		if (hasDeployVerb(text)) {
 			deploy = true;
-			violations.push("deploy verb in skill (reserved for deployer)");
+			pushFatal(`deploy verb in ${isBody ? "skill" : field} (reserved for deployer)`);
 		}
-
-		// Step 4: rewrite operator home-directory paths to a neutral placeholder.
-		body = rewriteHomePaths(body, violations);
 	}
+
+	// Step 4: rewrite operator home-directory paths to a neutral placeholder.
+	if (body !== undefined) body = rewriteHomePaths(body, violations);
 
 	// Rebuild the draft preserving optional-field semantics: a field that was
 	// absent stays absent (no spurious empty keys in the persisted frontmatter).

@@ -1,11 +1,24 @@
 name: Publish
 
 # Publishes @agentplate/cli to npm on every push to main, then creates the
-# matching GitHub Release. Guarded so it only runs `npm publish` when
-# package.json's version is not already on the registry (npm forbids
-# republishing an existing version), and skips cleanly when NPM_TOKEN is not yet
-# configured. The release step is idempotent — it skips if the release already
-# exists — so a manually-created release/tag never conflicts.
+# matching GitHub Release. Guarded so it only runs `npm publish` when this exact
+# package.json version is not already on the registry (npm forbids republishing
+# an existing version), and skips cleanly when NPM_TOKEN is not yet configured
+# (no release is created for a version that was not published). The release step
+# is idempotent — it skips if the release already exists — so a manually-created
+# release/tag never conflicts.
+#
+# Supply-chain hardening:
+#   - Both jobs only run for refs/heads/main, including on workflow_dispatch, so
+#     an unreviewed branch can't be dispatched into npm `latest` or a release tag.
+#   - All dependency code (bun install, tests, the vite UI build) runs in `verify`,
+#     which has a read-only token and no secrets.
+#   - The built ui/dist is handed to `publish` as an artifact. `publish` (the only
+#     job holding NPM_TOKEN, contents:write and id-token:write) runs no dependency
+#     code, and publishes with --ignore-scripts so `prepack` doesn't rebuild the UI
+#     with NODE_AUTH_TOKEN in its environment.
+#   - Actions are pinned to full commit SHAs (Dependabot bumps them via `# vX`), and
+#     checkout never persists the token into .git.
 
 on:
   push:
@@ -16,19 +29,28 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+# Deny by default; each job opts into exactly what it needs.
+permissions: {}
+
 jobs:
-  publish:
+  verify:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub Release (+ its tag)
-      id-token: write # required for npm provenance (OIDC)
+      contents: read
+    outputs:
+      name: ${{ steps.ver.outputs.name }}
+      version: ${{ steps.ver.outputs.local }}
+      changed: ${{ steps.ver.outputs.changed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -39,44 +61,101 @@ jobs:
           bun run lint
           bun run typecheck
 
-      - name: Setup Node (npm publish + provenance)
-        uses: actions/setup-node@v7
+      - name: Install UI dependencies
+        working-directory: ui
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck UI
+        working-directory: ui
+        run: bun run typecheck
+
+      - name: Build UI
+        working-directory: ui
+        run: bun run build
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+          package-manager-cache: false
 
       - name: Determine if version needs publishing
         id: ver
         run: |
           NAME=$(node -p "require('./package.json').name")
           LOCAL=$(node -p "require('./package.json').version")
-          REMOTE=$(npm view "$NAME" version 2>/dev/null || echo "none")
+          # Query this exact version, not the `latest` dist-tag (which may point
+          # elsewhere, e.g. after a dist-tag move or a backport release).
+          PUBLISHED=$(npm view "$NAME@$LOCAL" version 2>/dev/null || true)
           echo "name=$NAME"   >> "$GITHUB_OUTPUT"
           echo "local=$LOCAL" >> "$GITHUB_OUTPUT"
-          if [ "$LOCAL" = "$REMOTE" ]; then
+          if [ "$PUBLISHED" = "$LOCAL" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$NAME@$LOCAL is already published — nothing to publish."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Will publish $NAME@$LOCAL (registry currently at: $REMOTE)."
+            echo "::notice::Will publish $NAME@$LOCAL."
           fi
+
+      - name: Upload built UI
+        if: steps.ver.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && needs.verify.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release (+ its tag)
+      id-token: write # required for npm provenance (OIDC)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download built UI
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Setup Node (npm publish + provenance)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - name: Publish to npm
-        if: steps.ver.outputs.changed == 'true'
+        id: publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NAME: ${{ needs.verify.outputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::warning::NPM_TOKEN secret is not set — skipping publish of ${{ steps.ver.outputs.name }}@${{ steps.ver.outputs.local }}."
+            echo "::warning::NPM_TOKEN secret is not set — skipping publish of ${NAME}@${VERSION}."
             exit 0
           fi
-          npm publish --provenance --access public
+          if [ ! -f ui/dist/index.html ]; then
+            echo "::error::ui/dist is missing — refusing to publish a package without the web UI."
+            exit 1
+          fi
+          # ui/dist was built (and type-checked) in `verify`; --ignore-scripts keeps
+          # `prepack` and any other lifecycle script from running next to the token.
+          npm publish --provenance --access public --ignore-scripts
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        if: steps.ver.outputs.changed == 'true'
+        if: steps.publish.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.local }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           tag="v${VERSION}"
           if gh release view "$tag" >/dev/null 2>&1; then

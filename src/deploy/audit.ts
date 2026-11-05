@@ -3,8 +3,8 @@
  *
  * Every deploy/rollback the pipeline executes writes one immutable row here
  * (`deploys.db`). The audit log is the source of truth for *what shipped where*:
- * `ap deploy status` reads it, and rollback uses {@link DeployAudit.latest} to
- * find the last good deployment id to revert to.
+ * `ap deploy status` reads it, and rollback uses {@link DeployAudit.releases} to
+ * find the release that was live *before* the current one and revert to it.
  *
  * Design notes:
  * - Opened through {@link openDatabase} (WAL mode + busy timeout) because deployer
@@ -37,8 +37,15 @@ export interface DeployAudit {
 	record(row: Omit<DeployAuditRow, "id" | "createdAt">): DeployAuditRow;
 	/** Query rows with optional filters, newest first. */
 	list(filter?: DeployAuditFilter): DeployAuditRow[];
-	/** Most recent successful *deploy* for a target+environment (rollback target). */
+	/** Most recent successful *deploy* for a target+environment (the newest release shipped). */
 	latest(target: string, environment: string): DeployAuditRow | null;
+	/**
+	 * The chain of releases that led to what is live now for a target+environment,
+	 * oldest first, with rolled-back releases unwound. The last element is the
+	 * release that is live now; the one before it is what a rollback restores.
+	 * Each element is the (newest) successful deploy row for that release.
+	 */
+	releases(target: string, environment: string): DeployAuditRow[];
 	/** Close the underlying database connection. */
 	close(): void;
 }
@@ -220,9 +227,9 @@ export function createDeployAudit(dbPath: string): DeployAudit {
 		},
 
 		latest(target: string, environment: string): DeployAuditRow | null {
-			// Rollback reverts to the last good *deploy* — a prior rollback is not a
-			// state we roll forward to, so restrict action = 'deploy'. Dry runs never
-			// mutated the live target, so exclude them too.
+			// The newest real release: a rollback is not a release of its own, so
+			// restrict action = 'deploy'. Dry runs never mutated the live target, so
+			// exclude them too.
 			const row = db
 				.query(
 					`SELECT * FROM deploy_audit
@@ -236,6 +243,47 @@ export function createDeployAudit(dbPath: string): DeployAudit {
 				)
 				.get({ $target: target, $environment: environment }) as AuditRow | null;
 			return row ? rowToAuditRow(row) : null;
+		},
+
+		releases(target: string, environment: string): DeployAuditRow[] {
+			// Replay every live-state change (successful, non-dry-run deploys and
+			// rollbacks) oldest first, keeping a stack of releases:
+			//  - a deploy pushes its release (re-deploying the release already on
+			//    top is not a new release, so it only refreshes the top row);
+			//  - a rollback unwinds to the release it restored, so a rolled-back
+			//    (bad) release is never offered as a rollback target again.
+			const rows = db
+				.query(
+					`SELECT * FROM deploy_audit
+					WHERE target = $target
+					  AND environment = $environment
+					  AND status = 'success'
+					  AND dry_run = 0
+					  AND action IN ('deploy', 'rollback')
+					ORDER BY created_at ASC, seq ASC`,
+				)
+				.all({ $target: target, $environment: environment }) as AuditRow[];
+
+			const stack: DeployAuditRow[] = [];
+			for (const raw of rows) {
+				const row = rowToAuditRow(raw);
+				if (row.action === "deploy") {
+					const top = stack[stack.length - 1];
+					const sameAsTop =
+						top !== undefined && row.deploymentId !== null && top.deploymentId === row.deploymentId;
+					if (sameAsTop) stack[stack.length - 1] = row;
+					else stack.push(row);
+					continue;
+				}
+				// A rollback restored an earlier release: unwind down to it. One we
+				// cannot place leaves no trustworthy lineage, so fail closed and keep
+				// nothing older as a rollback target.
+				const restored = row.deploymentId;
+				const index =
+					restored === null ? -1 : stack.findLastIndex((r) => r.deploymentId === restored);
+				stack.length = index + 1;
+			}
+			return stack;
 		},
 
 		close(): void {

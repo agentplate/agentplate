@@ -36,7 +36,7 @@ export function createTurnCommand(): Command {
 		.description("Run the next (resumed) turn for an existing agent")
 		.argument("<agent>", "agent name")
 		.option("--json", "output JSON")
-		.action(async (agent: string, opts: TurnOptions, command: Command) => {
+		.action(async (agent: string, _opts: TurnOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
 			const root = findProjectRoot();
 			if (!isInitialized(root)) {

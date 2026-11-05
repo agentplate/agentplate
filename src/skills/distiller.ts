@@ -32,7 +32,7 @@ import type { AgentRuntime } from "../runtimes/types.ts";
 import type { ResolvedModel } from "../types.ts";
 import { resolveArgv } from "../utils/detect.ts";
 import { sanitizeSkillDraft } from "./safety.ts";
-import type { createSkillStore } from "./store.ts";
+import { type createSkillStore, isValidSlug } from "./store.ts";
 import type { Skill, SkillDraft, SkillProvenance } from "./types.ts";
 
 /** The skill store handle produced by {@link createSkillStore}. */
@@ -363,7 +363,11 @@ async function readSpecText(root: string, taskId: string | null): Promise<string
  *     have since been removed) so the model can choose to UPDATE one.
  *  4. Render the prompt and make a single one-shot model call via the runtime's
  *     `buildPrintCommand` (spawned with the resolved provider env), capturing stdout.
- *  5. Parse the output. A null parse or an explicit `skip` action → skipped.
+ *  5. Parse the output. A null parse or an explicit `skip` action → skipped. An
+ *     `update` whose `targetSlug` is not a valid slug, or is not one of the
+ *     skills applied (and still present) this session, is also skipped: the
+ *     model picks the slug, so it must not be able to rewrite an unrelated
+ *     skill or name a path outside the skills dir.
  *  6. Scrub the draft ({@link sanitizeSkillDraft}). A FATAL violation (dangerous
  *     command / deploy verb) downgrades the whole draft to a skip — we never
  *     persist a hazardous skill.
@@ -417,6 +421,14 @@ export async function distillSkill(args: DistillSkillArgs): Promise<DistillResul
 	const draft = parseDistillerOutput(stdout);
 	if (draft === null || draft.action === "skip") {
 		return { action: "skipped" };
+	}
+	if (draft.action === "update") {
+		const target = draft.targetSlug;
+		const applied =
+			target !== undefined &&
+			isValidSlug(target) &&
+			appliedSkills.some((skill) => skill.slug === target);
+		if (!applied) return { action: "skipped" };
 	}
 
 	// 6. Safety scrub. A fatal violation downgrades the draft to a skip.

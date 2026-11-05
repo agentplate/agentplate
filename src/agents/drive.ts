@@ -15,6 +15,7 @@
 import { existsSync } from "node:fs";
 import type { EventStore } from "../events/store.ts";
 import { runQualityGates } from "../insights/quality-gates.ts";
+import { sanitize } from "../logging/sanitizer.ts";
 import type { MailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { maybeAutoMerge } from "../merge/auto.ts";
@@ -34,11 +35,24 @@ import type {
 } from "../types.ts";
 import { updateIdentity } from "./identity.ts";
 import { buildDefaultManifest, getDefinition, loadManifest } from "./manifest.ts";
-import { runTurn } from "./turn-runner.ts";
+import { runTurn, type TurnResult } from "./turn-runner.ts";
 
 /** Terminal mail types whose presence marks a capability's work complete. */
 export function terminalTypesFor(capability: Capability): string[] {
 	return capability === "merger" ? ["merged", "merge_failed"] : ["worker_done"];
+}
+
+/** Max chars of runtime error/stderr text recorded per event. */
+const MAX_ERROR_DETAIL = 1000;
+
+/**
+ * Redact secrets from runtime error text, then bound it, before it is stored in
+ * events.db (and fanned out to the web UI / TUI). Redact first so truncation can
+ * never leave a partial — and no-longer-matching — secret behind.
+ */
+function errorDetail(text: string): string {
+	const clean = sanitize(text);
+	return clean.length > MAX_ERROR_DETAIL ? `${clean.slice(0, MAX_ERROR_DETAIL)}…` : clean;
 }
 
 /**
@@ -102,63 +116,124 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 
 	store.updateSessionState(sessionId, "working");
 
-	let sawError = false;
-	const turn = await runTurn({
-		runtime,
-		worktreePath,
-		model: model.model,
-		prompt: ctx.prompt,
-		env: model.env,
-		baseUrl: model.baseUrl,
-		authMode: model.authMode,
-		resumeSessionId: ctx.resumeSessionId,
-		timeoutMs:
-			config.agents.turnTimeoutMinutes > 0 ? config.agents.turnTimeoutMinutes * 60_000 : undefined,
-		onEvent: (event) => {
-			if (event.error || event.type === "error") sawError = true;
-			// Prefer the error message (so a failed agent's reason is visible in the
-			// feed/logs), else the token/cost JSON the Costs page aggregates.
-			const detail = event.error
-				? event.error
-				: event.usage
-					? JSON.stringify({ tokens: event.usage.tokens, cost: event.usage.costUsd })
-					: null;
-			events.record({ agentName: name, runId, type: event.type, tool: event.tool ?? null, detail });
-			// Bump last_activity on every streamed event so a long but active turn
-			// keeps itself fresh and is never reaped as "idle".
-			store.touch(sessionId);
-		},
-	});
-	if (turn.runtimeSessionId) store.setRuntimeSessionId(sessionId, turn.runtimeSessionId);
-
-	// Record a clear reason when the wall-clock cap killed the turn.
-	if (turn.timedOut) {
-		events.record({
-			agentName: name,
-			runId,
-			type: "error",
-			tool: null,
-			detail: `Turn killed: exceeded agents.turnTimeoutMinutes (${config.agents.turnTimeoutMinutes}m).`,
+	// Spawn → final state runs under try/finally: if the spawn throws (runtime
+	// binary missing, worktree gone) or anything before the final state lands
+	// fails, the session must not be stranded `working` — it would hold a
+	// concurrency slot and keep `watch --until-idle` looping forever.
+	let pid: number | null = null;
+	let settled = false;
+	let turn: TurnResult;
+	let finalState: SessionState;
+	try {
+		let sawError = false;
+		turn = await runTurn({
+			runtime,
+			worktreePath,
+			model: model.model,
+			prompt: ctx.prompt,
+			env: model.env,
+			baseUrl: model.baseUrl,
+			authMode: model.authMode,
+			resumeSessionId: ctx.resumeSessionId,
+			timeoutMs:
+				config.agents.turnTimeoutMinutes > 0
+					? config.agents.turnTimeoutMinutes * 60_000
+					: undefined,
+			onSpawn: (childPid) => {
+				// Recorded so the reaper can tell a live (if quiet) turn from a dead one.
+				pid = childPid;
+				store.setPid(sessionId, childPid);
+			},
+			onEvent: (event) => {
+				if (event.error || event.type === "error") sawError = true;
+				// Prefer the error message (so a failed agent's reason is visible in the
+				// feed/logs), else the token/cost JSON the Costs page aggregates.
+				const detail = event.error
+					? errorDetail(event.error)
+					: event.usage
+						? JSON.stringify({ tokens: event.usage.tokens, cost: event.usage.costUsd })
+						: null;
+				events.record({
+					agentName: name,
+					runId,
+					type: event.type,
+					tool: event.tool ?? null,
+					detail,
+				});
+				// Bump last_activity on every streamed event so a long but active turn
+				// keeps itself fresh and is never reaped as "idle".
+				store.touch(sessionId);
+			},
 		});
-	}
+		// The child has exited: clear its pid at once so it is never taken for live.
+		pid = null;
+		store.setPid(sessionId, null);
+		if (turn.runtimeSessionId) store.setRuntimeSessionId(sessionId, turn.runtimeSessionId);
 
-	// A non-zero exit with no error event means the runtime failed via stderr;
-	// record it so the failure reason is visible instead of a blank "failed".
-	if (turn.exitCode !== 0 && !sawError) {
-		const reason = turn.stderr.trim();
-		if (reason) {
+		// Record a clear reason when the wall-clock cap killed the turn.
+		if (turn.timedOut) {
 			events.record({
 				agentName: name,
 				runId,
 				type: "error",
 				tool: null,
-				detail: reason.length > 1000 ? `${reason.slice(0, 1000)}…` : reason,
+				detail: `Turn killed: exceeded agents.turnTimeoutMinutes (${config.agents.turnTimeoutMinutes}m).`,
 			});
 		}
-	}
 
-	const finalState = resolveFinalState(root, name, capability, turn.exitCode);
-	store.updateSessionState(sessionId, finalState);
+		// A non-zero exit with no error event means the runtime failed via stderr;
+		// record it so the failure reason is visible instead of a blank "failed".
+		if (turn.exitCode !== 0 && !sawError) {
+			const reason = turn.stderr.trim();
+			if (reason) {
+				events.record({
+					agentName: name,
+					runId,
+					type: "error",
+					tool: null,
+					detail: errorDetail(reason),
+				});
+			}
+		}
+
+		const resolved = resolveFinalState(root, name, capability, turn.exitCode);
+		// Compare-and-set: a session stopped mid-turn (`agentplate stop`) stays
+		// stopped — never resurrected, and no gates/skills/auto-merge run for it.
+		if (!store.transitionSessionState(sessionId, "working", resolved)) {
+			settled = true;
+			const current = store.getSession(sessionId)?.state ?? "stopped";
+			return { finalState: current, exitCode: turn.exitCode, gateStatus: null };
+		}
+		finalState = resolved;
+		settled = true;
+	} catch (error) {
+		try {
+			const message = error instanceof Error ? error.message : String(error);
+			events.record({
+				agentName: name,
+				runId,
+				type: "error",
+				tool: null,
+				detail: errorDetail(`Turn failed: ${message}`),
+			});
+		} catch {
+			// Recording is best-effort; the original error is rethrown below.
+		}
+		throw error;
+	} finally {
+		if (!settled) {
+			// The turn threw after spawning: don't leave its child running orphaned.
+			if (pid !== null) {
+				try {
+					process.kill(pid, "SIGTERM");
+				} catch {
+					// Already exited.
+				}
+			}
+			store.setPid(sessionId, null);
+			store.transitionSessionState(sessionId, "working", "failed");
+		}
+	}
 	store.touch(sessionId);
 	updateIdentity(root, name, {
 		taskId,

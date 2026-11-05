@@ -210,6 +210,73 @@ describe("deploy audit store", () => {
 		expect(latest?.id).toBe(match.id);
 	});
 
+	/** Deployment ids of the release stack, oldest first. */
+	function releaseIds(): Array<string | null> {
+		return audit.releases("docker-gha", "production").map((r) => r.deploymentId);
+	}
+
+	test("releases is empty with no successful real deploy", () => {
+		audit.record(newRow({ status: "failed", deploymentId: "A" }));
+		audit.record(newRow({ dryRun: true, deploymentId: "B" }));
+		expect(releaseIds()).toEqual([]);
+	});
+
+	test("releases puts the live release last and the one before it second-to-last", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "B" }));
+		// The rollback target is A, not the live (latest) B.
+		expect(releaseIds()).toEqual(["A", "B"]);
+		expect(audit.latest("docker-gha", "production")?.deploymentId).toBe("B");
+	});
+
+	test("releases ignores failed, dry-run, and other target/env rows", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "X", status: "failed" }));
+		audit.record(newRow({ deploymentId: "Y", dryRun: true }));
+		audit.record(newRow({ deploymentId: "Z", environment: "staging" }));
+		audit.record(newRow({ deploymentId: "W", target: "fly" }));
+		audit.record(newRow({ deploymentId: "B" }));
+		expect(releaseIds()).toEqual(["A", "B"]);
+	});
+
+	test("re-deploying the live release is not a new rollback point", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "B", commitSha: "first" }));
+		audit.record(newRow({ deploymentId: "B", commitSha: "second" }));
+		expect(releaseIds()).toEqual(["A", "B"]);
+		// The newest row for the live release is the one kept.
+		expect(audit.releases("docker-gha", "production").at(-1)?.commitSha).toBe("second");
+	});
+
+	test("a rollback unwinds the stack, so the rolled-back release is never restored", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "B" }));
+		audit.record(newRow({ action: "rollback", deploymentId: "A" }));
+		// A is live again and nothing older exists: no roll-forward to bad B.
+		expect(releaseIds()).toEqual(["A"]);
+		// A new release C after the rollback rolls back to A, skipping B.
+		audit.record(newRow({ deploymentId: "C" }));
+		expect(releaseIds()).toEqual(["A", "C"]);
+	});
+
+	test("consecutive rollbacks walk further back", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "B" }));
+		audit.record(newRow({ deploymentId: "C" }));
+		audit.record(newRow({ action: "rollback", deploymentId: "B" }));
+		expect(releaseIds()).toEqual(["A", "B"]);
+		// A failed rollback changes nothing.
+		audit.record(newRow({ action: "rollback", deploymentId: "A", status: "failed" }));
+		expect(releaseIds()).toEqual(["A", "B"]);
+	});
+
+	test("a rollback to a release not in the stack fails closed (no rollback target)", () => {
+		audit.record(newRow({ deploymentId: "A" }));
+		audit.record(newRow({ deploymentId: "B" }));
+		audit.record(newRow({ action: "rollback", deploymentId: "unknown" }));
+		expect(releaseIds()).toEqual([]);
+	});
+
 	test("persists across reopen (real file, WAL mode)", () => {
 		const stored = audit.record(newRow({ urls: ["https://x.example"], outputs: { k: "v" } }));
 		audit.close();

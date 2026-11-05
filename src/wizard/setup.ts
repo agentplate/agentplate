@@ -108,7 +108,7 @@ export function ollamaContextTip(providerId: string, model: string): string | nu
 }
 
 /** Abort the wizard cleanly if the user cancelled a prompt. */
-function ensure<T>(value: T | symbol): T {
+function ensure<T>(value: T | typeof p.CANCEL_SYMBOL): T {
 	if (p.isCancel(value)) {
 		p.cancel("Setup cancelled. No changes written.");
 		process.exit(0);

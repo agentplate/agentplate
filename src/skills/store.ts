@@ -12,7 +12,10 @@
  * Derived fields (`confidence`, `appliedCount`, `successCount`, `lastOutcome`)
  * ARE persisted into the frontmatter for cheap reads, but are always recomputed
  * from `outcomes.jsonl` whenever an outcome is appended — they are never trusted
- * as hand-edited input. The recompute is INLINED here (a weighted-count +
+ * as hand-edited input. An update that rewrites a skill's content appends an
+ * epoch marker to the log, so the new text starts with no earned confidence
+ * (outcomes recorded against the old text stay on disk but no longer count).
+ * The recompute is INLINED here (a weighted-count +
  * Wilson lower bound) rather than imported from the sibling feedback module, to
  * keep the store free of a cross-dependency on a module built in parallel.
  *
@@ -36,6 +39,7 @@ import yaml from "js-yaml";
 import { AGENTPLATE_DIR } from "../config.ts";
 import { openDatabase } from "../db/sqlite.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
+import { accent, isQuiet } from "../logging/color.ts";
 import type { OutcomeStatus } from "../types.ts";
 import type { Skill, SkillDraft, SkillOutcome, SkillProvenance, SkillStatus } from "./types.ts";
 
@@ -72,9 +76,22 @@ const FRONTMATTER_KEYS = [
 	"lastOutcome",
 ] as const;
 
+/**
+ * A valid skill slug: lowercase alphanumerics and dashes, starting with an
+ * alphanumeric. Every slug {@link slugify} produces matches it, including the
+ * `-2`, `-3` collision suffixes. A slug becomes a directory name under the
+ * skills dir, so anything else (`..`, `/`, `\`, dots, whitespace) is rejected.
+ */
+export const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
 // ---------------------------------------------------------------------------
+
+/** Is `slug` a valid skill slug ({@link SLUG_RE})? */
+export function isValidSlug(slug: string): boolean {
+	return SLUG_RE.test(slug);
+}
 
 /**
  * Lowercase, kebab-case slug. Non-alphanumeric runs become single dashes;
@@ -137,8 +154,13 @@ function toNumber(value: unknown, fallback: number): number {
  * Splits the leading `---`-fenced YAML frontmatter from the markdown body that
  * follows it. Every Skill field except `body` comes from the frontmatter; the
  * remainder (after the closing fence and one optional blank line) is the body.
- * Optional arrays default to `[]` and missing scalars to safe defaults so a
- * partially-written or older file never throws.
+ * Optional arrays default to `[]` and missing scalars to safe defaults, so an
+ * older file that lacks newer keys still parses.
+ *
+ * Throws a `ValidationError` when the frontmatter is missing, empty, or not a
+ * YAML mapping (plain markdown included), and lets js-yaml's `YAMLException`
+ * through for invalid YAML. {@link SkillStore.list} skips such files with a
+ * warning; {@link SkillStore.get} reports them.
  */
 export function parseSkillMd(text: string): Skill {
 	const { frontmatter, body } = splitFrontmatter(text);
@@ -182,8 +204,8 @@ export function parseSkillMd(text: string): Skill {
  *
  * Recognizes a leading `---` fence (optionally preceded by whitespace/BOM) and
  * the next line that is exactly `---`. If no fences are present the whole
- * document is treated as the body with empty frontmatter, so plain markdown
- * still parses (yielding a defaults-only Skill).
+ * document is treated as the body with empty frontmatter, which
+ * {@link parseSkillMd} then rejects.
  */
 function splitFrontmatter(text: string): { frontmatter: string; body: string } {
 	// Normalize CRLF so the fence regex and line slicing behave identically on
@@ -288,10 +310,10 @@ function wilsonLowerBound(successes: number, n: number): number {
 	const lower = (center - margin) / denom;
 	// Clamp to [0,1]; weighting can push phat into ranges where the raw bound
 	// drifts a hair outside the interval.
-	return lower < 0 ? 0 : lower > 1 ? 1 : lower;
+	return Math.min(Math.max(lower, 0), 1);
 }
 
-/** Derived stats recomputed from a skill's full outcome history. */
+/** Derived stats recomputed from a skill's current-epoch outcome history. */
 interface DerivedStats {
 	appliedCount: number;
 	successCount: number;
@@ -324,6 +346,22 @@ function deriveStats(outcomes: SkillOutcome[]): DerivedStats {
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
+
+/** Options for {@link createSkillStore}. */
+export interface SkillStoreOptions {
+	/**
+	 * Receives a warning when {@link SkillStore.list} skips a skill directory it
+	 * cannot read. Defaults to a `!`-prefixed line on stderr (silent in quiet
+	 * mode), so `--json` output on stdout stays parseable.
+	 */
+	onWarning?: (message: string) => void;
+}
+
+/** Default {@link SkillStoreOptions.onWarning}: a warning line on stderr. */
+function warnOnStderr(message: string): void {
+	if (isQuiet()) return;
+	process.stderr.write(`${accent("!")} ${message}\n`);
+}
 
 /** Filters for {@link SkillStore.list}. */
 export interface ListSkillsOptions {
@@ -369,11 +407,16 @@ interface IndexRow {
  * {@link SkillStore.reindex}). The skills directory is created lazily on first
  * write so opening a store on a fresh project is side-effect free beyond the
  * (gitignored) index file.
+ *
+ * Every slug is checked against {@link SLUG_RE} before it becomes a path:
+ * `get` returns null for an invalid slug, and the mutating methods throw a
+ * `ValidationError`.
  */
-export function createSkillStore(root: string): SkillStore {
+export function createSkillStore(root: string, opts: SkillStoreOptions = {}): SkillStore {
 	const agentplateDir = join(root, AGENTPLATE_DIR);
 	const skillsDir = join(agentplateDir, "skills");
 	const indexPath = join(agentplateDir, INDEX_FILE);
+	const warn = opts.onWarning ?? warnOnStderr;
 
 	// The index lives under .agentplate/, which must exist before SQLite can create
 	// the file. Creating it here is safe and idempotent.
@@ -381,8 +424,15 @@ export function createSkillStore(root: string): SkillStore {
 	const db: Database = openDatabase(indexPath);
 	initIndex(db);
 
-	/** Absolute path to a skill's directory. */
+	/**
+	 * Absolute path to a skill's directory. Throws a `ValidationError` for an
+	 * invalid slug, so a slug like `../../x` can never resolve outside the
+	 * skills dir.
+	 */
 	function dirOf(slug: string): string {
+		if (!isValidSlug(slug)) {
+			throw new ValidationError(`Invalid skill slug "${slug}" (expected ${SLUG_RE.source})`);
+		}
 		return join(skillsDir, slug);
 	}
 	/** Absolute path to a skill's `skill.md`. */
@@ -394,11 +444,20 @@ export function createSkillStore(root: string): SkillStore {
 		return join(dirOf(slug), OUTCOMES_FILE);
 	}
 
-	/** Read + parse a skill by slug, or null if its `skill.md` is absent. */
+	/**
+	 * Read + parse a skill by slug, or null if its `skill.md` is absent. A file
+	 * that does not parse throws a `ValidationError` naming the file.
+	 */
 	function read(slug: string): Skill | null {
 		const file = skillFileOf(slug);
 		if (!existsSync(file)) return null;
-		const skill = parseSkillMd(readFileSync(file, "utf8"));
+		let skill: Skill;
+		try {
+			skill = parseSkillMd(readFileSync(file, "utf8"));
+		} catch (err) {
+			const detail = err instanceof Error ? err.message : String(err);
+			throw new ValidationError(`Malformed skill file ${file}: ${detail}`);
+		}
 		// The directory name is authoritative for the slug — trust it over a stale
 		// frontmatter value (e.g. if a directory was renamed by hand).
 		skill.slug = slug;
@@ -421,11 +480,14 @@ export function createSkillStore(root: string): SkillStore {
 		upsertIndexRow(db, skill);
 	}
 
-	/** Read every outcome line for a skill (skipping malformed lines). */
+	/**
+	 * Read the outcomes of a skill's current epoch: every valid outcome line after
+	 * the last epoch marker (see {@link isEpochMarker}). Malformed lines are skipped.
+	 */
 	function readOutcomes(slug: string): SkillOutcome[] {
 		const file = outcomesFileOf(slug);
 		if (!existsSync(file)) return [];
-		const out: SkillOutcome[] = [];
+		let out: SkillOutcome[] = [];
 		for (const line of readFileSync(file, "utf8").split("\n")) {
 			const trimmed = line.trim();
 			if (trimmed === "") continue;
@@ -436,19 +498,41 @@ export function createSkillStore(root: string): SkillStore {
 				// A corrupt line should not poison the whole history.
 				continue;
 			}
+			if (isEpochMarker(parsed)) {
+				// Outcomes before the marker were earned by older content.
+				out = [];
+				continue;
+			}
 			const outcome = coerceOutcome(parsed);
 			if (outcome !== null) out.push(outcome);
 		}
 		return out;
 	}
 
-	/** List every skill on disk, newest-updated first, optionally status-filtered. */
+	/**
+	 * List every skill on disk, newest-updated first, optionally status-filtered.
+	 *
+	 * A directory whose name is not a valid slug, or whose `skill.md` cannot be
+	 * read or parsed, is skipped with a warning. One bad hand-written or
+	 * half-written file must not break every caller of `list()`, sling included.
+	 */
 	function list(opts?: ListSkillsOptions): Skill[] {
 		if (!existsSync(skillsDir)) return [];
 		const skills: Skill[] = [];
 		for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
-			const skill = read(entry.name);
+			if (!isValidSlug(entry.name)) {
+				warn(`Skipping skill directory "${entry.name}": not a valid skill slug`);
+				continue;
+			}
+			let skill: Skill | null;
+			try {
+				skill = read(entry.name);
+			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
+				warn(`Skipping skill "${entry.name}": ${detail}`);
+				continue;
+			}
 			if (skill === null) continue;
 			if (opts?.status !== undefined && skill.status !== opts.status) continue;
 			skills.push(skill);
@@ -462,6 +546,8 @@ export function createSkillStore(root: string): SkillStore {
 	}
 
 	function get(slug: string): Skill | null {
+		// An invalid slug cannot name a skill, so a read-only lookup reports "absent".
+		if (!isValidSlug(slug)) return null;
 		return read(slug);
 	}
 
@@ -485,8 +571,21 @@ export function createSkillStore(root: string): SkillStore {
 				throw new NotFoundError(`Cannot update skill: "${targetSlug}" not found`);
 			}
 
-			// Recompute derived fields from the preserved outcome log so they stay
-			// consistent across the version bump (outcomes.jsonl is left untouched).
+			// Confidence was earned by the old text. When the update rewrites what an
+			// agent reads, start a new outcome epoch so the new text starts at zero
+			// instead of inheriting it. The marker is appended before skill.md is
+			// rewritten, so a failed write leaves confidence lower, never higher.
+			// Metadata-only updates (tags, filePatterns) keep the current epoch.
+			if (changesContent(existing, draft)) {
+				const marker: EpochMarker = {
+					epoch: existing.version + 1,
+					ts: now,
+					note: "content updated; earlier outcomes no longer count",
+				};
+				appendFileSync(outcomesFileOf(targetSlug), `${JSON.stringify(marker)}\n`, "utf8");
+			}
+
+			// Recompute derived fields from the current epoch of the outcome log.
 			const stats = deriveStats(readOutcomes(targetSlug));
 
 			const updated: Skill = {
@@ -605,6 +704,43 @@ export function createSkillStore(root: string): SkillStore {
 // ---------------------------------------------------------------------------
 // Outcome coercion
 // ---------------------------------------------------------------------------
+
+/**
+ * A non-outcome line in `outcomes.jsonl` that starts a new outcome epoch.
+ * Written when an update rewrites a skill's content; only outcomes after the
+ * last marker count toward the derived stats. It has no `status`, so code that
+ * predates epochs drops it as a malformed outcome.
+ */
+interface EpochMarker {
+	/** The skill version the new epoch starts at. */
+	epoch: number;
+	ts: string;
+	note: string;
+}
+
+/** Is a parsed `outcomes.jsonl` line an {@link EpochMarker}? */
+function isEpochMarker(value: unknown): boolean {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const obj = value as Record<string, unknown>;
+	return typeof obj.epoch === "number" && obj.status === undefined;
+}
+
+/**
+ * Does applying `draft` change what an agent reads from the skill (title, goal,
+ * when-to-use, or body)? The body is compared after the trailing-whitespace
+ * trim that `write` applies, so resending the current text is not a change.
+ */
+function changesContent(existing: Skill, draft: SkillDraft): boolean {
+	if (draft.title !== undefined && draft.title !== existing.title) return true;
+	if (draft.goal !== undefined && draft.goal !== existing.goal) return true;
+	if (draft.body !== undefined && draft.body.replace(/\s+$/, "") !== existing.body) return true;
+	if (draft.whenToUse !== undefined) {
+		const next = draft.whenToUse;
+		const prev = existing.whenToUse;
+		if (next.length !== prev.length || next.some((item, i) => item !== prev[i])) return true;
+	}
+	return false;
+}
 
 /** Narrow an unknown parsed JSONL value into a {@link SkillOutcome}, or null. */
 function coerceOutcome(value: unknown): SkillOutcome | null {

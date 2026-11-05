@@ -268,21 +268,26 @@ describe("ClaudeRuntime", () => {
 			baseUrl: "http://gw.example.com",
 			authMode: "env",
 		});
+		// The provider did not ask for ANTHROPIC_API_KEY, so a shell-exported one is
+		// pinned to "" rather than forwarded to the third-party gateway.
 		expect(withToken).toEqual({
 			ANTHROPIC_AUTH_TOKEN: "tok",
 			ANTHROPIC_BASE_URL: "http://gw.example.com",
+			ANTHROPIC_API_KEY: "",
 		});
 	});
 
 	test("buildEnv with subscription auth + baseUrl (proxy) keeps the CLI login intact", () => {
-		// A Pro/Max login proxied through a gateway: only the endpoint moves —
-		// no dummy bearer and no key neutralization, or the OAuth session breaks.
+		// A Pro/Max login proxied through a gateway: the endpoint moves and no dummy
+		// bearer is injected (that would break the OAuth session). A shell-exported
+		// ANTHROPIC_API_KEY is pinned to "" (treated as unset by the CLI) so it is
+		// never sent to the non-Anthropic proxy host.
 		const env = runtime.buildEnv({
 			model: "claude-opus-4-8",
 			baseUrl: "https://proxy.example.com",
 			authMode: "subscription",
 		});
-		expect(env).toEqual({ ANTHROPIC_BASE_URL: "https://proxy.example.com" });
+		expect(env).toEqual({ ANTHROPIC_BASE_URL: "https://proxy.example.com", ANTHROPIC_API_KEY: "" });
 	});
 
 	test("buildEnv without baseUrl is byte-identical to the legacy behavior", () => {

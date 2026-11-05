@@ -11,8 +11,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openDatabase } from "../db/sqlite.ts";
+import { mergeDbPath } from "../paths.ts";
 import type { Capability, NewMail } from "../types.ts";
 import { type AutoMergeParams, maybeAutoMerge } from "./auto.ts";
+import { acquireMergeLock, releaseMergeLock } from "./lock.ts";
 
 let repo: string;
 
@@ -153,5 +156,50 @@ describe("maybeAutoMerge — landing", () => {
 		expect(out.merged).toBe(false);
 		expect(out).toMatchObject({ reason: "merge-failed" });
 		expect(mail.sent[0]).toMatchObject({ type: "merge_failed" });
+	});
+});
+
+describe("maybeAutoMerge — lock contention and errors", () => {
+	/** Status of every queue row for the worker branch, read straight from the DB. */
+	function queueStatuses(): string[] {
+		const db = openDatabase(mergeDbPath(repo));
+		try {
+			return db
+				.query<{ status: string }, [string]>(
+					"SELECT status FROM merge_queue WHERE branch_name = ? ORDER BY seq",
+				)
+				.all("agentplate/builder-x")
+				.map((r) => r.status);
+		} finally {
+			db.close();
+		}
+	}
+
+	test("a held lock leaves the entry pending and mails a notice (never silent)", async () => {
+		const mail = recordingMail();
+		await workerBranchWithCommit("agentplate/builder-x", "feature.txt");
+		expect(acquireMergeLock(repo)).toBe(true);
+		try {
+			const out = await maybeAutoMerge(params({ mail, lockRetryMs: 1 }));
+			expect(out).toMatchObject({ merged: false, reason: "lock-busy" });
+		} finally {
+			releaseMergeLock(repo);
+		}
+		expect(mail.sent[0]).toMatchObject({ type: "status", to: "lead-1" });
+		expect(mail.sent[0]?.subject).toContain("queued");
+		expect(queueStatuses()).toEqual(["pending"]);
+		expect(existsSync(join(repo, "feature.txt"))).toBe(false);
+	});
+
+	test("a merge that throws marks the entry failed and mails merge_failed", async () => {
+		const mail = recordingMail();
+		// No such branch -> mergeBranch throws instead of returning a result.
+		const out = await maybeAutoMerge(params({ mail, lockRetryMs: 1 }));
+		expect(out).toMatchObject({ merged: false, reason: "merge-error" });
+		expect(mail.sent[0]).toMatchObject({ type: "merge_failed" });
+		expect(queueStatuses()).toEqual(["failed"]);
+		// The lock is released even on the error path.
+		expect(acquireMergeLock(repo)).toBe(true);
+		releaseMergeLock(repo);
 	});
 });

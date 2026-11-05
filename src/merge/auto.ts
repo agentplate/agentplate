@@ -19,12 +19,17 @@
 import { createMailClient } from "../mail/client.ts";
 import { mergeDbPath } from "../paths.ts";
 import type { AutoMergeMode, Capability, MergeStatus, MergeTier, OutcomeStatus } from "../types.ts";
-import { withMergeLock } from "./lock.ts";
+import { acquireMergeLock, releaseMergeLock } from "./lock.ts";
 import { createMergeQueue } from "./queue.ts";
 import { mergeBranch } from "./resolver.ts";
 
 /** Capabilities that never produce a branch worth landing on the canonical branch. */
 const NON_MERGING_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>(["scout", "merger"]);
+
+/** How many times to try the merge lock before leaving the entry queued. */
+const LOCK_ATTEMPTS = 5;
+/** Delay between lock attempts (ms). Parallel auto-merges usually finish in well under this. */
+const LOCK_RETRY_MS = 1000;
 
 export interface AutoMergeParams {
 	root: string;
@@ -40,6 +45,8 @@ export interface AutoMergeParams {
 	aiResolveEnabled: boolean;
 	/** The task's quality-gate outcome, or null if gates did not run. */
 	gateStatus: OutcomeStatus | null;
+	/** Lock retry delay in ms (injectable for tests; defaults to {@link LOCK_RETRY_MS}). */
+	lockRetryMs?: number;
 	/** Mail surface for reporting the outcome (injectable for tests). */
 	mail?: { send: (m: Parameters<ReturnType<typeof createMailClient>["send"]>[0]) => unknown };
 }
@@ -48,7 +55,13 @@ export type AutoMergeOutcome =
 	| { merged: true; status: MergeStatus; tier: MergeTier | null }
 	| {
 			merged: false;
-			reason: "disabled" | "capability-skipped" | "gates-not-passed" | "merge-failed";
+			reason:
+				| "disabled"
+				| "capability-skipped"
+				| "gates-not-passed"
+				| "merge-failed"
+				| "lock-busy"
+				| "merge-error";
 			conflictFiles?: string[];
 	  };
 
@@ -86,11 +99,46 @@ export async function maybeAutoMerge(params: AutoMergeParams): Promise<AutoMerge
 			taskId: params.taskId,
 			targetBranch: params.targetBranch,
 		});
-		const result = await withMergeLock(params.root, () =>
-			mergeBranch(params.root, params.branchName, params.targetBranch, {
-				autoResolve: params.aiResolveEnabled,
-			}),
+		const result = await mergeUnderLock(
+			params.root,
+			params.lockRetryMs ?? LOCK_RETRY_MS,
+			async () => {
+				try {
+					return await mergeBranch(params.root, params.branchName, params.targetBranch, {
+						autoResolve: params.aiResolveEnabled,
+					});
+				} catch (error) {
+					return error instanceof Error ? error : new Error(String(error));
+				}
+			},
 		);
+
+		// Lock stayed busy: leave the entry pending (`agentplate merge --all` picks it
+		// up) and say so, instead of dropping the landing silently.
+		if (result === null) {
+			mail.send({
+				from: params.agentName,
+				to,
+				subject: `Auto-merge queued: ${params.branchName}`,
+				body: "Another merge held the merge lock; the branch is queued as pending. Run `agentplate merge --all` to land it.",
+				type: "status",
+			});
+			return { merged: false, reason: "lock-busy" };
+		}
+
+		// mergeBranch threw (missing branch, merge already in progress, git failure):
+		// record the failure so the queue row never sits pending forever.
+		if (result instanceof Error) {
+			queue.markStatus(entry.id, "failed");
+			mail.send({
+				from: params.agentName,
+				to,
+				subject: `Auto-merge failed: ${params.branchName}`,
+				body: `Merge error: ${result.message}. Merge manually.`,
+				type: "merge_failed",
+			});
+			return { merged: false, reason: "merge-error" };
+		}
 		queue.markStatus(entry.id, result.status);
 
 		if (result.status === "merged") {
@@ -115,4 +163,26 @@ export async function maybeAutoMerge(params: AutoMergeParams): Promise<AutoMerge
 	} finally {
 		queue.close();
 	}
+}
+
+/**
+ * Run `fn` under the cross-process merge lock, retrying briefly if another merge
+ * holds it. Returns null when the lock never frees up.
+ */
+async function mergeUnderLock<T>(
+	root: string,
+	retryMs: number,
+	fn: () => Promise<T>,
+): Promise<T | null> {
+	for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+		if (acquireMergeLock(root)) {
+			try {
+				return await fn();
+			} finally {
+				releaseMergeLock(root);
+			}
+		}
+		if (attempt < LOCK_ATTEMPTS - 1) await Bun.sleep(retryMs);
+	}
+	return null;
 }

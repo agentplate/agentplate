@@ -193,14 +193,16 @@ export async function removeWorktree(
 }
 
 /**
- * Force-delete a local branch via `git branch -D`. Used to fully clean up a
- * reaped agent's `agentplate/<name>` branch after its worktree is removed. Uses
- * `-D` (not `-d`) because the branch is typically unmerged. The branch must no
- * longer be checked out by any worktree (remove the worktree first).
+ * Safely delete a local branch via `git branch -d`. Used to clean up a reaped or
+ * stopped agent's `agentplate/<name>` branch after its worktree is removed. Uses
+ * `-d` (never `-D`): git refuses to delete a branch with commits not yet merged,
+ * so an agent's committed-but-unlanded work is never destroyed by cleanup — the
+ * call throws and the branch is kept. The branch must no longer be checked out
+ * by any worktree (remove the worktree first).
  */
 export async function deleteBranch(repoRoot: string, branchName: string): Promise<void> {
 	try {
-		await git(repoRoot, ["branch", "-D", branchName]);
+		await git(repoRoot, ["branch", "-d", branchName]);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new WorktreeError(`Failed to delete branch ${branchName}: ${message}`);

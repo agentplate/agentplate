@@ -7,12 +7,20 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	AGENTPLATE_DIR,
+	CONFIG_FILE,
+	DEFAULT_CONFIG,
+	serializeConfig,
+	setProjectRootOverride,
+} from "../config.ts";
 import { ValidationError } from "../errors.ts";
+import { sessionsDbPath, worktreesDir } from "../paths.ts";
 import type { OverlayConfig } from "../types.ts";
-import { dispatchBody, readSpecContract } from "./sling.ts";
+import { createSlingCommand, dispatchBody, readSpecContract } from "./sling.ts";
 
 let dir: string;
 
@@ -80,5 +88,33 @@ describe("dispatchBody", () => {
 		const body = dispatchBody("task-1", "lead", baseCfg, "");
 		expect(body).not.toContain("=== SPEC");
 		expect(body).toContain("Task: task-1");
+	});
+});
+
+describe("sling task-id validation", () => {
+	let root: string;
+
+	beforeEach(() => {
+		root = mkdtempSync(join(tmpdir(), "agentplate-sling-id-"));
+		mkdirSync(join(root, AGENTPLATE_DIR), { recursive: true });
+		writeFileSync(join(root, AGENTPLATE_DIR, CONFIG_FILE), serializeConfig(DEFAULT_CONFIG), "utf8");
+		setProjectRootOverride(root);
+	});
+
+	afterEach(() => {
+		setProjectRootOverride(null);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("rejects a path-traversal / flag-like task id before touching any state", async () => {
+		for (const taskId of ["../../README", "a/b", "a..b", "-rf"]) {
+			const cmd = createSlingCommand();
+			await expect(cmd.parseAsync(["--", taskId], { from: "user" })).rejects.toThrow(
+				ValidationError,
+			);
+		}
+		// Validation ran before the session store / worktree were created.
+		expect(existsSync(sessionsDbPath(root))).toBe(false);
+		expect(existsSync(worktreesDir(root))).toBe(false);
 	});
 });

@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createEventStore } from "../events/store.ts";
 import { createMailStore } from "../mail/store.ts";
 import { createMergeQueue } from "../merge/queue.ts";
@@ -142,6 +142,23 @@ describe("purgeAgentData", () => {
 		const second = purgeAgentData(root, b, stores);
 		expect(second.specRemoved).toBe(true);
 		expect(existsSync(specPath(root, "shared"))).toBe(false);
+	});
+
+	test("never deletes a file outside specs/ for a path-traversal taskId", () => {
+		// A session persisted with a `../` task id (sling used to accept any id).
+		const session = mk(root, { id: "s-evil", agentName: "evil", taskId: "../../README" });
+		stores.sessions.upsertSession(session);
+		mkdirSync(join(root, ".agentplate", "specs"), { recursive: true });
+		const readme = join(root, "README.md");
+		writeFileSync(readme, "# keep me\n");
+		// Sanity: the naive spec path really does resolve to the project README.
+		expect(resolve(specPath(root, session.taskId))).toBe(resolve(readme));
+
+		const report = purgeAgentData(root, session, stores);
+
+		expect(report.specRemoved).toBe(false);
+		expect(report.sessionDeleted).toBe(true);
+		expect(existsSync(readme)).toBe(true);
 	});
 
 	test("is resilient when there is nothing to purge", () => {

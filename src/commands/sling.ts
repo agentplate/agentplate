@@ -25,6 +25,7 @@ import { jsonOutput } from "../json.ts";
 import { brand, muted, printHint, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
 import {
+	assertSafeTaskId,
 	currentRunPath,
 	eventsDbPath,
 	manifestFilePath,
@@ -103,6 +104,9 @@ export function createSlingCommand(): Command {
 		.option("--json", "output JSON")
 		.action(async (taskId: string, opts: SlingOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
+			// The task id names the spec file, agent and branch and is persisted on the
+			// session row (later used by purge), so reject path-like ids up front.
+			assertSafeTaskId(taskId);
 			const root = findProjectRoot();
 			if (!isInitialized(root)) {
 				throw new ValidationError("Not initialized. Run `agentplate setup` first.");

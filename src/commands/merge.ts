@@ -69,7 +69,8 @@ export function createMergeCommand(): Command {
 					return;
 				}
 
-				// Dry-run: predict only, no mutation, no lock needed.
+				// Dry-run: predict only. predictMerge uses `git merge-tree`, which never
+				// touches HEAD, the index, or the working tree, so no lock is needed.
 				if (opts.dryRun) {
 					const predictions: MergeResult[] = [];
 					for (const { branch } of branches) {
@@ -98,9 +99,16 @@ export function createMergeCommand(): Command {
 							taskId: session?.taskId ?? "unknown",
 							targetBranch: target,
 						});
-						const result = await withMergeLock(root, () =>
-							mergeBranch(root, branch, target, { autoResolve: config.merge.aiResolveEnabled }),
-						);
+						let result: MergeResult;
+						try {
+							result = await withMergeLock(root, () =>
+								mergeBranch(root, branch, target, { autoResolve: config.merge.aiResolveEnabled }),
+							);
+						} catch (err) {
+							// Record the attempt so the queue row is not left "pending" forever.
+							queue.markStatus(entry.id, "failed");
+							throw err;
+						}
 						queue.markStatus(entry.id, result.status);
 						results.push(result);
 					}
