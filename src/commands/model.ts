@@ -66,6 +66,16 @@ export function buildPersistedConfig(
 	applyChanges(out, shown as unknown as PlainObject, result as unknown as PlainObject);
 	const persisted = out as unknown as AgentplateConfig;
 	persisted.project = { ...persisted.project, root: "" };
+	// The committed active provider must be fully defined in config.yaml itself, or a
+	// fresh clone (no config.local.yaml) fails validation. If the user made a provider
+	// active whose entry lives only in config.local.yaml (so the diff above wrote none,
+	// or only the changed fields), commit the entry the wizard confirmed in full.
+	const active = persisted.activeProvider;
+	const chosen = result.providers[active];
+	const written = persisted.providers[active];
+	if (chosen && !written?.type) {
+		persisted.providers = { ...persisted.providers, [active]: structuredClone(chosen) };
+	}
 	return persisted;
 }
 

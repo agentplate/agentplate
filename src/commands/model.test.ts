@@ -131,4 +131,83 @@ describe("persistWizardConfig", () => {
 		expect(raw).not.toContain(root);
 		expect(loadConfig(root).providers.anthropic?.model).toBe("m1");
 	});
+
+	describe("active provider defined only in config.local.yaml", () => {
+		const OR_URL = "https://openrouter.ai/api/v1";
+
+		function writeLocalOpenrouter(model: string): void {
+			writeFileSync(
+				join(root, AGENTPLATE_DIR, CONFIG_LOCAL_FILE),
+				yaml.dump({
+					providers: {
+						openrouter: {
+							type: "gateway",
+							authMode: "api-key",
+							authTokenEnv: "OPENROUTER_API_KEY",
+							baseUrl: OR_URL,
+							model,
+						},
+					},
+				}),
+				"utf8",
+			);
+		}
+
+		function wizardPickOpenrouter(current: AgentplateConfig, model: string): AgentplateConfig {
+			const spec = getProviderSpec("openrouter");
+			if (!spec) throw new Error("openrouter spec missing");
+			return applyProviderSelection(current, {
+				providerId: "openrouter",
+				spec,
+				model,
+				authMode: "api-key",
+				runtime: current.runtime.default,
+			});
+		}
+
+		/** Simulate a fresh clone / CI: config.local.yaml is gitignored, so it is absent. */
+		function loadAsFreshClone(): AgentplateConfig {
+			rmSync(join(root, AGENTPLATE_DIR, CONFIG_LOCAL_FILE));
+			return loadConfig(root);
+		}
+
+		test("switching to it with the same model commits a complete provider entry", () => {
+			writeLocalOpenrouter("qwen/qwen3-coder:free");
+			const shown = loadConfig(root);
+			expect(shown.activeProvider).toBe("anthropic");
+			persistWizardConfig(root, shown, wizardPickOpenrouter(shown, "qwen/qwen3-coder:free"));
+
+			const fresh = loadAsFreshClone();
+			expect(fresh.activeProvider).toBe("openrouter");
+			expect(fresh.providers.openrouter).toEqual({
+				type: "gateway",
+				authMode: "api-key",
+				authTokenEnv: "OPENROUTER_API_KEY",
+				baseUrl: OR_URL,
+				model: "qwen/qwen3-coder:free",
+			});
+		});
+
+		test("changing only its model never writes a partial entry", () => {
+			writeLocalOpenrouter("a");
+			const shown = loadConfig(root);
+			persistWizardConfig(root, shown, wizardPickOpenrouter(shown, "b"));
+
+			const committed = readCommitted() as {
+				providers: Record<string, { type?: string; model?: string }>;
+			};
+			expect(committed.providers.openrouter?.type).toBe("gateway");
+			expect(committed.providers.openrouter?.model).toBe("b");
+			expect(loadAsFreshClone().providers.openrouter?.model).toBe("b");
+		});
+
+		test("a non-active local-only provider is still not committed", () => {
+			writeLocalOpenrouter("a");
+			const shown = loadConfig(root);
+			persistWizardConfig(root, shown, wizardSwitchModel(shown, "claude-sonnet-x"));
+			const committed = readCommitted() as { providers: Record<string, unknown> };
+			expect(committed.providers.openrouter).toBeUndefined();
+			expect(loadAsFreshClone().activeProvider).toBe("anthropic");
+		});
+	});
 });
