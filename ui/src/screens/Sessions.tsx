@@ -4,7 +4,7 @@
 import { useMemo, useState } from "react";
 import { getAgents, getRuns } from "../api.ts";
 import { IconActive, IconLayers, IconRuns, IconSkills, PageIcon } from "../icons.tsx";
-import { Badge, Card, Stat, fmtAgo, stateTone } from "../lib.tsx";
+import { Badge, Card, fmtAgo, Stat, stateTone } from "../lib.tsx";
 import type { AgentSession } from "../types.ts";
 import { usePolling } from "../usePolling.ts";
 
@@ -55,7 +55,12 @@ export function SessionsScreen({ onSelect }: { onSelect: (name: string) => void 
 			</div>
 
 			<div className="stat-grid">
-				<Stat label="Total Runs" value={runList.length} icon={<IconRuns size={20} />} iconTone="cyan" />
+				<Stat
+					label="Total Runs"
+					value={runList.length}
+					icon={<IconRuns size={20} />}
+					iconTone="cyan"
+				/>
 				<Stat
 					label="Total Sessions"
 					value={agentList.length}
@@ -131,7 +136,19 @@ export function SessionsScreen({ onSelect }: { onSelect: (name: string) => void 
 									return (
 										<tr key={a.id} className="row-click" onClick={() => onSelect(a.agentName)}>
 											<td>
-												<span style={{ fontWeight: 700 }}>{a.agentName}</span>{" "}
+												{/* The row is mouse-clickable; this button is the keyboard / screen-reader target. */}
+												<button
+													type="button"
+													className="link-button"
+													style={{ fontWeight: 700 }}
+													onClick={(e) => {
+														e.stopPropagation();
+														onSelect(a.agentName);
+													}}
+													aria-label={`Open details for ${a.agentName}`}
+												>
+													{a.agentName}
+												</button>{" "}
 												<Badge tone="neutral">{a.capability}</Badge>
 											</td>
 											<td className="dim">{a.capability}</td>

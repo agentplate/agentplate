@@ -14,9 +14,9 @@ import {
 	XAxis,
 	YAxis,
 } from "recharts";
-import { IconActivity, IconCost, IconCosts, IconUsers, PageIcon } from "../icons.tsx";
-import { Card, Stat, fmtNum } from "../lib.tsx";
 import { getCosts } from "../api.ts";
+import { IconActivity, IconCost, IconCosts, IconUsers, PageIcon } from "../icons.tsx";
+import { Card, fmtNum, Stat } from "../lib.tsx";
 import { usePolling } from "../usePolling.ts";
 
 const ACCENT = "#f5402d";

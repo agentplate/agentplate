@@ -13,6 +13,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getFeed } from "../api.ts";
 import { IconActivity, PageIcon } from "../icons.tsx";
+import { feedKey, withStableKeys } from "../keys.ts";
 import { agentColor, clock } from "../lib.tsx";
 import type { FeedItem } from "../types.ts";
 
@@ -23,7 +24,8 @@ function labelColor(label: string, level: string): string {
 	if (level === "error") return "var(--err)";
 	if (level === "warn") return "var(--warn)";
 	if (label.startsWith("TOOL")) return "var(--info)";
-	if (label.startsWith("MAIL") || label.startsWith("DISP") || label === "PROG ") return "var(--cyan)";
+	if (label.startsWith("MAIL") || label.startsWith("DISP") || label === "PROG ")
+		return "var(--cyan)";
 	if (label.startsWith("SESS") || label.startsWith("DONE") || label === "RSULT") return "var(--ok)";
 	if (label === "SPAWN") return "var(--violet)";
 	return "var(--text-faint)";
@@ -105,7 +107,9 @@ export function FeedScreen({ feed, live }: { feed: FeedItem[]; live: boolean }):
 						<h1 className="page-title">
 							<PageIcon icon={IconActivity} tone="ok" /> Activity
 						</h1>
-						<p className="page-sub">Live terminal stream of agent tool calls and mail across the swarm.</p>
+						<p className="page-sub">
+							Live terminal stream of agent tool calls and mail across the swarm.
+						</p>
 					</div>
 					<div style={{ display: "flex", alignItems: "center", gap: 8 }}>
 						<span className={`ap-live-dot ${live ? "on" : "off"}`} />
@@ -122,8 +126,8 @@ export function FeedScreen({ feed, live }: { feed: FeedItem[]; live: boolean }):
 						No recent events. Spawn an agent or chat with the coordinator.
 					</div>
 				) : (
-					rows.map((e, i) => (
-						<div className="ap-fl-row" key={`${e.ts}-${i}`}>
+					withStableKeys(rows, feedKey).map(({ item: e, key }) => (
+						<div className="ap-fl-row" key={key}>
 							<span className="ap-fl-time">{clock(e.ts)}</span>
 							<span className="ap-fl-label" style={{ color: labelColor(e.label, e.level) }}>
 								{e.label}

@@ -18,13 +18,7 @@ export interface JsonFailure {
 export type JsonEnvelope<T> = JsonSuccess<T> | JsonFailure;
 
 /** Lifecycle state of an agent session. */
-export type SessionState =
-	| "booting"
-	| "working"
-	| "idle"
-	| "completed"
-	| "failed"
-	| "stopped";
+export type SessionState = "booting" | "working" | "idle" | "completed" | "failed" | "stopped";
 
 /** GET /api/overview */
 export interface Overview {

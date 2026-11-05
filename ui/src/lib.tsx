@@ -23,7 +23,9 @@ export function agentColor(name: string): string {
 export function clock(iso: string | null | undefined): string {
 	if (!iso) return "--:--:--";
 	const d = new Date(iso);
-	return Number.isNaN(d.getTime()) ? "--:--:--" : d.toLocaleTimeString(undefined, { hour12: false });
+	return Number.isNaN(d.getTime())
+		? "--:--:--"
+		: d.toLocaleTimeString(undefined, { hour12: false });
 }
 
 /** "x ago" relative time. */

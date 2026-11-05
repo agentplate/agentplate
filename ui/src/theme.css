@@ -795,6 +795,31 @@ table.grid tr:last-child td {
 .row-click:hover {
 	background: var(--bg-card-2);
 }
+/* A card rendered as a <button> (keyboard-focusable): reset native button chrome. */
+.card-button {
+	display: block;
+	width: 100%;
+	font: inherit;
+	color: inherit;
+	text-align: left;
+}
+/* An inline text button (e.g. the agent name in a table row). */
+.link-button {
+	background: none;
+	border: none;
+	padding: 0;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+.link-button:hover {
+	text-decoration: underline;
+}
+.row-click:focus-visible,
+.link-button:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
 
 /* utility */
 .mono {

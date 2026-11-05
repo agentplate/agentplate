@@ -7,8 +7,8 @@
 import { useEffect, useState } from "react";
 import { getTasks } from "../api.ts";
 import { IconActive, IconCheck, IconTasks, PageIcon } from "../icons.tsx";
-import { Badge, Card, Stat, fmtAgo } from "../lib.tsx";
 import type { BadgeTone } from "../lib.tsx";
+import { Badge, Card, fmtAgo, Stat } from "../lib.tsx";
 import type { TaskItem } from "../types.ts";
 
 function statusTone(status: string): BadgeTone {
@@ -59,7 +59,12 @@ export function TasksScreen({ tasks, live }: { tasks: TaskItem[]; live: boolean 
 			</div>
 
 			<div className="stat-grid">
-				<Stat label="Total tasks" value={rows.length} icon={<IconTasks size={20} />} iconTone="violet" />
+				<Stat
+					label="Total tasks"
+					value={rows.length}
+					icon={<IconTasks size={20} />}
+					iconTone="violet"
+				/>
 				<Stat
 					label="Active"
 					value={active}

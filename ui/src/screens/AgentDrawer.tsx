@@ -3,11 +3,15 @@
 // Slides in from the right and shows the full per-agent picture, polled every
 // 5s while open: identity + session metadata, the mail it has sent and received
 // (its handoff conversation), recent events (tool calls / state changes), and
-// any child agents it spawned. Closes on backdrop click or the × button.
+// any child agents it spawned. Closes on Escape, backdrop click or the × button.
+//
+// Modal semantics: focus moves to the × button on open, Tab/Shift+Tab cycle
+// inside the panel, and focus returns to whatever opened the drawer on close.
 //
 // The new theme.css has no .drawer-* / .kv-* classes, so the drawer chrome is
 // inline-styled; content uses the shared <Card> + Badge / stateTone helpers.
 
+import { useEffect, useRef } from "react";
 import { getAgentDetail } from "../api.ts";
 import { agentColor, Badge, Card, clock, fmtAgo, stateTone } from "../lib.tsx";
 import type { AgentDetail, MailMessage } from "../types.ts";
@@ -71,15 +75,63 @@ const listReset: React.CSSProperties = {
 	gap: 10,
 };
 
-export function AgentDrawer({
-	name,
-	onClose,
-}: {
-	name: string;
-	onClose: () => void;
-}): JSX.Element {
+export function AgentDrawer({ name, onClose }: { name: string; onClose: () => void }): JSX.Element {
 	const { data, error } = usePolling<AgentDetail>(() => getAgentDetail(name), 5000);
 	const s = data?.session ?? null;
+	const panelRef = useRef<HTMLElement>(null);
+	const closeRef = useRef<HTMLButtonElement>(null);
+	const onCloseRef = useRef(onClose);
+	useEffect(() => {
+		onCloseRef.current = onClose;
+	}, [onClose]);
+
+	// Focus in on open, restore on close.
+	useEffect(() => {
+		const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		closeRef.current?.focus();
+		return () => previous?.focus();
+	}, []);
+
+	// Escape closes; Tab is trapped inside the panel. Window-level so it works
+	// wherever focus is, but yields to an overlay above (the ⌘K palette handles
+	// its own Escape and calls preventDefault).
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			if (e.defaultPrevented) return;
+			if (e.key === "Escape") {
+				e.preventDefault();
+				onCloseRef.current();
+				return;
+			}
+			if (e.key !== "Tab") return;
+			const panel = panelRef.current;
+			if (!panel) return;
+			const active = document.activeElement;
+			// The ⌘K palette sits above the drawer and owns focus while open.
+			if (active?.closest(".cmdk")) return;
+			const inPanel = active !== null && panel.contains(active);
+			const focusable = Array.from(
+				panel.querySelectorAll<HTMLElement>(
+					'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+				),
+			).filter((el) => !el.hasAttribute("disabled"));
+			const first = focusable[0];
+			const last = focusable[focusable.length - 1];
+			if (!first || !last) return;
+			if (!inPanel) {
+				e.preventDefault();
+				first.focus();
+			} else if (e.shiftKey && active === first) {
+				e.preventDefault();
+				last.focus();
+			} else if (!e.shiftKey && active === last) {
+				e.preventDefault();
+				first.focus();
+			}
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, []);
 
 	// Merge inbox + sent into one time-ordered conversation for the handoff view.
 	const conversation = [
@@ -88,8 +140,11 @@ export function AgentDrawer({
 	].sort((a, b) => (a.m.createdAt < b.m.createdAt ? 1 : -1));
 
 	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: backdrop click is a mouse-only convenience; keyboard users close with Escape or the focused × button.
 		<div
-			onClick={onClose}
+			onClick={(e) => {
+				if (e.target === e.currentTarget) onClose();
+			}}
 			role="presentation"
 			style={{
 				position: "fixed",
@@ -101,8 +156,9 @@ export function AgentDrawer({
 			}}
 		>
 			<aside
-				onClick={(e) => e.stopPropagation()}
+				ref={panelRef}
 				role="dialog"
+				aria-modal="true"
 				aria-label={`Agent ${name}`}
 				style={{
 					width: "min(560px, 100%)",
@@ -137,7 +193,13 @@ export function AgentDrawer({
 							{s ? s.capability : "agent"} · refreshes every 5s
 						</div>
 					</div>
-					<button type="button" className="btn" onClick={onClose} aria-label="Close">
+					<button
+						ref={closeRef}
+						type="button"
+						className="btn"
+						onClick={onClose}
+						aria-label="Close agent details"
+					>
 						×
 					</button>
 				</div>
@@ -173,10 +235,7 @@ export function AgentDrawer({
 								<Field label="Depth" value={String(s.depth)} />
 								<Field label="Branch" value={<span className="mono">{s.branchName || "—"}</span>} />
 								<Field label="PID" value={s.pid != null ? String(s.pid) : "—"} />
-								<Field
-									label="Worktree"
-									value={<span className="mono">{s.worktreePath}</span>}
-								/>
+								<Field label="Worktree" value={<span className="mono">{s.worktreePath}</span>} />
 								<Field label="Started" value={clock(s.startedAt)} />
 								<Field
 									label="Last activity"
@@ -205,7 +264,10 @@ export function AgentDrawer({
 							<Card title="Spawned agents" meta={`${data.children.length}`}>
 								<ul style={listReset}>
 									{data.children.map((c) => (
-										<li key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+										<li
+											key={c.id}
+											style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+										>
 											<StateBadge state={c.state} />
 											<span className="mono" style={{ color: agentColor(c.agentName) }}>
 												{c.agentName}
@@ -225,7 +287,10 @@ export function AgentDrawer({
 							) : (
 								<ul style={listReset}>
 									{data.events.map((e) => (
-										<li key={e.id} style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+										<li
+											key={e.id}
+											style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}
+										>
 											<span className="dim" style={{ fontSize: 12 }}>
 												{fmtAgo(e.createdAt)}
 											</span>

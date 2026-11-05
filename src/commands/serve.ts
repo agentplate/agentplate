@@ -16,23 +16,34 @@ import { isLoopbackHost, startServer } from "../serve/server.ts";
 
 /**
  * The warning printed (to stderr, never suppressed) when binding off loopback:
- * the API has no authentication and can spawn agents that run with bypassed
- * permissions, so anyone who can reach the port can run code as this user.
+ * the API can spawn agents that run with bypassed permissions, so anyone holding
+ * the per-launch token who can reach the port can run code as this user — and
+ * the traffic (token included) is plain HTTP.
  */
 export function remoteBindWarning(host: string): string {
 	return [
 		`${accent("!")} WARNING: binding to ${host}, which is NOT a loopback address.`,
-		"  The agentplate API has no authentication. Anyone who can reach this port can",
-		"  read all agent state AND spawn agents that run commands on this machine.",
+		"  The API now requires the per-launch bearer token printed below, but it is sent",
+		"  over plain HTTP. Anyone who obtains it and can reach this port can read all",
+		"  agent state AND spawn agents that run commands on this machine.",
 		"  Only do this on a network you fully trust; prefer the default 127.0.0.1.",
 	].join("\n");
+}
+
+/** The browser URL that hands the SPA its token (it keeps it in sessionStorage). */
+export function tokenUrl(url: string, token: string | null): string {
+	return token === null ? url : `${url}/?token=${encodeURIComponent(token)}`;
 }
 
 export function createServeCommand(): Command {
 	return new Command("serve")
 		.description("Serve the web UI (HTTP + WebSocket) over the project's state")
 		.option("--port <n>", "port", "7551")
-		.option("--host <addr>", "bind host (non-loopback exposes an unauthenticated API)", "127.0.0.1")
+		.option(
+			"--host <addr>",
+			"bind host (non-loopback requires a per-launch bearer token)",
+			"127.0.0.1",
+		)
 		.option("--ui-dir <path>", "directory of the built SPA (default: bundled ui/dist)")
 		.option(
 			"--allow-origin <origin>",
@@ -68,11 +79,20 @@ export function createServeCommand(): Command {
 				});
 
 				if (useJson) {
-					jsonOutput({ url: handle.url, healthz: `${handle.url}/healthz`, uiDir });
+					jsonOutput({
+						url: handle.url,
+						healthz: `${handle.url}/healthz`,
+						uiDir,
+						token: handle.token,
+						open: tokenUrl(handle.url, handle.token),
+					});
 				} else {
-					printSuccess(`${brand("agentplate serve")} → ${handle.url}`);
+					printSuccess(`${brand("agentplate serve")} → ${tokenUrl(handle.url, handle.token)}`);
 					printInfo(`  REST:    ${handle.url}/api/overview`);
 					printInfo(`  health:  ${handle.url}/healthz`);
+					if (handle.token !== null) {
+						printInfo(`  token:   ${handle.token}  (send as "Authorization: Bearer <token>")`);
+					}
 					printHint("  Press Ctrl+C to stop.");
 				}
 

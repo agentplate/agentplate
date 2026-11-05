@@ -5,9 +5,9 @@
 // GET /api/deploy/targets and GET /api/deploy/history.
 
 import { getDeployHistory, getDeployTargets } from "../api.ts";
-import { Badge, Card, fmtAgo } from "../lib.tsx";
-import type { BadgeTone } from "../lib.tsx";
 import { IconArrowRight, IconCheck, IconDeploy, PageIcon } from "../icons.tsx";
+import type { BadgeTone } from "../lib.tsx";
+import { Badge, Card, fmtAgo } from "../lib.tsx";
 import type { DeployAuditRow, DeployTargetSummary } from "../types.ts";
 import { usePolling } from "../usePolling.ts";
 

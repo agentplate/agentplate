@@ -17,12 +17,18 @@
  *     a request with no Origin is a non-browser client and is allowed.
  *   - POST requires `content-type: application/json` (forces a CORS preflight the
  *     server never approves), a body under MAX_BODY_BYTES, and a JSON object.
+ *   - Bearer token on every /api/* and /ws request when bound off loopback (a
+ *     per-launch random token unless one is supplied). Sent as
+ *     `Authorization: Bearer <token>` or, where a browser can't set headers (the
+ *     /ws handshake, the first page load), a `?token=` query param. Loopback binds
+ *     stay token-free; /healthz and the static SPA are never gated.
  *
  * The WS broadcaster polls the stores on an interval and sends snapshots to all
  * connected clients — simple, store-agnostic, and good enough for a local
  * operator dashboard without a change-feed.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, normalize } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -65,12 +71,19 @@ export interface ServeOptions {
 	 * `http://localhost:5173`). The server's own loopback origins are always allowed.
 	 */
 	allowedOrigins?: readonly string[];
+	/**
+	 * Bearer token required on /api/* and /ws. Omitted → a random per-launch
+	 * token when `host` is not loopback, none on loopback. `null` → never require one.
+	 */
+	authToken?: string | null;
 }
 
 export interface ServeHandle {
 	server: Server<WsData>;
 	stop: () => void;
 	url: string;
+	/** The bearer token clients must present, or null when the API is token-free. */
+	token: string | null;
 }
 
 interface WsData {
@@ -185,6 +198,33 @@ function originAllowed(guard: RequestGuard, req: Request): boolean {
 	return guard.hosts === null && o === `http://${(req.headers.get("host") ?? "").toLowerCase()}`;
 }
 
+/** Resolve the effective bearer token for a bind (see {@link ServeOptions.authToken}). */
+export function resolveAuthToken(host: string, explicit: string | null | undefined): string | null {
+	if (explicit === null) return null;
+	if (explicit !== undefined) {
+		if (explicit.trim() === "") throw new ValidationError("authToken must not be empty.");
+		return explicit;
+	}
+	return isLoopbackHost(host) ? null : crypto.randomUUID();
+}
+
+/** Constant-time string compare (hash first so lengths always match). */
+function safeEqual(a: string, b: string): boolean {
+	const ha = createHash("sha256").update(a).digest();
+	const hb = createHash("sha256").update(b).digest();
+	return timingSafeEqual(ha, hb);
+}
+
+/** Does `req` carry the bearer token (Authorization header or `?token=` query)? */
+function tokenAllowed(token: string | null, req: Request, url: URL): boolean {
+	if (token === null) return true;
+	const auth = req.headers.get("authorization") ?? "";
+	const match = /^Bearer\s+(.+)$/i.exec(auth.trim());
+	if (match?.[1] !== undefined && safeEqual(match[1], token)) return true;
+	const q = url.searchParams.get("token");
+	return q !== null && safeEqual(q, token);
+}
+
 /** Parse a POST body: JSON content-type, valid JSON, and a plain object. */
 async function readJsonObject(req: Request): Promise<Record<string, unknown> | Response> {
 	const contentType = req.headers.get("content-type") ?? "";
@@ -262,6 +302,7 @@ export function startServer(opts: ServeOptions): ServeHandle {
 	const intervalMs = opts.wsIntervalMs ?? 5000;
 	// Validate extra origins up front (throws on garbage) rather than per request.
 	const extraOrigins = (opts.allowedOrigins ?? []).map(normalizeOrigin);
+	const token = resolveAuthToken(opts.host, opts.authToken);
 	// Built lazily from the real bound port (port 0 → OS-assigned).
 	let guard: RequestGuard | null = null;
 
@@ -281,6 +322,19 @@ export function startServer(opts: ServeOptions): ServeHandle {
 
 			if (pathname === "/healthz") {
 				return jsonResponse(jsonSuccess({ status: "ok", ts: new Date().toISOString() }));
+			}
+
+			if ((pathname === "/ws" || pathname.startsWith("/api/")) && !tokenAllowed(token, req, url)) {
+				return new Response(
+					`${JSON.stringify({ ok: false, error: { message: "unauthorized: missing or invalid bearer token" } })}\n`,
+					{
+						status: 401,
+						headers: {
+							"content-type": "application/json; charset=utf-8",
+							"www-authenticate": 'Bearer realm="agentplate"',
+						},
+					},
+				);
 			}
 
 			if (pathname === "/ws") {
@@ -397,6 +451,7 @@ export function startServer(opts: ServeOptions): ServeHandle {
 	return {
 		server,
 		url: `http://${formatHost(opts.host)}:${server.port}`,
+		token,
 		stop: () => {
 			clearInterval(timer);
 			if (reapTimer) clearInterval(reapTimer);

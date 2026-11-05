@@ -10,26 +10,24 @@
 // we ALSO poll the REST endpoints and apply them whenever the WS is not connected,
 // keeping agents/tasks/feed fresh instead of freezing on the last snapshot.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { connectWs, getAgents, getFeed, getOverview, getSystem, getTasks } from "./api.ts";
-import { fmtUptime } from "./lib.tsx";
-import { BrandMark, BrandSpark, IconSearch, NAV_ICON } from "./icons.tsx";
 import { CommandPalette } from "./CommandPalette.tsx";
+import { BrandMark, BrandSpark, IconSearch, NAV_ICON } from "./icons.tsx";
+import { fmtUptime } from "./lib.tsx";
 import { NotificationBell } from "./NotificationBell.tsx";
+import { AgentDrawer } from "./screens/AgentDrawer.tsx";
 import { AgentsScreen } from "./screens/Agents.tsx";
 import { ChatScreen } from "./screens/Chat.tsx";
-import { CostsScreen } from "./screens/Costs.tsx";
 import { DeployScreen } from "./screens/Deploy.tsx";
 import { FeedScreen } from "./screens/Feed.tsx";
 import { HandoffsScreen } from "./screens/Handoffs.tsx";
 import { MissionControl } from "./screens/MissionControl.tsx";
-import { OfficeScreen } from "./screens/Office.tsx";
 import { SessionsScreen } from "./screens/Sessions.tsx";
 import { SettingsScreen } from "./screens/Settings.tsx";
 import { SkillsScreen } from "./screens/Skills.tsx";
 import { SystemScreen } from "./screens/System.tsx";
 import { TasksScreen } from "./screens/Tasks.tsx";
-import { AgentDrawer } from "./screens/AgentDrawer.tsx";
 import type {
 	AgentSession,
 	FeedItem,
@@ -72,6 +70,16 @@ const NAV: { id: TabId; label: string }[] = [
 ];
 
 const EMPTY_COUNTS: StatusCounts = { idle: 0, working: 0, completed: 0, stalled: 0 };
+
+// Code-split the two heavy screens: Office pulls in three + @react-three/* and
+// Costs pulls in recharts — together ~95% of the bundle — but only 2 of 13 tabs
+// use them. Loaded on first visit to keep the initial chunk small.
+const OfficeScreen = lazy(() =>
+	import("./screens/Office.tsx").then((m) => ({ default: m.OfficeScreen })),
+);
+const CostsScreen = lazy(() =>
+	import("./screens/Costs.tsx").then((m) => ({ default: m.CostsScreen })),
+);
 
 /**
  * Derive status counts from the agent list (mirrors the server's buildStatusCounts):
@@ -227,7 +235,7 @@ export function App(): JSX.Element {
 	return (
 		<div className="os">
 			{/* Icon rail */}
-			<nav className="rail">
+			<nav className="rail" aria-label="Screens">
 				<div className="rail-logo" title="Agentplate">
 					<BrandSpark size={26} color="#fff" />
 				</div>
@@ -238,6 +246,7 @@ export function App(): JSX.Element {
 							key={n.id}
 							type="button"
 							className={`rail-item ${tab === n.id ? "active" : ""}`}
+							aria-current={tab === n.id ? "page" : undefined}
 							onClick={() => setTab(n.id)}
 						>
 							<span className="ri-icon">{Icon ? <Icon size={20} strokeWidth={2} /> : null}</span>
@@ -269,7 +278,9 @@ export function App(): JSX.Element {
 			</header>
 
 			{/* Active screen */}
-			<main className="main">{screen}</main>
+			<main className="main">
+				<Suspense fallback={<div className="empty">Loading…</div>}>{screen}</Suspense>
+			</main>
 
 			{/* Status bar */}
 			<footer className="statusbar">
@@ -303,7 +314,13 @@ export function App(): JSX.Element {
 			</footer>
 
 			{selectedAgent ? (
-				<AgentDrawer name={selectedAgent} onClose={() => setSelectedAgent(null)} />
+				// Keyed by agent so picking another agent (e.g. via ⌘K over the open
+				// drawer) remounts it: fresh polling state, no stale previous-agent data.
+				<AgentDrawer
+					key={selectedAgent}
+					name={selectedAgent}
+					onClose={() => setSelectedAgent(null)}
+				/>
 			) : null}
 
 			<CommandPalette
