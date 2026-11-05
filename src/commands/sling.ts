@@ -23,7 +23,7 @@ import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printHint, printInfo, printSuccess } from "../logging/color.ts";
-import { createMailClient } from "../mail/client.ts";
+import { createMailClient, resolveDispatchSender } from "../mail/client.ts";
 import {
 	assertSafeTaskId,
 	currentRunPath,
@@ -217,7 +217,7 @@ export function createSlingCommand(): Command {
 
 				// 4. Dispatch over mail (before the turn, so checkInject sees it).
 				mail.send({
-					from: opts.parent ?? "operator",
+					from: resolveDispatchSender(opts.parent),
 					to: name,
 					subject: `Dispatch: ${taskId}`,
 					body: dispatchBody(taskId, capability, overlayConfig, specBody),

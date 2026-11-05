@@ -88,6 +88,21 @@ export function resolveSender(
 	return agent;
 }
 
+/**
+ * Who a `sling` dispatch is sent from. Inside an agent's turn it is that agent,
+ * whatever `--parent` names (`--parent` only sets the hierarchy), so an agent
+ * can't hand a child a task "from" the operator or the coordinator. Outside a
+ * turn it is `--parent`, else the operator.
+ */
+export function resolveDispatchSender(
+	parent: string | undefined,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+	const agent = env[AGENT_IDENTITY_ENV]?.trim();
+	if (agent) return agent;
+	return parent?.trim() || OPERATOR_SENDER;
+}
+
 /** Optional filters when checking an inbox. */
 export interface CheckOptions {
 	/** Return only unread messages (default: all). */

@@ -13,6 +13,7 @@ import {
 	AGENT_IDENTITY_ENV,
 	createMailClient,
 	isMailType,
+	resolveDispatchSender,
 	resolveRecipients,
 	resolveSender,
 } from "./client.ts";
@@ -324,6 +325,20 @@ describe("resolveSender — mail is sent as the agent whose turn it is", () => {
 		for (const other of ["operator", "coordinator", "builder-b", "lead-1"]) {
 			expect(() => resolveSender(other, inTurn)).toThrow(ValidationError);
 		}
+	});
+});
+
+describe("resolveDispatchSender — sling dispatch is sent as the slinging agent", () => {
+	test("outside any turn it is --parent, else the operator", () => {
+		expect(resolveDispatchSender(undefined, {})).toBe("operator");
+		expect(resolveDispatchSender("lead-1", {})).toBe("lead-1");
+	});
+
+	test("inside a turn it is the agent itself, never operator/coordinator via --parent", () => {
+		const inTurn = { [AGENT_IDENTITY_ENV]: "builder-a" };
+		expect(resolveDispatchSender(undefined, inTurn)).toBe("builder-a");
+		expect(resolveDispatchSender("operator", inTurn)).toBe("builder-a");
+		expect(resolveDispatchSender("coordinator", inTurn)).toBe("builder-a");
 	});
 });
 

@@ -26,7 +26,7 @@ import {
 	printSuccess,
 	printWarning,
 } from "../logging/color.ts";
-import { AGENT_IDENTITY_ENV, createMailClient } from "../mail/client.ts";
+import { AGENT_IDENTITY_ENV, createMailClient, resolveSender } from "../mail/client.ts";
 import { currentRunPath, sessionsDbPath } from "../paths.ts";
 import { getRuntime } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
@@ -290,13 +290,16 @@ function sendCommand(): Command {
 		.description("Send a message to the coordinator")
 		.argument("<body>", "message body")
 		.requiredOption("--subject <text>", "subject")
-		.option("--from <name>", "sender", "operator")
-		.action((body: string, opts: { subject: string; from: string }) => {
+		.option("--from <name>", "sender (default: this agent inside its turn, else operator)")
+		.action((body: string, opts: { subject: string; from?: string }) => {
 			const root = requireInit();
+			// Same attribution rule as `mail send`: inside an agent's turn the mail is
+			// sent as that agent, so only the operator's own shell can speak as "operator".
+			const from = resolveSender(opts.from);
 			const mail = createMailClient(root);
 			try {
 				mail.send({
-					from: opts.from,
+					from,
 					to: COORDINATOR_NAME,
 					subject: opts.subject,
 					body,
