@@ -73,7 +73,7 @@ on first visit, so the initial chunk stays small. Preview the build locally with
 
 The UI is linted and formatted by the repo-root Biome config (`biome check .`).
 Pure modules (`urls.ts`, `ws.ts`, `fpsKeys.ts`, `keys.ts`) have colocated
-`*.test.ts` files, which run under the root `bun test`.
+`*.test.ts` files, which run with `bun test` from `ui/` (they need `ui/node_modules`; CI runs them in the `ui` job).
 
 ## Serving under a sub-path
 

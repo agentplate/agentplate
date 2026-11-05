@@ -2,4 +2,6 @@
 exact = false
 
 [test]
-# Colocated *.test.ts files are discovered automatically.
+# Colocated *.test.ts files are discovered automatically. Only under src/:
+# the ui/ tests need ui/node_modules, so they run from ui/ (`cd ui && bun test`).
+root = "src"
