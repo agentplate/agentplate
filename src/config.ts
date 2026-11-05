@@ -63,6 +63,7 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 		distill: {
 			onlyOnGatesPass: true,
 			model: null,
+			timeoutSeconds: 300,
 		},
 		prune: {
 			quarantineBelow: 0.25,

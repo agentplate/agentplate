@@ -46,11 +46,29 @@ export interface DirectSpawnOpts {
 	instructionPath: string;
 	/** Resume a prior turn's session (omit for the first turn). */
 	resumeSessionId?: string;
-	/** Extra env vars (merged over process.env by the caller). */
+	/** Extra env vars (merged over the allowlisted parent env by the caller). */
 	env?: Record<string, string>;
-	/** Initial user-turn text (the prompt for this turn). */
+	/**
+	 * Initial user-turn text (the prompt for this turn). A runtime whose
+	 * {@link AgentRuntime.promptInput} is `"stdin"` leaves it OUT of argv — the
+	 * caller writes it to the child's stdin instead.
+	 */
 	prompt?: string;
 }
+
+/**
+ * How a runtime's CLI receives the prompt of a headless turn
+ * ({@link AgentRuntime.buildDirectSpawn}) and of a one-shot call
+ * ({@link AgentRuntime.buildPrintCommand}):
+ *
+ * - `"stdin"` — the argv carries NO prompt; the caller writes it to the
+ *   child's stdin. A prompt of any size works: one argv element is capped at
+ *   128 KiB on Linux (`E2BIG`) and a Windows `.cmd` shim's whole command line at
+ *   8191 chars, and a turn prompt is all of an agent's unread mail.
+ * - `"argv"` — the prompt is an argv element (a CLI with no stdin prompt
+ *   mode); the child's stdin is closed.
+ */
+export type PromptInput = "stdin" | "argv";
 
 /** Options for an attended (foreground, stdio-inherited) interactive session. */
 export interface InteractiveSpawnOpts {
@@ -73,6 +91,17 @@ export interface AgentRuntime {
 	/** Relative path where the overlay instructions are written in the worktree. */
 	readonly instructionPath: string;
 
+	/** How the turn / one-shot prompt reaches the CLI (default `"argv"`). */
+	readonly promptInput?: PromptInput;
+
+	/**
+	 * Parent env vars this runtime's CLI needs beyond the base allowlist (its own
+	 * config dir, login and feature flags), as exact names or `PREFIX_*`
+	 * patterns. Agent-facing children never inherit the whole parent env — see
+	 * `agentChildEnv` in `src/utils/child-process.ts`.
+	 */
+	readonly envPassthrough?: readonly string[];
+
 	/** Build argv for a single headless turn (run via Bun.spawn). */
 	buildDirectSpawn(opts: DirectSpawnOpts): string[];
 
@@ -86,7 +115,11 @@ export interface AgentRuntime {
 	/** Build provider env vars (API keys, base URLs) for the resolved model. */
 	buildEnv(model: ResolvedModel): Record<string, string>;
 
-	/** Build argv for a one-shot non-interactive call (used by AI merge/distill later). */
+	/**
+	 * Build argv for a one-shot non-interactive call (used by the skill
+	 * distiller). A `promptInput: "stdin"` runtime leaves `prompt` out of argv;
+	 * the caller pipes it on stdin.
+	 */
 	buildPrintCommand(prompt: string, model?: string): string[];
 
 	/** Parse a headless stdout byte stream into normalized events. */

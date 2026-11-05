@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import type { EventStore } from "../events/store.ts";
 import { runQualityGates } from "../insights/quality-gates.ts";
 import { sanitize } from "../logging/sanitizer.ts";
-import type { MailClient } from "../mail/client.ts";
+import { formatInjection, type MailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
 import { maybeAutoMerge } from "../merge/auto.ts";
 import { mailDbPath, manifestFilePath } from "../paths.ts";
@@ -93,6 +93,8 @@ export interface DriveTurnCtx {
 	prompt: string;
 	/** Prior runtime session id to resume — omit on the first turn (warm start). */
 	resumeSessionId?: string;
+	/** Called right after the runtime child spawns (not when the spawn fails). */
+	onSpawn?: () => void;
 }
 
 export interface DriveTurnResult {
@@ -143,6 +145,7 @@ export async function driveTurn(ctx: DriveTurnCtx): Promise<DriveTurnResult> {
 				// Recorded so the reaper can tell a live (if quiet) turn from a dead one.
 				pid = childPid;
 				store.setPid(sessionId, childPid);
+				ctx.onSpawn?.();
 			},
 			onEvent: (event) => {
 				if (event.error || event.type === "error") sawError = true;
@@ -325,11 +328,13 @@ export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnR
 	const model = resolveModel(config, root, def.model, session.capability);
 
 	// The turn's user text is the agent's unread mail (a child's reply / operator
-	// direction); fall back to a continue nudge. checkInject marks it read.
-	const injected = ctx.mail.checkInject(session.agentName);
+	// direction); fall back to a continue nudge. The mail is marked read only once
+	// the runtime has spawned: a turn that fails to start leaves it unread for the
+	// next attempt instead of silently consuming it.
+	const unread = ctx.mail.check(session.agentName, { unreadOnly: true });
 	const prompt =
-		injected.trim().length > 0
-			? injected
+		unread.length > 0
+			? formatInjection(unread)
 			: "Continue your task. If it is complete, send your terminal mail.";
 
 	return driveTurn({
@@ -343,5 +348,8 @@ export async function driveAgentTurn(ctx: DriveAgentTurnCtx): Promise<DriveTurnR
 		model,
 		prompt,
 		resumeSessionId: session.runtimeSessionId ?? undefined,
+		onSpawn: () => {
+			for (const message of unread) ctx.mail.markRead(message.id);
+		},
 	});
 }

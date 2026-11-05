@@ -62,6 +62,12 @@ export interface SkillsConfig {
 		onlyOnGatesPass: boolean;
 		/** Model override for the distiller (null = runtime default). */
 		model: string | null;
+		/**
+		 * Wall-clock cap on the one-shot distiller model call, in seconds; past it
+		 * the call is killed and distillation is skipped. Default 300; `0`
+		 * disables the cap.
+		 */
+		timeoutSeconds?: number;
 	};
 	/** Auto-pruning thresholds. */
 	prune: {
@@ -90,6 +96,11 @@ export interface QualityGate {
 	name: string;
 	command: string;
 	description?: string;
+	/**
+	 * Wall-clock cap in minutes; past it the gate's whole process tree is killed
+	 * and the gate fails. Default 30; `0` disables the cap.
+	 */
+	timeoutMinutes?: number;
 }
 
 /** Which coding-agent runtime drives workers, and per-capability overrides. */
@@ -253,6 +264,13 @@ export interface ResolvedModel {
 	model: string;
 	/** Provider env vars to inject into the spawned process. */
 	env?: Record<string, string>;
+	/**
+	 * Name of the `env` entry holding the provider's credential (its
+	 * `authTokenEnv`), set only when that credential was resolved. Lets a runtime
+	 * re-present it under the variable its CLI reads (e.g. claude maps a gateway's
+	 * `OPENROUTER_API_KEY` to `ANTHROPIC_AUTH_TOKEN`).
+	 */
+	authTokenEnv?: string;
 	/**
 	 * Provider gateway base URL; runtimes that support endpoint override map it
 	 * to their CLI's env var.

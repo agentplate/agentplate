@@ -40,6 +40,16 @@ export class CursorRuntime implements AgentRuntime {
 	readonly instructionPath = "AGENTS.md";
 
 	/**
+	 * The prompt stays an argv element: `cursor-agent` has no validated stdin
+	 * prompt mode. A prompt past the OS argv limit therefore fails to spawn
+	 * (`E2BIG`); the turn is then recorded as failed with its mail left unread.
+	 */
+	readonly promptInput = "argv" as const;
+
+	/** Cursor's own settings (`CURSOR_API_KEY` for an API-key login, …). */
+	readonly envPassthrough = ["CURSOR_*"] as const;
+
+	/**
 	 * Build argv for one headless streaming turn (`cursor-agent -p`).
 	 *
 	 * Flag choices:

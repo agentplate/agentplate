@@ -162,6 +162,10 @@ export async function runSkillFeedbackAndDistill(
 					appliedSlugs,
 					model,
 					resolvedModel,
+					timeoutMs:
+						args.skills.distill.timeoutSeconds !== undefined
+							? args.skills.distill.timeoutSeconds * 1000
+							: undefined,
 				});
 			}
 		}

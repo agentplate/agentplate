@@ -30,6 +30,7 @@
 
 import type { AgentRuntime } from "../runtimes/types.ts";
 import type { ResolvedModel } from "../types.ts";
+import { agentChildEnv, armKillTimer } from "../utils/child-process.ts";
 import { resolveArgv } from "../utils/detect.ts";
 import { sanitizeSkillDraft } from "./safety.ts";
 import { type createSkillStore, isValidSlug } from "./store.ts";
@@ -75,10 +76,16 @@ export interface DistillSkillArgs {
 	/**
 	 * Resolved provider model whose env (API key, base URL, auth mode) the
 	 * one-shot call runs with — passed through `runtime.buildEnv` and merged over
-	 * `process.env` so a configured gateway/local provider is honored instead of
-	 * whatever credentials happen to be in the inherited environment.
+	 * the allowlisted parent env so a configured gateway/local provider is
+	 * honored instead of whatever credentials happen to be in the shell.
 	 */
 	resolvedModel: ResolvedModel;
+	/**
+	 * Wall-clock cap on the model call in ms (default
+	 * {@link DEFAULT_DISTILL_TIMEOUT_MS}; `0` disables it). A call killed at the
+	 * cap is a skip.
+	 */
+	timeoutMs?: number;
 }
 
 /** Result of a distillation attempt. */
@@ -90,6 +97,9 @@ export interface DistillResult {
 
 /** Max characters of diff embedded in the prompt — a huge diff is truncated. */
 const MAX_DIFF_CHARS = 24_000;
+
+/** Default cap on the one-shot distiller model call (`skills.distill.timeoutSeconds`). */
+export const DEFAULT_DISTILL_TIMEOUT_MS = 300_000;
 
 // ---------------------------------------------------------------------------
 // Prompt construction (pure)
@@ -362,7 +372,9 @@ async function readSpecText(root: string, taskId: string | null): Promise<string
  *  3. Resolve the applied skills the store still knows about (dropping any that
  *     have since been removed) so the model can choose to UPDATE one.
  *  4. Render the prompt and make a single one-shot model call via the runtime's
- *     `buildPrintCommand` (spawned with the resolved provider env), capturing stdout.
+ *     `buildPrintCommand` (spawned with the resolved provider env over the
+ *     allowlisted parent env, the prompt on stdin), capturing stdout. A call
+ *     that fails to spawn, exits non-zero, or outlives its time cap is skipped.
  *  5. Parse the output. A null parse or an explicit `skip` action → skipped. An
  *     `update` whose `targetSlug` is not a valid slug, or is not one of the
  *     skills applied (and still present) this session, is also skipped: the
@@ -404,14 +416,27 @@ export async function distillSkill(args: DistillSkillArgs): Promise<DistillResul
 	try {
 		const proc = Bun.spawn(resolveArgv(runtime.buildPrintCommand(prompt, model)), {
 			cwd: worktreePath,
-			// Provider env (API key / base URL) merged over the inherited env — a
-			// bare process.env would silently call the operator's default provider.
-			env: { ...process.env, ...runtime.buildEnv(resolvedModel) },
+			// Provider env (API key / base URL) merged over the ALLOWLISTED parent
+			// env: the provider's credential is what the call needs, and a bare
+			// process.env would both call the operator's default provider and hand
+			// the CLI every deploy secret in the shell.
+			env: agentChildEnv(runtime.buildEnv(resolvedModel), {
+				passthrough: runtime.envPassthrough,
+			}),
+			// The prompt embeds the spec, digest and diff — pipe it on stdin when
+			// the runtime reads it there, so its size is not bounded by argv limits.
+			stdin: runtime.promptInput === "stdin" ? new Blob([prompt]) : "ignore",
 			stdout: "pipe",
-			stderr: "pipe",
+			stderr: "ignore",
 		});
+		// A stalled model call (network, an auth prompt) must not hold session-end
+		// forever: past the cap it is killed and the distillation skipped.
+		const killTimer = armKillTimer(proc, args.timeoutMs ?? DEFAULT_DISTILL_TIMEOUT_MS);
 		stdout = await new Response(proc.stdout).text();
-		await proc.exited;
+		const exitCode = await proc.exited;
+		killTimer.clear();
+		// A failed or killed CLI run is not a draft, whatever it printed.
+		if (exitCode !== 0 || killTimer.timedOut) return { action: "skipped" };
 	} catch {
 		// The model CLI failed to spawn/run — degrade to a skip rather than crash.
 		return { action: "skipped" };

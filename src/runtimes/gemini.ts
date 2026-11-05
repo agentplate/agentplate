@@ -7,8 +7,9 @@
  * the provider layer injects no key and Gemini uses that login; an `api-key`/`env`
  * provider flows `GEMINI_API_KEY` through {@link GeminiRuntime.buildEnv}.
  *
- * A headless turn is `gemini -p … --output-format stream-json`, whose stdout is a
- * stream of JSONL events (`init` / `message` / `result`); {@link parseEvents}
+ * A headless turn is `gemini --output-format stream-json` with the prompt piped
+ * on stdin (Gemini reads piped stdin as the prompt), whose stdout is a stream of
+ * JSONL events (`init` / `message` / `result`); {@link parseEvents}
  * normalizes them. `--yolo` auto-approves tool actions, and `--skip-trust` is
  * REQUIRED: in an untrusted folder (e.g. a fresh worktree) Gemini silently
  * downgrades the approval mode to "default" and then deadlocks/aborts a headless
@@ -31,10 +32,23 @@ export class GeminiRuntime implements AgentRuntime {
 	/** Gemini reads `GEMINI.md` from the working directory at startup. */
 	readonly instructionPath = "GEMINI.md";
 
+	/** Gemini reads piped stdin as the prompt and runs non-interactively. */
+	readonly promptInput = "stdin" as const;
+
+	/** Gemini's own settings and the non-secret Vertex selectors. */
+	readonly envPassthrough = [
+		"GEMINI_*",
+		"GOOGLE_CLOUD_PROJECT",
+		"GOOGLE_CLOUD_LOCATION",
+		"GOOGLE_GENAI_USE_VERTEXAI",
+	] as const;
+
 	/**
-	 * Build argv for a single headless turn (`gemini -p … -o stream-json`).
+	 * Build argv for a single headless turn (`gemini -o stream-json`).
 	 *
-	 * `--prompt <text>` runs non-interactively and exits. `--model` pins the model;
+	 * The prompt is NOT in argv: with stdin piped Gemini reads it from there and
+	 * runs non-interactively, then exits; the caller writes it
+	 * ({@link promptInput}). `--model` pins the model;
 	 * `--output-format stream-json` emits the per-event JSONL {@link parseEvents}
 	 * consumes. `--yolo` auto-approves tools and `--skip-trust` keeps that mode in
 	 * an untrusted worktree (without it Gemini reverts to prompting and the headless
@@ -49,8 +63,6 @@ export class GeminiRuntime implements AgentRuntime {
 			opts.model,
 			"--output-format",
 			"stream-json",
-			"--prompt",
-			opts.prompt ?? "",
 		];
 	}
 
@@ -78,13 +90,12 @@ export class GeminiRuntime implements AgentRuntime {
 		return { ...(model.env ?? {}) };
 	}
 
-	/** Build argv for a one-shot, non-streaming call (`gemini -p -o text`). */
-	buildPrintCommand(prompt: string, model?: string): string[] {
+	/** Build argv for a one-shot, non-streaming call (`gemini -o text`, prompt on stdin). */
+	buildPrintCommand(_prompt: string, model?: string): string[] {
 		const argv = ["gemini", "--skip-trust", "--output-format", "text"];
 		if (model !== undefined) {
 			argv.push("--model", model);
 		}
-		argv.push("--prompt", prompt);
 		return argv;
 	}
 

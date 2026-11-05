@@ -163,6 +163,67 @@ describe("resolveModel — non-loopback credential warning", () => {
 		expect(warnings).toEqual([]);
 	});
 
+	test("warns in subscription mode: the CLI's own login goes to the endpoint", () => {
+		const cfg = configWithProvider({
+			type: "gateway",
+			authMode: "subscription",
+			baseUrl: "https://attacker.example/v1",
+			model: "m",
+		});
+		const warnings: string[] = [];
+		resolveModel(cfg, ROOT, "alias", undefined, (msg) => warnings.push(msg));
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("will be sent to non-local endpoint https://attacker.example/v1");
+	});
+
+	test("warns when the secret is unset: the runtime falls back to its own login", () => {
+		const cfg = configWithProvider({
+			type: "gateway",
+			authMode: "api-key",
+			authTokenEnv: TOKEN_ENV, // deliberately not set anywhere
+			baseUrl: "https://gw.example.com",
+			model: "m",
+		});
+		const warnings: string[] = [];
+		const resolved = resolveModel(cfg, ROOT, "alias", undefined, (msg) => warnings.push(msg));
+		expect(resolved.env).toEqual({});
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(`${TOKEN_ENV} is unset`);
+		expect(warnings[0]).toContain("non-local endpoint https://gw.example.com");
+	});
+
+	test("no warning for a login going to its own vendor (catalog default endpoints)", () => {
+		const warnings: string[] = [];
+		const collect = (msg: string) => warnings.push(msg);
+		// `codex login` → OpenAI, Claude login → Anthropic, loopback → this machine.
+		for (const baseUrl of [
+			"https://api.openai.com/v1",
+			"https://api.anthropic.com",
+			"http://localhost:4000",
+		]) {
+			const cfg = configWithProvider({
+				type: "gateway",
+				authMode: "subscription",
+				baseUrl,
+				model: "m",
+			});
+			resolveModel(cfg, ROOT, "alias", undefined, collect);
+		}
+		expect(warnings).toEqual([]);
+	});
+
+	test("authTokenEnv is carried on the resolved model only when the credential resolved", () => {
+		const cfg = configWithProvider({
+			type: "gateway",
+			authMode: "env",
+			authTokenEnv: TOKEN_ENV,
+			model: "m",
+		});
+		expect(resolveModel(cfg, ROOT, "alias").authTokenEnv).toBeUndefined();
+		process.env[TOKEN_ENV] = "tok";
+		expect(resolveModel(cfg, ROOT, "alias").authTokenEnv).toBe(TOKEN_ENV);
+	});
+
 	test("isLoopbackBaseUrl recognizes loopback hosts and fails safe on junk", () => {
 		expect(isLoopbackBaseUrl("http://localhost:11434/v1")).toBe(true);
 		expect(isLoopbackBaseUrl("http://127.0.0.1:8080")).toBe(true);

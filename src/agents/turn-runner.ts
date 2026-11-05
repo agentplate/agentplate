@@ -10,6 +10,7 @@
 
 import type { AgentEvent, AgentRuntime } from "../runtimes/types.ts";
 import type { AuthMode } from "../types.ts";
+import { agentChildEnv, armKillTimer } from "../utils/child-process.ts";
 import { resolveArgv } from "../utils/detect.ts";
 
 export interface RunTurnOptions {
@@ -18,9 +19,15 @@ export interface RunTurnOptions {
 	worktreePath: string;
 	/** Concrete model id. */
 	model: string;
-	/** The user-turn text (dispatch/mail/nudge). */
+	/**
+	 * The user-turn text (dispatch/mail/nudge). Written to the child's stdin for a
+	 * `promptInput: "stdin"` runtime, so its size is not bounded by argv limits.
+	 */
 	prompt: string;
-	/** Provider env vars (merged over process.env for the child). */
+	/**
+	 * Provider env vars, merged over the ALLOWLISTED parent env (see
+	 * `agentChildEnv`) — the child never inherits all of process.env.
+	 */
 	env?: Record<string, string>;
 	/** Provider gateway base URL (runtimes map it to their CLI's env var). */
 	baseUrl?: string;
@@ -67,25 +74,23 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 		baseUrl: opts.baseUrl,
 		authMode: opts.authMode,
 	});
+	// The prompt goes on stdin when the runtime reads it there: one argv element
+	// is capped at 128 KiB on Linux, and a turn prompt is all of an agent's unread
+	// mail. The env is allowlisted — agents never see deploy secrets that happen
+	// to be exported in the operator's shell or CI job.
 	const proc = Bun.spawn(resolveArgv(argv), {
 		cwd: opts.worktreePath,
-		env: { ...process.env, ...runtimeEnv },
+		env: agentChildEnv(runtimeEnv, { passthrough: opts.runtime.envPassthrough }),
 		stdout: "pipe",
 		stderr: "pipe",
-		stdin: "ignore",
+		stdin: opts.runtime.promptInput === "stdin" ? new Blob([opts.prompt]) : "ignore",
 	});
 
 	// Hard wall-clock cap: kill a turn that runs past the limit even if it keeps
-	// streaming (idle reaping only catches inactivity). Closing the child's pipes
-	// ends the drain/parse loops below, so the turn resolves with a non-zero exit.
-	let timedOut = false;
-	const timer =
-		opts.timeoutMs && opts.timeoutMs > 0
-			? setTimeout(() => {
-					timedOut = true;
-					proc.kill(); // SIGTERM
-				}, opts.timeoutMs)
-			: null;
+	// streaming (idle reaping only catches inactivity) — SIGTERM, then SIGKILL if
+	// it ignores that. Closing the child's pipes ends the drain/parse loops below,
+	// so the turn resolves with a non-zero exit.
+	const killTimer = armKillTimer(proc, opts.timeoutMs);
 	opts.onSpawn?.(proc.pid);
 
 	// Read stderr concurrently so a full pipe buffer can't deadlock the child.
@@ -104,6 +109,6 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 
 	const stderr = await stderrPromise;
 	const exitCode = await proc.exited;
-	if (timer) clearTimeout(timer);
-	return { exitCode, runtimeSessionId, stderr, timedOut };
+	killTimer.clear();
+	return { exitCode, runtimeSessionId, stderr, timedOut: killTimer.timedOut };
 }

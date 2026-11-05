@@ -175,7 +175,7 @@ function normalizeAgent(agent: string): string {
  *
  *   2. From: bob | ...
  */
-function formatInjection(messages: MailMessage[]): string {
+export function formatInjection(messages: MailMessage[]): string {
 	const header = `You have ${messages.length} new message(s):`;
 	const entries = messages.map((m, index) => {
 		const meta = `${index + 1}. From: ${m.from} | Subject: ${m.subject} | Type: ${m.type}`;

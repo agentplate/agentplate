@@ -17,7 +17,7 @@ import { MockRuntime } from "../runtimes/mock.ts";
 import type { AgentEvent, DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore, type SessionStore } from "../sessions/store.ts";
 import type { AgentplateConfig, AgentSession, ResolvedModel } from "../types.ts";
-import { driveTurn } from "./drive.ts";
+import { driveAgentTurn, driveTurn } from "./drive.ts";
 
 /** Mock runtime that records the spawn opts (so we can assert the resume id). */
 class SpyRuntime extends MockRuntime {
@@ -365,5 +365,49 @@ describe("driveTurn — secret redaction in recorded errors", () => {
 			true,
 		);
 		expect(details.some((d) => d.includes(KEY))).toBe(false);
+	});
+});
+
+describe("driveAgentTurn — injected mail", () => {
+	function mockCfg(): AgentplateConfig {
+		const c = cfg();
+		c.runtime.default = "mock";
+		c.skills.enabled = false;
+		return c;
+	}
+
+	function sendToBuilder(body: string): void {
+		mail.send({ from: "lead-1", to: "builder-1", subject: "logs", body, type: "status" });
+	}
+
+	test("a turn that fails to spawn leaves its mail unread (not silently consumed)", async () => {
+		// A vanished worktree makes Bun.spawn throw before the runtime ever runs.
+		const session = makeSession({ worktreePath: join(root, "worktree-gone") });
+		store.upsertSession(session);
+		sendToBuilder("build log: 3 failures");
+
+		await expect(
+			driveAgentTurn({ root, config: mockCfg(), session, store, events, mail }),
+		).rejects.toThrow();
+
+		expect(mail.check("builder-1", { unreadOnly: true })).toHaveLength(1);
+		expect(store.getSession(session.id)?.state).toBe("failed");
+	});
+
+	test("a spawned turn receives all of its (large) mail on stdin, which is then marked read", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		const promptFile = join(worktree, "prompt.txt");
+		process.env.AGENTPLATE_MOCK_CMD = `cat > '${promptFile}'`;
+		// Several long logs: together well past Linux's 128 KiB single-argv cap.
+		for (let i = 0; i < 4; i++) sendToBuilder(`log ${i}\n${"x".repeat(50_000)}`);
+
+		const out = await driveAgentTurn({ root, config: mockCfg(), session, store, events, mail });
+
+		expect(out.finalState).toBe("idle");
+		const prompt = readFileSync(promptFile, "utf8");
+		expect(prompt).toStartWith("You have 4 new message(s):");
+		expect(prompt.length).toBeGreaterThan(200_000);
+		expect(mail.check("builder-1", { unreadOnly: true })).toHaveLength(0);
 	});
 });

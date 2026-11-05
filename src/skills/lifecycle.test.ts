@@ -6,8 +6,8 @@
  * `resolveModel`, with a FAKE runtime whose `buildPrintCommand` is a bash probe
  * that records which env vars the one-shot distill subprocess actually saw.
  * This pins the FIX-402 invariant: the distiller's model call runs with the
- * ACTIVE PROVIDER's env (API key, base URL) merged over process.env — never the
- * bare inherited environment.
+ * ACTIVE PROVIDER's env (API key, base URL) merged over the allowlisted parent
+ * env — never the bare inherited environment.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -146,6 +146,41 @@ describe("runSkillFeedbackAndDistill", () => {
 		expect(readFileSync(probeFile, "utf8")).toBe("key-from-secrets-file|http://localhost:9999/v1");
 		// The distiller's own model selection is preserved (distill override wins).
 		expect(printModel).toBe("distill-override-model");
+	});
+
+	test("skills.distill.timeoutSeconds caps the distill model call", async () => {
+		const baseRef = await setupProject(dir);
+		const runtime: AgentRuntime = {
+			id: "fake-hang",
+			stability: "experimental",
+			instructionPath: "CLAUDE.md",
+			buildDirectSpawn(_opts: DirectSpawnOpts): string[] {
+				return ["true"];
+			},
+			buildEnv(model: ResolvedModel): Record<string, string> {
+				return { ...(model.env ?? {}) };
+			},
+			buildPrintCommand(): string[] {
+				return ["sleep", "30"]; // a model call stalled on the network
+			},
+		};
+		const skills = makeSkillsConfig();
+		skills.distill.timeoutSeconds = 0.2;
+
+		const started = performance.now();
+		const result = await runSkillFeedbackAndDistill({
+			root: dir,
+			agentName: "builder-x",
+			capability: "builder",
+			taskId: "task-1",
+			worktreePath: dir,
+			baseRef,
+			runtime,
+			outcomeStatus: "success",
+			skills,
+		});
+		expect(result.distill.action).toBe("skipped");
+		expect(performance.now() - started).toBeLessThan(4000);
 	});
 
 	test("does not spawn the distill call when gates failed", async () => {

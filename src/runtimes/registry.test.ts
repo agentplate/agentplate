@@ -61,7 +61,6 @@ describe("ClaudeRuntime", () => {
 		expect(argv).toEqual([
 			"claude",
 			"-p",
-			"do the thing",
 			"--output-format",
 			"stream-json",
 			"--verbose",
@@ -131,11 +130,14 @@ describe("ClaudeRuntime", () => {
 		expect(argv).not.toContain("--resume");
 	});
 
-	test("buildDirectSpawn defaults a missing prompt to empty string", () => {
-		const argv = runtime.buildDirectSpawn(spawnOpts());
-		// `-p` must always be followed by a string argument (here "").
+	test("the prompt is read from stdin, never placed in argv (no E2BIG on big mail)", () => {
+		expect(runtime.promptInput).toBe("stdin");
+		const big = "m".repeat(200_000);
+		const argv = runtime.buildDirectSpawn(spawnOpts({ prompt: big }));
 		expect(argv[1]).toBe("-p");
-		expect(argv[2]).toBe("");
+		expect(argv).not.toContain(big);
+		expect(argv).toEqual(runtime.buildDirectSpawn(spawnOpts()));
+		expect(runtime.buildPrintCommand(big)).not.toContain(big);
 	});
 
 	test("buildInteractiveSpawn builds an attended session (no -p, default perms)", () => {
@@ -176,17 +178,10 @@ describe("ClaudeRuntime", () => {
 	});
 
 	test("buildPrintCommand emits text output and appends model only when given", () => {
-		expect(runtime.buildPrintCommand("hi")).toEqual([
-			"claude",
-			"-p",
-			"hi",
-			"--output-format",
-			"text",
-		]);
+		expect(runtime.buildPrintCommand("hi")).toEqual(["claude", "-p", "--output-format", "text"]);
 		expect(runtime.buildPrintCommand("hi", "opus")).toEqual([
 			"claude",
 			"-p",
-			"hi",
 			"--output-format",
 			"text",
 			"--model",
@@ -255,11 +250,13 @@ describe("ClaudeRuntime", () => {
 			baseUrl: "http://gw.example.com/v1",
 			authMode: "api-key",
 		});
+		// The configured key is forwarded; a shell-exported bearer token is pinned
+		// to "" (unset to the CLI) rather than sent to the gateway — never a dummy.
 		expect(withKey).toEqual({
 			ANTHROPIC_API_KEY: "sk-real",
 			ANTHROPIC_BASE_URL: "http://gw.example.com",
+			ANTHROPIC_AUTH_TOKEN: "",
 		});
-		expect(withKey.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
 		expect(withKey.ANTHROPIC_SMALL_FAST_MODEL).toBeUndefined();
 
 		const withToken = runtime.buildEnv({
@@ -279,15 +276,19 @@ describe("ClaudeRuntime", () => {
 
 	test("buildEnv with subscription auth + baseUrl (proxy) keeps the CLI login intact", () => {
 		// A Pro/Max login proxied through a gateway: the endpoint moves and no dummy
-		// bearer is injected (that would break the OAuth session). A shell-exported
-		// ANTHROPIC_API_KEY is pinned to "" (treated as unset by the CLI) so it is
-		// never sent to the non-Anthropic proxy host.
+		// bearer is injected (that would break the OAuth session). Shell-exported
+		// ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN are pinned to "" (treated as unset
+		// by the CLI) so they are never sent to the non-Anthropic proxy host.
 		const env = runtime.buildEnv({
 			model: "claude-opus-4-8",
 			baseUrl: "https://proxy.example.com",
 			authMode: "subscription",
 		});
-		expect(env).toEqual({ ANTHROPIC_BASE_URL: "https://proxy.example.com", ANTHROPIC_API_KEY: "" });
+		expect(env).toEqual({
+			ANTHROPIC_BASE_URL: "https://proxy.example.com",
+			ANTHROPIC_API_KEY: "",
+			ANTHROPIC_AUTH_TOKEN: "",
+		});
 	});
 
 	test("buildEnv without baseUrl is byte-identical to the legacy behavior", () => {
@@ -502,14 +503,16 @@ describe("OpenCodeRuntime", () => {
 		expect(runtime.stability).toBe("beta");
 	});
 
-	test("buildDirectSpawn: positional message + json; permissions handled via env, not a flag", () => {
+	test("buildDirectSpawn: message on stdin + json; permissions handled via env, not a flag", () => {
 		const argv = runtime.buildDirectSpawn(
 			spawnOpts({ prompt: "do it", model: "openrouter/gpt-4o" }),
 		);
 		expect(argv.slice(0, 2)).toEqual(["opencode", "run"]);
-		// The `run` subcommand takes the message as a positional (no --prompt flag).
+		// `run` appends piped stdin to its message: the prompt is neither a
+		// positional nor a (nonexistent) --prompt flag, so its size is unbounded.
+		expect(runtime.promptInput).toBe("stdin");
 		expect(argv).not.toContain("--prompt");
-		expect(argv[argv.length - 1]).toBe("do it");
+		expect(argv).not.toContain("do it");
 		expect(argv).toContain("--model");
 		expect(argv).toContain("openrouter/gpt-4o"); // provider-qualified, passes through
 		expect(argv).toContain("--format");
@@ -556,14 +559,14 @@ describe("OpenCodeRuntime", () => {
 		expect(argv[i + 1]).toBe("opencode/minimax-m3-free");
 	});
 
-	test("buildDirectSpawn adds --session on resume and keeps the message last", () => {
+	test("buildDirectSpawn adds --session on resume (message still on stdin)", () => {
 		const argv = runtime.buildDirectSpawn(
 			spawnOpts({ prompt: "go on", resumeSessionId: "sess-1" }),
 		);
 		const idx = argv.indexOf("--session");
 		expect(idx).toBeGreaterThan(-1);
 		expect(argv[idx + 1]).toBe("sess-1");
-		expect(argv[argv.length - 1]).toBe("go on");
+		expect(argv).not.toContain("go on");
 	});
 
 	test("buildInteractiveSpawn seeds via top-level --prompt and never adds the run-only perm flag", () => {
@@ -589,7 +592,7 @@ describe("OpenCodeRuntime", () => {
 		expect(argv).toEqual(["opencode", "--model", "openrouter/m"]);
 	});
 
-	test("buildPrintCommand emits text format with the prompt as a positional", () => {
+	test("buildPrintCommand emits text format with the prompt on stdin", () => {
 		expect(runtime.buildPrintCommand("hi", "openrouter/gpt-4o")).toEqual([
 			"opencode",
 			"run",
@@ -597,9 +600,8 @@ describe("OpenCodeRuntime", () => {
 			"text",
 			"--model",
 			"openrouter/gpt-4o",
-			"hi",
 		]);
-		expect(runtime.buildPrintCommand("hi")).toEqual(["opencode", "run", "--format", "text", "hi"]);
+		expect(runtime.buildPrintCommand("hi")).toEqual(["opencode", "run", "--format", "text"]);
 	});
 
 	test("parseEvents captures sessionID and passes event types through", async () => {
@@ -660,7 +662,10 @@ describe("CodexRuntime", () => {
 		expect(argv).toContain("--model");
 		expect(argv).toContain("gpt-5-codex");
 		expect(argv).toContain("--dangerously-bypass-approvals-and-sandbox");
-		expect(argv[argv.length - 1]).toBe("do it"); // prompt is the trailing positional
+		// The trailing positional `-` makes codex read the prompt from stdin.
+		expect(runtime.promptInput).toBe("stdin");
+		expect(argv[argv.length - 1]).toBe("-");
+		expect(argv).not.toContain("do it");
 		expect(argv).not.toContain("resume"); // no resume on the first turn
 	});
 
@@ -670,7 +675,8 @@ describe("CodexRuntime", () => {
 		);
 		expect(argv.slice(0, 4)).toEqual(["codex", "exec", "resume", "uuid-1"]);
 		expect(argv).toContain("--json");
-		expect(argv[argv.length - 1]).toBe("go on");
+		expect(argv[argv.length - 1]).toBe("-"); // resume also reads stdin
+		expect(argv).not.toContain("go on");
 	});
 
 	test("buildDirectSpawn treats an empty resumeSessionId as no resume", () => {
@@ -694,12 +700,13 @@ describe("CodexRuntime", () => {
 			"codex",
 			"exec",
 			"--dangerously-bypass-approvals-and-sandbox",
-			"hi",
+			"-",
 		]);
 		const withModel = runtime.buildPrintCommand("hi", "gpt-5-codex");
 		expect(withModel).toContain("--model");
 		expect(withModel).toContain("gpt-5-codex");
-		expect(withModel[withModel.length - 1]).toBe("hi");
+		expect(withModel[withModel.length - 1]).toBe("-");
+		expect(withModel).not.toContain("hi");
 	});
 
 	test("buildEnv copies provider env and is a fresh object", () => {
@@ -804,8 +811,10 @@ describe("GeminiRuntime", () => {
 		expect(argv).toContain("gemini-2.5-pro");
 		expect(argv).toContain("--output-format");
 		expect(argv).toContain("stream-json");
-		expect(argv).toContain("--prompt");
-		expect(argv[argv.length - 1]).toBe("do it");
+		// Gemini reads piped stdin as the prompt — nothing of it is in argv.
+		expect(runtime.promptInput).toBe("stdin");
+		expect(argv).not.toContain("--prompt");
+		expect(argv).not.toContain("do it");
 	});
 
 	test("buildDirectSpawn ignores resumeSessionId (Gemini resume is index-based)", () => {
@@ -831,14 +840,12 @@ describe("GeminiRuntime", () => {
 		expect(safe).not.toContain("--yolo"); // --safe keeps in-TUI approval
 	});
 
-	test("buildPrintCommand emits a text --prompt call with --skip-trust", () => {
+	test("buildPrintCommand emits a text call with --skip-trust (prompt on stdin)", () => {
 		expect(runtime.buildPrintCommand("hi")).toEqual([
 			"gemini",
 			"--skip-trust",
 			"--output-format",
 			"text",
-			"--prompt",
-			"hi",
 		]);
 		const withModel = runtime.buildPrintCommand("hi", "gemini-2.5-flash");
 		expect(withModel).toContain("--model");
@@ -905,6 +912,8 @@ describe("CursorRuntime", () => {
 
 	test("buildDirectSpawn invokes the `cursor-agent` binary with stream-json + --force", () => {
 		const argv = runtime.buildDirectSpawn(spawnOpts({ prompt: "do it", model: "gpt-5" }));
+		// cursor-agent has no validated stdin prompt mode: the prompt stays in argv.
+		expect(runtime.promptInput).toBe("argv");
 		expect(argv.slice(0, 3)).toEqual(["cursor-agent", "-p", "do it"]);
 		expect(argv).toContain("--output-format");
 		expect(argv).toContain("stream-json");
