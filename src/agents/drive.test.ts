@@ -12,7 +12,7 @@ import { AGENTPLATE_DIR, CONFIG_FILE, DEFAULT_CONFIG, serializeConfig } from "..
 import { ValidationError } from "../errors.ts";
 import { createEventStore, type EventStore } from "../events/store.ts";
 import { createMailClient, type MailClient } from "../mail/client.ts";
-import { eventsDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
+import { appliedSkillsPath, eventsDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { claudeRuntime } from "../runtimes/claude.ts";
 import { MockRuntime } from "../runtimes/mock.ts";
 import type { AgentEvent, DirectSpawnOpts } from "../runtimes/types.ts";
@@ -335,8 +335,9 @@ describe("driveTurn — best-effort post-turn steps fail visibly", () => {
 		const session = makeSession();
 		store.upsertSession(session);
 		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
-		// A skills index that can't be opened makes the feedback/distill step throw.
-		mkdirSync(join(root, AGENTPLATE_DIR, "skills.db"));
+		// An applied-skills record that is a directory makes the feedback step throw
+		// (it cannot be removed as a file).
+		mkdirSync(appliedSkillsPath(root, session.agentName), { recursive: true });
 		const config = cfg();
 		config.skills.enabled = true;
 		config.agents.skipGates = true;
