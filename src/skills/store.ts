@@ -1,18 +1,22 @@
 /**
- * Skill store — the source of truth plus a derived FTS index.
+ * Skill store — the on-disk source of truth for the skill library.
  *
  * A skill lives on disk as a directory `<root>/.agentplate/skills/<slug>/` holding:
  *   - `skill.md`     — YAML frontmatter (every {@link Skill} field except `body`)
  *                       + a blank line + the markdown body. This is authoritative.
  *   - `outcomes.jsonl` — append-only log of {@link SkillOutcome}s, one JSON per line.
  *
- * A gitignored SQLite FTS5 index (`<root>/.agentplate/skills.db`) accelerates
- * retrieval and is fully rebuildable from the `skill.md` files via {@link reindex}.
+ * There is no index: retrieval and `skill search` score every skill read from
+ * these files. (An FTS5 index used to be written to `skills.db` on every change,
+ * but nothing ever queried it, and it could not see skill files that arrive by
+ * merge or hand edit.)
  *
  * Derived fields (`confidence`, `appliedCount`, `successCount`, `lastOutcome`)
- * ARE persisted into the frontmatter for cheap reads, but are always recomputed
- * from `outcomes.jsonl` whenever an outcome is appended — they are never trusted
- * as hand-edited input. An update that rewrites a skill's content appends an
+ * are written into the frontmatter so a reader of `skill.md` sees them, but
+ * they are never trusted as input: every read recomputes them from
+ * `outcomes.jsonl`. A skill file committed by hand or on a worker branch
+ * therefore cannot claim a track record it has not earned in its outcome log.
+ * An update that rewrites a skill's content appends an
  * epoch marker to the log, so the new text starts with no earned confidence
  * (outcomes recorded against the old text stay on disk but no longer count).
  * The recompute is INLINED here (a weighted-count +
@@ -20,11 +24,9 @@
  * keep the store free of a cross-dependency on a module built in parallel.
  *
  * Storage style mirrors the rest of Agentplate: js-yaml for human-editable YAML
- * (as in config.ts / secrets.ts / identity.ts), bun:sqlite via openDatabase for
- * the WAL-mode index, and crypto.randomUUID for ids.
+ * (as in config.ts / secrets.ts / identity.ts) and crypto.randomUUID for ids.
  */
 
-import type { Database } from "bun:sqlite";
 import {
 	appendFileSync,
 	existsSync,
@@ -37,7 +39,6 @@ import {
 import { join } from "node:path";
 import yaml from "js-yaml";
 import { AGENTPLATE_DIR } from "../config.ts";
-import { openDatabase } from "../db/sqlite.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { accent, isQuiet } from "../logging/color.ts";
 import type { OutcomeStatus } from "../types.ts";
@@ -47,8 +48,6 @@ import type { Skill, SkillDraft, SkillOutcome, SkillProvenance, SkillStatus } fr
 const SKILL_FILE = "skill.md";
 /** Name of the per-skill append-only outcome log. */
 const OUTCOMES_FILE = "outcomes.jsonl";
-/** Name of the derived (gitignored) FTS index. */
-const INDEX_FILE = "skills.db";
 
 /**
  * Canonical frontmatter key order. Serialization walks this list so `skill.md`
@@ -135,7 +134,7 @@ function toProvenance(value: unknown): SkillProvenance | undefined {
 
 /** Narrow an unknown to a {@link SkillStatus}, defaulting to `"active"`. */
 function toStatus(value: unknown): SkillStatus {
-	return value === "deprecated" || value === "quarantined" ? value : "active";
+	return value === "draft" || value === "deprecated" || value === "quarantined" ? value : "active";
 }
 
 /** Narrow an unknown to an {@link OutcomeStatus} or `null`. */
@@ -355,6 +354,13 @@ export interface SkillStoreOptions {
 	 * mode), so `--json` output on stdout stays parseable.
 	 */
 	onWarning?: (message: string) => void;
+	/**
+	 * Hold writes for operator review (`skills.requireReview`). When true,
+	 * {@link SkillStore.upsert} creates new skills as `draft`, and an update to
+	 * an `active` skill moves it back to `draft`. Drafts are not retrieved until
+	 * `agentplate skill approve <slug>` makes them active. Default false.
+	 */
+	requireReview?: boolean;
 }
 
 /** Default {@link SkillStoreOptions.onWarning}: a warning line on stderr. */
@@ -382,47 +388,27 @@ export interface SkillStore {
 	setStatus(slug: string, status: SkillStatus): void;
 	appendOutcome(slug: string, outcome: SkillOutcome): Skill;
 	remove(slug: string): void;
-	reindex(): number;
+	/**
+	 * Release the store. The store holds no open handles (it reads and writes
+	 * plain files), so this is a no-op kept for callers' `try/finally` pattern.
+	 */
 	close(): void;
-}
-
-/** FTS row shape as stored in the derived index. */
-interface IndexRow {
-	slug: string;
-	title: string;
-	goal: string;
-	tags: string;
-	when_to_use: string;
-	file_patterns: string;
-	status: string;
-	confidence: number;
-	updated_at: string;
 }
 
 /**
  * Create a skill store rooted at a project directory.
  *
- * `<root>/.agentplate/skills/` holds one directory per skill; `<root>/.agentplate/
- * skills.db` is the derived FTS index (created on open, rebuildable via
- * {@link SkillStore.reindex}). The skills directory is created lazily on first
- * write so opening a store on a fresh project is side-effect free beyond the
- * (gitignored) index file.
+ * `<root>/.agentplate/skills/` holds one directory per skill. It is created
+ * lazily on first write, so opening a store has no side effects.
  *
  * Every slug is checked against {@link SLUG_RE} before it becomes a path:
  * `get` returns null for an invalid slug, and the mutating methods throw a
  * `ValidationError`.
  */
 export function createSkillStore(root: string, opts: SkillStoreOptions = {}): SkillStore {
-	const agentplateDir = join(root, AGENTPLATE_DIR);
-	const skillsDir = join(agentplateDir, "skills");
-	const indexPath = join(agentplateDir, INDEX_FILE);
+	const skillsDir = join(root, AGENTPLATE_DIR, "skills");
 	const warn = opts.onWarning ?? warnOnStderr;
-
-	// The index lives under .agentplate/, which must exist before SQLite can create
-	// the file. Creating it here is safe and idempotent.
-	mkdirSync(agentplateDir, { recursive: true });
-	const db: Database = openDatabase(indexPath);
-	initIndex(db);
+	const requireReview = opts.requireReview === true;
 
 	/**
 	 * Absolute path to a skill's directory. Throws a `ValidationError` for an
@@ -447,6 +433,10 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 	/**
 	 * Read + parse a skill by slug, or null if its `skill.md` is absent. A file
 	 * that does not parse throws a `ValidationError` naming the file.
+	 *
+	 * The derived fields are recomputed from `outcomes.jsonl` rather than taken
+	 * from the frontmatter, so a hand-written or committed `confidence: 1`
+	 * counts for nothing without outcomes to back it.
 	 */
 	function read(slug: string): Skill | null {
 		const file = skillFileOf(slug);
@@ -461,11 +451,11 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 		// The directory name is authoritative for the slug — trust it over a stale
 		// frontmatter value (e.g. if a directory was renamed by hand).
 		skill.slug = slug;
-		return skill;
+		return { ...skill, ...deriveStats(readOutcomes(slug)) };
 	}
 
 	/**
-	 * Write a skill's `skill.md` (creating its directory) and refresh the index row.
+	 * Write a skill's `skill.md` (creating its directory).
 	 *
 	 * The body is normalized in place to exactly the form that lands on disk
 	 * (trailing whitespace trimmed by {@link serializeSkillMd}). Mutating the
@@ -477,7 +467,6 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 		skill.body = skill.body.replace(/\s+$/, "");
 		mkdirSync(dirOf(skill.slug), { recursive: true });
 		writeFileSync(skillFileOf(skill.slug), serializeSkillMd(skill), "utf8");
-		upsertIndexRow(db, skill);
 	}
 
 	/**
@@ -590,6 +579,9 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 
 			const updated: Skill = {
 				...existing,
+				// Under review, a rewritten active skill leaves retrieval until it is
+				// approved again. Retired skills (deprecated/quarantined) keep their status.
+				status: requireReview && existing.status === "active" ? "draft" : existing.status,
 				title: draft.title ?? existing.title,
 				goal: draft.goal ?? existing.goal,
 				whenToUse: draft.whenToUse ?? existing.whenToUse,
@@ -616,7 +608,7 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 			slug,
 			title: draft.title,
 			version: 1,
-			status: "active",
+			status: requireReview ? "draft" : "active",
 			goal: draft.goal ?? "",
 			whenToUse: draft.whenToUse ?? [],
 			filePatterns: draft.filePatterns ?? [],
@@ -679,26 +671,13 @@ export function createSkillStore(root: string, opts: SkillStoreOptions = {}): Sk
 		if (existsSync(dir)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
-		db.query("DELETE FROM skills_fts WHERE slug = $slug").run({ $slug: slug });
-	}
-
-	function reindex(): number {
-		// Rebuild the FTS table from scratch so deletions/renames on disk are
-		// reflected and the index can't drift from the source of truth.
-		db.exec("DELETE FROM skills_fts");
-		let count = 0;
-		for (const skill of list()) {
-			upsertIndexRow(db, skill);
-			count++;
-		}
-		return count;
 	}
 
 	function close(): void {
-		db.close();
+		// Nothing to release: the store keeps no open handles.
 	}
 
-	return { list, get, upsert, setStatus, appendOutcome, remove, reindex, close };
+	return { list, get, upsert, setStatus, appendOutcome, remove, close };
 }
 
 // ---------------------------------------------------------------------------
@@ -758,63 +737,4 @@ function coerceOutcome(value: unknown): SkillOutcome | null {
 	};
 	if (typeof obj.note === "string") outcome.note = obj.note;
 	return outcome;
-}
-
-// ---------------------------------------------------------------------------
-// FTS index
-// ---------------------------------------------------------------------------
-
-/**
- * Create the FTS5 virtual table if it is absent. `slug` is stored UNINDEXED so
- * it round-trips exactly (it is a row key, not a search term); the remaining
- * text columns are full-text searchable. `confidence`/`updated_at` ride along as
- * unindexed columns so retrieval can rank/filter without a second table.
- */
-function initIndex(db: Database): void {
-	db.exec(`
-		CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
-			slug UNINDEXED,
-			title,
-			goal,
-			tags,
-			when_to_use,
-			file_patterns,
-			status UNINDEXED,
-			confidence UNINDEXED,
-			updated_at UNINDEXED
-		)
-	`);
-}
-
-/** Replace (delete + insert) a skill's row in the FTS index. */
-function upsertIndexRow(db: Database, skill: Skill): void {
-	// FTS5 has no UPSERT; delete the prior row (if any) then insert the current.
-	db.query("DELETE FROM skills_fts WHERE slug = $slug").run({ $slug: skill.slug });
-	const row: IndexRow = {
-		slug: skill.slug,
-		title: skill.title,
-		goal: skill.goal,
-		tags: skill.tags.join(" "),
-		when_to_use: skill.whenToUse.join(" "),
-		file_patterns: skill.filePatterns.join(" "),
-		status: skill.status,
-		confidence: skill.confidence,
-		updated_at: skill.updatedAt,
-	};
-	db.query(
-		`INSERT INTO skills_fts
-			(slug, title, goal, tags, when_to_use, file_patterns, status, confidence, updated_at)
-		VALUES
-			($slug, $title, $goal, $tags, $when_to_use, $file_patterns, $status, $confidence, $updated_at)`,
-	).run({
-		$slug: row.slug,
-		$title: row.title,
-		$goal: row.goal,
-		$tags: row.tags,
-		$when_to_use: row.when_to_use,
-		$file_patterns: row.file_patterns,
-		$status: row.status,
-		$confidence: row.confidence,
-		$updated_at: row.updated_at,
-	});
 }

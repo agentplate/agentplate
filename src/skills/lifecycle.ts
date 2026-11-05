@@ -111,7 +111,8 @@ export async function runSkillFeedbackAndDistill(
 	};
 	if (!args.skills.enabled) return result;
 
-	const store = createSkillStore(args.root);
+	// Under skills.requireReview the distiller's writes land as drafts.
+	const store = createSkillStore(args.root, { requireReview: args.skills.requireReview === true });
 	try {
 		// 1. Feedback: append the session outcome to every applied skill. Capture
 		//    the applied slugs first (the record file is removed afterward, but the

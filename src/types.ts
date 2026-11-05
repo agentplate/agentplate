@@ -49,6 +49,13 @@ export interface DeployTargetConfig {
 export interface SkillsConfig {
 	/** Master switch for retrieval + distillation. */
 	enabled: boolean;
+	/**
+	 * When true, skills the distiller (or `skill record`) writes are stored as
+	 * `draft` and are not injected into overlays until an operator runs
+	 * `agentplate skill approve <slug>`. Default false. Optional so hand-built
+	 * configs stay valid; `loadConfig` always fills it in.
+	 */
+	requireReview?: boolean;
 	/** Retrieval budget + count caps. */
 	retrieval: {
 		/** Max characters of skills injected into an overlay. */

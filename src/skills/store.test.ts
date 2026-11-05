@@ -1,9 +1,9 @@
 /**
  * Skill store tests.
  *
- * Real implementations throughout: a real temp `.agentplate/` tree on disk and the
- * real bun:sqlite FTS index (no mocks). Each test gets a fresh temp root so
- * directory-per-skill state never leaks between cases.
+ * Real implementations throughout: a real temp `.agentplate/` tree on disk (no
+ * mocks). Each test gets a fresh temp root so directory-per-skill state never
+ * leaks between cases.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -405,7 +405,6 @@ describe("createSkillStore", () => {
 
 		expect(store.list().map((s) => s.slug)).toEqual(["good-skill"]);
 		expect(store.list({ status: "active" }).map((s) => s.slug)).toEqual(["good-skill"]);
-		expect(store.reindex()).toBe(1);
 
 		// One warning per bad entry per list() call, each naming the entry.
 		warnings.length = 0;
@@ -526,35 +525,185 @@ describe("createSkillStore", () => {
 		expect(() => store.remove("never-existed")).not.toThrow();
 	});
 
-	test("reindex returns the number of skills indexed", () => {
-		store.upsert(createDraft({ title: "One" }), PROVENANCE);
-		store.upsert(createDraft({ title: "Two" }), PROVENANCE);
-		store.upsert(createDraft({ title: "Three" }), PROVENANCE);
-
-		expect(store.reindex()).toBe(3);
-
-		// After removing one, a rebuild reflects the new count.
-		store.remove("two");
-		expect(store.reindex()).toBe(2);
-	});
-
-	test("reindex on an empty store returns 0", () => {
-		expect(store.reindex()).toBe(0);
-	});
-
-	test("a reindexed store survives reopen (index is rebuildable from files)", () => {
-		store.upsert(createDraft({ title: "Persistent Skill" }), PROVENANCE);
-		store.close();
-
-		// Reopen against the same root and rebuild from the on-disk skill.md files.
-		const reopened = createSkillStore(root);
+	test("opening a store writes nothing (no index database)", () => {
+		const fresh = mkdtempSync(join(tmpdir(), "agentplate-skill-store-noindex-"));
 		try {
-			expect(reopened.reindex()).toBe(1);
-			expect(reopened.get("persistent-skill")?.title).toBe("Persistent Skill");
+			const opened = createSkillStore(fresh);
+			expect(opened.list()).toEqual([]);
+			opened.close();
+			// No skills.db and no .agentplate/ until something is actually written.
+			expect(existsSync(join(fresh, AGENTPLATE_DIR))).toBe(false);
+
+			const writer = createSkillStore(fresh);
+			writer.upsert(createDraft({ title: "First" }), PROVENANCE);
+			writer.close();
+			expect(existsSync(join(fresh, AGENTPLATE_DIR, "skills", "first", "skill.md"))).toBe(true);
+			expect(existsSync(join(fresh, AGENTPLATE_DIR, "skills.db"))).toBe(false);
 		} finally {
-			reopened.close();
-			// Re-point the outer store so afterEach's close() is harmless.
-			store = createSkillStore(root);
+			rmSync(fresh, { recursive: true, force: true });
+		}
+	});
+
+	test("a skill file that arrives on disk (e.g. by merge) is seen without any rebuild", () => {
+		const { skill } = store.upsert(createDraft({ title: "Template" }), PROVENANCE);
+		const copy = { ...skill, slug: "merged-in", title: "Merged In" };
+		const dir = join(root, AGENTPLATE_DIR, "skills", "merged-in");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "skill.md"), serializeSkillMd(copy), "utf8");
+
+		expect(store.get("merged-in")?.title).toBe("Merged In");
+		expect(store.list().map((s) => s.slug)).toContain("merged-in");
+	});
+});
+
+/** Write a skill.md by hand, as a commit on a worker branch would. */
+function plantSkill(root: string, slug: string, fields: Partial<Skill>): string {
+	const skill: Skill = {
+		id: crypto.randomUUID(),
+		slug,
+		title: "Planted Skill",
+		version: 1,
+		status: "active",
+		goal: "",
+		whenToUse: [],
+		filePatterns: [],
+		tags: [],
+		created: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		relatesTo: [],
+		supersedes: [],
+		body: "## Steps\n\n1. Do it",
+		confidence: 0,
+		appliedCount: 0,
+		successCount: 0,
+		lastOutcome: null,
+		...fields,
+	};
+	const dir = join(root, AGENTPLATE_DIR, "skills", slug);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "skill.md"), serializeSkillMd(skill), "utf8");
+	return dir;
+}
+
+describe("derived fields are never trusted from the frontmatter", () => {
+	let root: string;
+	let store: SkillStore;
+
+	beforeEach(() => {
+		root = mkdtempSync(join(tmpdir(), "agentplate-skill-derived-"));
+		store = createSkillStore(root);
+	});
+
+	afterEach(() => {
+		store.close();
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("a hand-written track record with no outcomes reads back as unproven", () => {
+		plantSkill(root, "forged", {
+			confidence: 1,
+			appliedCount: 99,
+			successCount: 99,
+			lastOutcome: "success",
+		});
+
+		for (const skill of [store.get("forged"), store.list()[0]]) {
+			expect(skill?.slug).toBe("forged");
+			expect(skill?.confidence).toBe(0);
+			expect(skill?.appliedCount).toBe(0);
+			expect(skill?.successCount).toBe(0);
+			expect(skill?.lastOutcome).toBeNull();
+		}
+	});
+
+	test("the stats come from outcomes.jsonl, whatever the frontmatter claims", () => {
+		const dir = plantSkill(root, "half-true", {
+			confidence: 0.99,
+			appliedCount: 50,
+			successCount: 50,
+			lastOutcome: "success",
+		});
+		writeFileSync(
+			join(dir, "outcomes.jsonl"),
+			`${JSON.stringify(outcome("failure"))}\n${JSON.stringify(outcome("success"))}\n`,
+			"utf8",
+		);
+
+		const skill = store.get("half-true");
+		expect(skill?.appliedCount).toBe(2);
+		expect(skill?.successCount).toBe(1);
+		expect(skill?.lastOutcome).toBe("success");
+		expect(skill?.confidence).toBeLessThan(0.5);
+	});
+
+	test("a status change rewrites the cached stats from the outcome log", () => {
+		plantSkill(root, "forged", { confidence: 1, appliedCount: 99, successCount: 99 });
+		store.setStatus("forged", "deprecated");
+
+		const md = readFileSync(join(root, AGENTPLATE_DIR, "skills", "forged", "skill.md"), "utf8");
+		expect(md).toContain("confidence: 0");
+		expect(md).toContain("appliedCount: 0");
+		expect(md).not.toContain("appliedCount: 99");
+	});
+});
+
+describe("requireReview: writes are held as drafts", () => {
+	let root: string;
+	let store: SkillStore;
+
+	beforeEach(() => {
+		root = mkdtempSync(join(tmpdir(), "agentplate-skill-review-"));
+		store = createSkillStore(root, { requireReview: true });
+	});
+
+	afterEach(() => {
+		store.close();
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("a new skill is created as a draft (and round-trips as one)", () => {
+		const { skill } = store.upsert(createDraft(), PROVENANCE);
+		expect(skill.status).toBe("draft");
+		expect(store.get(skill.slug)?.status).toBe("draft");
+		expect(store.list({ status: "active" })).toEqual([]);
+		expect(store.list({ status: "draft" }).map((s) => s.slug)).toEqual([skill.slug]);
+	});
+
+	test("updating an approved (active) skill sends it back to draft", () => {
+		const { skill } = store.upsert(createDraft(), PROVENANCE);
+		store.setStatus(skill.slug, "active");
+
+		const { skill: updated } = store.upsert(
+			{ action: "update", targetSlug: skill.slug, body: "## Steps\n\n1. Something new" },
+			PROVENANCE,
+		);
+		expect(updated.status).toBe("draft");
+		expect(store.get(skill.slug)?.status).toBe("draft");
+	});
+
+	test("updating a retired skill keeps it retired", () => {
+		const { skill } = store.upsert(createDraft(), PROVENANCE);
+		store.setStatus(skill.slug, "quarantined");
+
+		const { skill: updated } = store.upsert(
+			{ action: "update", targetSlug: skill.slug, tags: ["x"] },
+			PROVENANCE,
+		);
+		expect(updated.status).toBe("quarantined");
+	});
+
+	test("without requireReview, skills are created active and updates keep their status", () => {
+		const open = createSkillStore(root);
+		try {
+			const { skill } = open.upsert(createDraft({ title: "Open Skill" }), PROVENANCE);
+			expect(skill.status).toBe("active");
+			const { skill: updated } = open.upsert(
+				{ action: "update", targetSlug: skill.slug, body: "changed" },
+				PROVENANCE,
+			);
+			expect(updated.status).toBe("active");
+		} finally {
+			open.close();
 		}
 	});
 });

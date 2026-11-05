@@ -2,7 +2,7 @@
  * `agentplate skill` command tests.
  *
  * Real implementations throughout (no mocks): a real temp `.agentplate/` tree with a
- * real `config.yaml` so `loadConfig`/`isInitialized` work, and the real bun:sqlite
+ * real `config.yaml` so `loadConfig`/`isInitialized` work, and the real on-disk
  * skill store. The command actions resolve the project root via
  * `findProjectRoot()`, which honors `setProjectRootOverride`, so each test points
  * Agentplate at its own temp root and drives the exported action functions directly
@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,18 +22,20 @@ import {
 	setProjectRootOverride,
 } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
+import { selectSkills } from "../skills/retrieval.ts";
 import { createSkillStore, parseSkillMd, serializeSkillMd } from "../skills/store.ts";
 import type { Skill, SkillDraft } from "../skills/types.ts";
 import {
 	createSkillCommand,
 	parseDraft,
-	rankSkills,
+	runApprove,
 	runList,
 	runOutcome,
 	runPrune,
 	runRecord,
+	runReindex,
+	runSearch,
 	runSetStatus,
-	scoreSkill,
 } from "./skill.ts";
 
 // --- temp-root harness ----------------------------------------------------
@@ -108,6 +110,7 @@ describe("createSkillCommand", () => {
 		const names = command.commands.map((c) => c.name()).sort();
 		expect(names).toEqual(
 			[
+				"approve",
 				"deprecate",
 				"list",
 				"outcome",
@@ -119,6 +122,12 @@ describe("createSkillCommand", () => {
 				"show",
 			].sort(),
 		);
+	});
+
+	test("reindex is still accepted but hidden from help", () => {
+		const help = createSkillCommand().helpInformation();
+		expect(help).toContain("approve");
+		expect(help).not.toContain("reindex");
 	});
 });
 
@@ -394,22 +403,34 @@ describe("parseDraft", () => {
 	});
 });
 
-// --- pure helpers: scoreSkill / rankSkills --------------------------------
+// --- search: the same ranking agents get ----------------------------------
 
-/** Build a minimal Skill for ranking tests (only the fields the scorer reads). */
-function fakeSkill(overrides: Partial<Skill>): Skill {
-	return {
-		id: "id",
-		slug: "s",
-		title: "",
+/** Run `search --json` and return its rows. */
+async function searchJson(
+	query: string,
+	opts: { files?: string[]; capability?: string } = {},
+): Promise<Array<{ slug: string; score: number; status: string }>> {
+	const out = await captureStdout(() => runSearch(query, { ...opts, json: true }, true));
+	const env = JSON.parse(out.trim());
+	expect(env.ok).toBe(true);
+	return env.data;
+}
+
+/** Write a skill.md straight to disk (as a commit merged from a worker branch would). */
+function plantSkill(slug: string, fields: Partial<Skill>): void {
+	const now = new Date().toISOString();
+	const skill: Skill = {
+		id: crypto.randomUUID(),
+		slug,
+		title: "Planted",
 		version: 1,
 		status: "active",
 		goal: "",
 		whenToUse: [],
 		filePatterns: [],
 		tags: [],
-		created: "",
-		updatedAt: "",
+		created: now,
+		updatedAt: now,
 		relatesTo: [],
 		supersedes: [],
 		body: "",
@@ -417,42 +438,180 @@ function fakeSkill(overrides: Partial<Skill>): Skill {
 		appliedCount: 0,
 		successCount: 0,
 		lastOutcome: null,
-		...overrides,
+		...fields,
 	};
+	const dir = join(root, AGENTPLATE_DIR, "skills", slug);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "skill.md"), serializeSkillMd(skill), "utf8");
 }
 
-describe("scoreSkill / rankSkills", () => {
-	test("query-term overlap drives the score", () => {
-		const skill = fakeSkill({ title: "Add a CLI subcommand", goal: "Register on the program" });
-		const tokens = new Set(["cli", "subcommand"]);
-		expect(scoreSkill(skill, tokens, [])).toBeGreaterThan(0);
-		expect(scoreSkill(skill, new Set(["unrelated"]), [])).toBeCloseTo(0, 5);
+describe("search", () => {
+	test("scores and orders skills exactly as agent retrieval does", async () => {
+		seed({ title: "Add a CLI Subcommand", filePatterns: ["src/commands/*.ts"] });
+		// A bare (wildcard-free) pattern is a substring match in retrieval.
+		seed({ title: "Command Wiring Notes", filePatterns: ["src/commands"], tags: [] });
+		seed({ title: "Unrelated Database Migration", filePatterns: ["db/**"], tags: ["sql"] });
+
+		const query = "add a cli subcommand";
+		const files = ["src/commands/foo.ts"];
+		const rows = await searchJson(query, { files, capability: "builder" });
+
+		const store = createSkillStore(root);
+		let expected: Array<{ slug: string; score: number }>;
+		try {
+			const result = selectSkills(store.list(), {
+				taskText: query,
+				capability: "builder",
+				fileScope: files,
+			});
+			expected = [...result.full, ...result.summarized]
+				.sort((a, b) => b.score - a.score)
+				.map((r) => ({ slug: r.skill.slug, score: r.score }));
+		} finally {
+			store.close();
+		}
+
+		expect(rows.map((r) => r.slug)).toEqual(expected.map((r) => r.slug));
+		for (const [i, row] of rows.entries()) {
+			expect(row.score).toBeCloseTo(expected[i]?.score ?? -1, 3);
+		}
+		// The audit's case: the bare `src/commands` pattern matches the file, as in
+		// retrieval, so it outranks the unrelated skill.
+		const slugs = rows.map((r) => r.slug);
+		expect(slugs.indexOf("command-wiring-notes")).toBeLessThan(
+			slugs.indexOf("unrelated-database-migration"),
+		);
 	});
 
-	test("file-pattern overlap adds to the score", () => {
-		const skill = fakeSkill({ filePatterns: ["src/commands/*.ts"] });
-		const withFile = scoreSkill(skill, new Set(), ["src/commands/skill.ts"]);
-		expect(withFile).toBeGreaterThan(0);
+	test("an unproven skill an agent would still receive is listed, not hidden", async () => {
+		seed({ title: "Something Else Entirely", filePatterns: [], tags: [] });
+		const rows = await searchJson("rebase onto main");
+		// Retrieval gives every active skill a recency score, so it would be
+		// injected as a summary; search must say so too.
+		expect(rows.map((r) => r.slug)).toEqual(["something-else-entirely"]);
+		expect(rows[0]?.score).toBeGreaterThan(0);
 	});
 
-	test("rankSkills orders by relevance and excludes non-active skills", () => {
-		const relevant = fakeSkill({ slug: "relevant", title: "git rebase workflow" });
-		const irrelevant = fakeSkill({ slug: "irrelevant", title: "something else entirely" });
-		const deprecated = fakeSkill({
-			slug: "deprecated-but-relevant",
-			title: "git rebase howto",
-			status: "deprecated",
+	test("drafts, deprecated skills and skills failing the safety scrub are excluded", async () => {
+		seed({ title: "Git Rebase Workflow" });
+		const deprecated = seed({ title: "Git Rebase Howto" });
+		await captureStdout(() => runSetStatus(deprecated.slug, "deprecated", true));
+		plantSkill("git-rebase-draft", { title: "Git rebase draft", status: "draft" });
+		plantSkill("git-rebase-danger", {
+			title: "Git rebase danger",
+			body: "git reset --hard origin/main",
 		});
 
-		const ranked = rankSkills([irrelevant, relevant, deprecated], "git rebase", []);
-		// Deprecated is dropped; only the relevant active skill survives the filter.
-		expect(ranked.map((r) => r.skill.slug)).toEqual(["relevant"]);
+		const rows = await searchJson("git rebase");
+		expect(rows.map((r) => r.slug)).toEqual(["git-rebase-workflow"]);
+
+		// Table mode explains why the scrubbed-out skill is never injected.
+		const table = await captureStdout(() => runSearch("git rebase", {}, false));
+		expect(table).toContain("git-rebase-danger is never injected");
+		expect(table).toContain("dangerous command");
 	});
 
-	test("a blank query returns active skills ordered by confidence", () => {
-		const low = fakeSkill({ slug: "low", confidence: 0.1 });
-		const high = fakeSkill({ slug: "high", confidence: 0.9 });
-		const ranked = rankSkills([low, high], "", []);
-		expect(ranked.map((r) => r.skill.slug)).toEqual(["high", "low"]);
+	test("a forged confidence in the frontmatter does not lift the score", async () => {
+		plantSkill("honest", { title: "Lint the code" });
+		plantSkill("forged", {
+			title: "Lint the code",
+			confidence: 1,
+			appliedCount: 99,
+			successCount: 99,
+			lastOutcome: "success",
+		});
+		const rows = await searchJson("lint the code");
+		expect(rows).toHaveLength(2);
+		expect(rows[0]?.score).toBeCloseTo(rows[1]?.score ?? -1, 6);
+		const list = await captureStdout(() => runList({ json: true }, true));
+		const forged = (
+			JSON.parse(list.trim()).data as Array<{ slug: string; confidence: number }>
+		).find((r) => r.slug === "forged");
+		expect(forged?.confidence).toBe(0);
+	});
+});
+
+// --- requireReview + approve ------------------------------------------------
+
+/** Turn on `skills.requireReview` in the temp project's config.yaml. */
+function enableRequireReview(): void {
+	const config = structuredClone(DEFAULT_CONFIG);
+	config.skills.requireReview = true;
+	writeFileSync(join(root, AGENTPLATE_DIR, CONFIG_FILE), serializeConfig(config), "utf8");
+}
+
+describe("requireReview + approve", () => {
+	const draft: SkillDraft = {
+		action: "create",
+		title: "Reviewed Skill",
+		goal: "Only reach agents after review",
+		filePatterns: ["src/**"],
+		body: "## Steps\n\n1. Review it",
+	};
+
+	test("defaults to off: a recorded skill is active at once", async () => {
+		expect(DEFAULT_CONFIG.skills.requireReview).toBe(false);
+		const out = await captureStdout(() =>
+			runRecord({ stdin: true, json: true }, true, async () => JSON.stringify(draft)),
+		);
+		expect(JSON.parse(out.trim()).data.skill.status).toBe("active");
+	});
+
+	test("with requireReview, record writes a draft that search skips until approved", async () => {
+		enableRequireReview();
+		const out = await captureStdout(() =>
+			runRecord({ stdin: true, json: true }, true, async () => JSON.stringify(draft)),
+		);
+		const env = JSON.parse(out.trim());
+		expect(env.data.action).toBe("created");
+		expect(env.data.skill.status).toBe("draft");
+		const slug: string = env.data.skill.slug;
+
+		expect(await searchJson("reviewed skill")).toEqual([]);
+		const listed = await captureStdout(() => runList({ status: "draft", json: true }, true));
+		expect((JSON.parse(listed.trim()).data as Array<{ slug: string }>).map((r) => r.slug)).toEqual([
+			slug,
+		]);
+
+		const approved = await captureStdout(() => runApprove(slug, true));
+		expect(JSON.parse(approved.trim()).data).toEqual({ slug, status: "active", changed: true });
+		expect((await searchJson("reviewed skill")).map((r) => r.slug)).toEqual([slug]);
+
+		// Approving again is a harmless no-op.
+		const again = await captureStdout(() => runApprove(slug, true));
+		expect(JSON.parse(again.trim()).data.changed).toBe(false);
+	});
+
+	test("the table output tells the operator how to approve a draft", async () => {
+		enableRequireReview();
+		const out = await captureStdout(() =>
+			runRecord({ stdin: true }, false, async () => JSON.stringify(draft)),
+		);
+		expect(out).toContain("agentplate skill approve reviewed-skill");
+	});
+
+	test("approve refuses a retired skill and reports a missing one", async () => {
+		const skill = seed();
+		await captureStdout(() => runSetStatus(skill.slug, "quarantined", true));
+		expect(() => runApprove(skill.slug, true)).toThrow(ValidationError);
+		expect(() => runApprove("does-not-exist", true)).toThrow(NotFoundError);
+	});
+
+	test("list accepts --status draft", async () => {
+		const out = await captureStdout(() => runList({ status: "draft", json: true }, true));
+		expect(JSON.parse(out.trim()).data).toEqual([]);
+		expect(() => runList({ status: "bogus", json: true }, true)).toThrow(ValidationError);
+	});
+});
+
+// --- reindex (deprecated) ---------------------------------------------------
+
+describe("reindex", () => {
+	test("is a no-op that still reports how many skills it read", async () => {
+		seed({ title: "One" });
+		seed({ title: "Two" });
+		const out = await captureStdout(() => runReindex(true));
+		expect(JSON.parse(out.trim()).data).toEqual({ reindexed: 2, deprecated: true });
+		expect(existsSync(join(root, AGENTPLATE_DIR, "skills.db"))).toBe(false);
 	});
 });

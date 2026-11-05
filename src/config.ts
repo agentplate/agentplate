@@ -56,6 +56,7 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 	},
 	skills: {
 		enabled: true,
+		requireReview: false,
 		retrieval: {
 			budgetChars: 6000,
 			maxFull: 4,
