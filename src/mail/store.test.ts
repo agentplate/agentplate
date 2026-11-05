@@ -6,14 +6,15 @@
  * gets a fresh file via beforeEach/afterEach.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase } from "../db/sqlite.ts";
+import { DEFAULT_LIST_LIMIT, openDatabase } from "../db/sqlite.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import type { NewMail } from "../types.ts";
-import { createMailStore, type MailStore } from "./store.ts";
+import { createMailStore, MAIL_MIGRATIONS, type MailStore } from "./store.ts";
 
 /** Minimal valid NewMail with overridable fields. */
 function newMail(overrides: Partial<NewMail> = {}): NewMail {
@@ -274,6 +275,77 @@ describe("mail store", () => {
 			// Nothing is both old AND involving zoe, so count is 0 and the row stays.
 			expect(store.purge({ olderThanDays: 1, agent: "zoe" })).toBe(0);
 			expect(store.list()).toHaveLength(1);
+		});
+	});
+
+	describe("list limit hardening", () => {
+		test("0 / negative / NaN fall back to the default cap instead of dumping or throwing", () => {
+			const total = DEFAULT_LIST_LIMIT + 5;
+			for (let i = 0; i < total; i++) store.send(newMail({ subject: `m${i}` }));
+
+			// -1 used to bind as SQLite's "no limit"; NaN threw "datatype mismatch".
+			for (const limit of [0, -1, Number.NaN]) {
+				const rows = store.list({ limit });
+				expect(rows).toHaveLength(DEFAULT_LIST_LIMIT);
+				expect(rows[0]?.subject).toBe(`m${total - 1}`);
+			}
+			expect(store.list()).toHaveLength(total);
+		});
+	});
+
+	describe("schema versioning and indexes", () => {
+		/** The query plan's detail lines for `sql` on the store's file. */
+		function plan(sql: string): string[] {
+			const db = new Database(dbPath);
+			const rows = db.query(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>;
+			db.close();
+			return rows.map((r) => r.detail);
+		}
+
+		test("newest-first list() and list({ from }) are served by an index, with no temp sort", () => {
+			// Same query shapes MailStore.list() builds.
+			const newest = plan("SELECT * FROM messages ORDER BY created_at DESC, seq DESC LIMIT 40");
+			const fromAgent = plan(
+				"SELECT * FROM messages WHERE from_agent = 'a' ORDER BY created_at DESC, seq DESC",
+			);
+			for (const detail of [newest, fromAgent]) {
+				expect(detail.join("\n")).not.toContain("TEMP B-TREE");
+				expect(detail.join("\n")).not.toMatch(/SCAN messages$/m);
+			}
+			expect(fromAgent.join("\n")).toContain("idx_messages_from");
+			// The inbox lookup still uses its own (to_agent, read) index.
+			expect(plan("SELECT * FROM messages WHERE to_agent = 'b' AND read = 0").join("\n")).toContain(
+				"idx_messages_inbox",
+			);
+		});
+
+		test("a pre-versioning mail.db gains the new indexes and keeps its messages", () => {
+			store.send(newMail({ subject: "kept" }));
+			store.close();
+			// Rewind to what the pre-versioning code left behind: user_version 0 and
+			// only the original two indexes.
+			const raw = new Database(dbPath);
+			raw.exec("DROP INDEX idx_messages_from");
+			raw.exec("DROP INDEX idx_messages_created");
+			raw.exec("PRAGMA user_version = 0");
+			raw.close();
+
+			store = createMailStore(dbPath);
+			expect(store.list().map((m) => m.subject)).toEqual(["kept"]);
+			const check = new Database(dbPath);
+			const indexes = (
+				check
+					.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'")
+					.all() as Array<{ name: string }>
+			).map((r) => r.name);
+			const { user_version } = check.query("PRAGMA user_version").get() as {
+				user_version: number;
+			};
+			check.close();
+			expect(indexes).toEqual(
+				expect.arrayContaining(["idx_messages_from", "idx_messages_created", "idx_messages_inbox"]),
+			);
+			expect(user_version).toBe(MAIL_MIGRATIONS.at(-1)?.version ?? -1);
 		});
 	});
 });

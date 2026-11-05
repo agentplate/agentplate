@@ -16,11 +16,11 @@
  *   text and round-tripped on read.
  * - NEVER store secrets. There is deliberately no secrets column; the caller
  *   guarantees `outputs`/`urls` are already redacted (see logging/sanitizer.ts).
- * - Greenfield schema: `CREATE TABLE IF NOT EXISTS` is the whole story, no
- *   migrations.
+ * - The schema is versioned: {@link DEPLOY_AUDIT_MIGRATIONS} are applied in order
+ *   by {@link openDatabase} (tracked in `PRAGMA user_version`).
  */
 
-import { openDatabase } from "../db/sqlite.ts";
+import { type Migration, openDatabase } from "../db/sqlite.ts";
 import type { DeployAuditRow } from "../types.ts";
 
 /** Filters accepted by {@link DeployAudit.list}. */
@@ -75,7 +75,17 @@ interface AuditRow {
 	created_at: string;
 }
 
-const CREATE_TABLE = `
+/**
+ * Ordered schema migrations (tracked in `PRAGMA user_version`; see openDatabase).
+ * Append new steps — never edit a shipped one.
+ */
+export const DEPLOY_AUDIT_MIGRATIONS: readonly Migration[] = [
+	{
+		// v1 — baseline table plus the rollback-lookup index: the hot read path is
+		// the most recent successful deploy for a (target, environment).
+		// Idempotent, because databases created before versioning already hold it.
+		version: 1,
+		sql: `
 CREATE TABLE IF NOT EXISTS deploy_audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -93,13 +103,19 @@ CREATE TABLE IF NOT EXISTS deploy_audit (
   outputs TEXT NOT NULL DEFAULT '{}',
   commit_sha TEXT NOT NULL,
   created_at TEXT NOT NULL
-)`;
-
-// The hot read path is rollback lookup: most recent successful deploy for a
-// (target, environment). Index those three columns up front, not per query.
-const CREATE_INDEXES = `
+);
 CREATE INDEX IF NOT EXISTS idx_deploy_audit_lookup
-  ON deploy_audit(target, environment, status)`;
+  ON deploy_audit(target, environment, status);`,
+	},
+	{
+		// v2 — every newest-first `list()` (`ap deploy status`, the web UI history)
+		// used to scan and temp-sort the whole log. An index on created_at is ordered
+		// by (created_at, seq) because seq is the rowid, so it serves
+		// `ORDER BY created_at DESC, seq DESC` directly.
+		version: 2,
+		sql: "CREATE INDEX IF NOT EXISTS idx_deploy_audit_created ON deploy_audit(created_at);",
+	},
+];
 
 /** Parse a JSON text column into a string array (tolerates legacy/empty values). */
 function parseUrls(text: string): string[] {
@@ -154,9 +170,7 @@ function rowToAuditRow(row: AuditRow): DeployAuditRow {
  * {@link deploysDbPath}.
  */
 export function createDeployAudit(dbPath: string): DeployAudit {
-	const db = openDatabase(dbPath);
-	db.exec(CREATE_TABLE);
-	db.exec(CREATE_INDEXES);
+	const db = openDatabase(dbPath, { migrations: DEPLOY_AUDIT_MIGRATIONS });
 
 	return {
 		record(input: Omit<DeployAuditRow, "id" | "createdAt">): DeployAuditRow {

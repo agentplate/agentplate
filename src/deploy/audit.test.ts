@@ -6,12 +6,13 @@
  * production. Each test gets a fresh file via beforeEach/afterEach.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DeployAuditRow } from "../types.ts";
-import { createDeployAudit, type DeployAudit } from "./audit.ts";
+import { createDeployAudit, DEPLOY_AUDIT_MIGRATIONS, type DeployAudit } from "./audit.ts";
 
 /** Minimal valid audit-row input (no id/createdAt — the store assigns those). */
 function newRow(
@@ -296,5 +297,45 @@ describe("deploy audit store", () => {
 			// Re-open so the afterEach close() is balanced.
 			audit = createDeployAudit(dbPath);
 		}
+	});
+
+	test("newest-first list() is served by the created_at index (no full scan + temp sort)", () => {
+		const db = new Database(dbPath);
+		try {
+			// The same ORDER BY DeployAudit.list() uses.
+			const detail = (
+				db
+					.query(
+						"EXPLAIN QUERY PLAN SELECT * FROM deploy_audit ORDER BY created_at DESC, seq DESC LIMIT 100",
+					)
+					.all() as Array<{ detail: string }>
+			)
+				.map((r) => r.detail)
+				.join("\n");
+			expect(detail).toContain("idx_deploy_audit_created");
+			expect(detail).not.toContain("TEMP B-TREE");
+			const { user_version } = db.query("PRAGMA user_version").get() as { user_version: number };
+			expect(user_version).toBe(DEPLOY_AUDIT_MIGRATIONS.at(-1)?.version ?? -1);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("a pre-versioning deploys.db is upgraded in place and keeps its rows", () => {
+		const stored = audit.record(newRow());
+		audit.close();
+		const raw = new Database(dbPath);
+		raw.exec("DROP INDEX idx_deploy_audit_created");
+		raw.exec("PRAGMA user_version = 0");
+		raw.close();
+
+		audit = createDeployAudit(dbPath);
+		expect(audit.list().map((r) => r.id)).toEqual([stored.id]);
+		const check = new Database(dbPath);
+		const index = check
+			.query("SELECT name FROM sqlite_master WHERE name = 'idx_deploy_audit_created'")
+			.get();
+		check.close();
+		expect(index).not.toBeNull();
 	});
 });

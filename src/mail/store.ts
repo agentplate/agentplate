@@ -13,12 +13,12 @@
  * - Columns are snake_case (SQL idiom); the public {@link MailMessage} shape is
  *   camelCase. {@link rowToMessage} is the single translation point.
  * - `read` is stored as an INTEGER (0/1) because SQLite has no boolean type.
- * - This is a greenfield schema, so there is no migration logic: `CREATE TABLE
- *   IF NOT EXISTS` is the whole story.
+ * - The schema is versioned: {@link MAIL_MIGRATIONS} are applied in order by
+ *   {@link openDatabase} (tracked in `PRAGMA user_version`).
  */
 
 import type { Database } from "bun:sqlite";
-import { openDatabase } from "../db/sqlite.ts";
+import { type Migration, openDatabase, resolveLimit } from "../db/sqlite.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import type { MailMessage, MailPriority, MailType, NewMail } from "../types.ts";
 
@@ -27,6 +27,11 @@ export interface MailListFilter {
 	from?: string;
 	to?: string;
 	unread?: boolean;
+	/**
+	 * Max rows (newest first). Omitted → every match. A value that is not a
+	 * positive integer (0, negative, NaN) falls back to the default cap
+	 * (DEFAULT_LIST_LIMIT); it never means "no limit".
+	 */
 	limit?: number;
 }
 
@@ -80,7 +85,17 @@ interface MessageRow {
 	created_at: string;
 }
 
-const CREATE_TABLE = `
+/**
+ * Ordered schema migrations (tracked in `PRAGMA user_version`; see openDatabase).
+ * Append new steps — never edit a shipped one.
+ */
+export const MAIL_MIGRATIONS: readonly Migration[] = [
+	{
+		// v1 — baseline table plus indexes for the inbox lookup (to_agent + read)
+		// and thread reconstruction (thread_id). Idempotent, because databases
+		// created before versioning already hold it.
+		version: 1,
+		sql: `
 CREATE TABLE IF NOT EXISTS messages (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -94,13 +109,23 @@ CREATE TABLE IF NOT EXISTS messages (
   payload TEXT,
   read INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
-)`;
-
-// Indexes target the two hot read paths: inbox lookups (to_agent + read) and
-// thread reconstruction (thread_id). Created up front, not per query.
-const CREATE_INDEXES = `
+);
 CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(to_agent, read);
-CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id)`;
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);`,
+	},
+	{
+		// v2 — `list({ from })` (run at the end of every turn) and every
+		// newest-first `list()` (the 5s feed tick) used to scan the whole table and
+		// sort it in a temp B-tree. An index on created_at is ordered by
+		// (created_at, seq) because seq is the rowid, so these serve
+		// `ORDER BY created_at DESC, seq DESC` (and purge's created_at cutoff)
+		// straight from the index, without changing the ordering semantics.
+		version: 2,
+		sql: `
+CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_agent, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);`,
+	},
+];
 
 /** Translate a stored row (snake_case, int boolean) into a {@link MailMessage}. */
 function rowToMessage(row: MessageRow): MailMessage {
@@ -153,9 +178,10 @@ export function createMailStore(dbPath: string): MailStore {
 	// Guard on `messages.seq`: the unrelated @ag-eco/agentplate-cli uses a
 	// `messages` table without our `seq` column and a stricter `type` CHECK that
 	// would reject Agentplate's delivery-pipeline message types.
-	const db = openDatabase(dbPath, { guard: { table: "messages", columns: ["seq"] } });
-	db.exec(CREATE_TABLE);
-	db.exec(CREATE_INDEXES);
+	const db = openDatabase(dbPath, {
+		guard: { table: "messages", columns: ["seq"] },
+		migrations: MAIL_MIGRATIONS,
+	});
 
 	return {
 		send(mail: NewMail): MailMessage {
@@ -227,9 +253,12 @@ export function createMailStore(dbPath: string): MailStore {
 
 			const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 			let sql = `SELECT * FROM messages ${where} ORDER BY created_at DESC, seq DESC`;
-			if (filter?.limit !== undefined) {
+			// Omitted → no LIMIT. Otherwise normalized to a positive integer: binding
+			// a raw -1 meant "unlimited" and NaN threw a datatype mismatch.
+			const limit = resolveLimit(filter?.limit);
+			if (limit !== undefined) {
 				sql += " LIMIT $limit";
-				params.$limit = filter.limit;
+				params.$limit = limit;
 			}
 
 			const rows = db.query(sql).all(params) as MessageRow[];
