@@ -51,7 +51,10 @@ export const DEFAULT_CONFIG: AgentplateConfig = {
 		purgeOnReap: false,
 	},
 	merge: {
-		aiResolveEnabled: true,
+		// Off by default: a conflicting merge is aborted and reported. When on, a
+		// conflict is auto-resolved only if the target never changed the conflicted
+		// files (see src/merge/resolver.ts); there is no AI resolution tier yet.
+		aiResolveEnabled: false,
 		autoMerge: "off",
 	},
 	skills: {

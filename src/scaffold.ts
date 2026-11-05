@@ -19,6 +19,7 @@ logs/
 *.db
 *.db-shm
 *.db-wal
+merge.lock
 config.local.yaml
 secrets.local.yaml
 agents/*/checkpoint.json
@@ -32,7 +33,7 @@ skills, and SQLite databases (mail, sessions, events, skills, deploys).
 
 Committed: \`config.yaml\`, \`agent-manifest.json\`, \`agent-defs/\`.
 Gitignored (see \`.gitignore\` here): \`config.local.yaml\`, \`secrets.local.yaml\`,
-\`worktrees/\`, \`logs/\`, and all \`*.db\` files.
+\`worktrees/\`, \`logs/\`, \`merge.lock\`, and all \`*.db\` files.
 
 Managed by the \`agentplate\` CLI — you generally don't edit these by hand.
 `;

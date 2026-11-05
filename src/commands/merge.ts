@@ -74,15 +74,35 @@ export function createMergeCommand(): Command {
 				if (opts.dryRun) {
 					const predictions: MergeResult[] = [];
 					for (const { branch } of branches) {
-						predictions.push(await predictMerge(root, branch, target));
+						// One bad entry (e.g. a completed session whose branch was deleted)
+						// is reported on its own line instead of aborting the whole --all run.
+						try {
+							predictions.push(
+								await predictMerge(root, branch, target, {
+									autoResolve: config.merge.aiResolveEnabled,
+								}),
+							);
+						} catch (err) {
+							predictions.push({
+								branchName: branch,
+								status: "failed",
+								tier: null,
+								conflictFiles: [],
+								message: err instanceof Error ? err.message : String(err),
+							});
+						}
 					}
 					if (useJson) {
 						jsonOutput({ dryRun: true, target, predictions });
 						return;
 					}
 					for (const p of predictions) {
+						if (p.status === "failed") {
+							printError(`${p.branchName} → ${target}: predicted failure — ${p.message}`);
+							continue;
+						}
 						printInfo(
-							`${p.branchName} → ${target}: predicted ${p.tier ?? "conflict"}` +
+							`${p.branchName} → ${target}: predicted ${p.tier}` +
 								(p.conflictFiles.length ? ` (${p.conflictFiles.length} conflict file(s))` : ""),
 						);
 					}

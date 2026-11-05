@@ -42,8 +42,8 @@ describe("loadConfig", () => {
 		const cfg = loadConfig(root);
 		expect(cfg.project.name).toBe("my-app");
 		expect(cfg.runtime.default).toBe("codex");
-		// Untouched defaults remain.
-		expect(cfg.merge.aiResolveEnabled).toBe(true);
+		// Untouched defaults remain (auto-resolve is off unless opted in).
+		expect(cfg.merge.aiResolveEnabled).toBe(false);
 	});
 
 	test("an old config without merge.autoMerge inherits the 'off' default (deep merge)", () => {
