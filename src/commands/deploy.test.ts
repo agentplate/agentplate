@@ -318,7 +318,9 @@ describe("deploy --dry-run", () => {
 		expect(dockerfile?.content).toContain("FROM");
 		const workflow = result.artifacts.find((a) => a.path === ".github/workflows/deploy.yml");
 		expect(workflow?.content).toContain("name: deploy");
-		expect(workflow?.content).toContain("GHCR_TOKEN");
+		// CI pushes with the job's own GITHUB_TOKEN, not the local GHCR_TOKEN.
+		expect(workflow?.content).toContain("secrets.GITHUB_TOKEN");
+		expect(workflow?.content).not.toContain("GHCR_TOKEN");
 
 		// Required secret surfaced, not deployed.
 		expect(result.requiredSecretKeys).toContain("GHCR_TOKEN");
@@ -609,11 +611,12 @@ describe("rollback", () => {
 			expect(result.audit?.deploymentId).toBe(good);
 			expect(result.audit?.gateDecision).toBe("auto");
 
-			// The environment tag is re-pointed at the GOOD image and pushed; the bad
-			// image is never touched.
+			// The environment tag is re-pointed at the GOOD image and pushed (after a
+			// GHCR login that reads the token from stdin); the bad image is never touched.
 			expect(calls()).toEqual([
 				`image inspect ${good}`,
 				`tag ${good} ghcr.io/demo/app:staging`,
+				"login ghcr.io --username demo --password-stdin",
 				"push ghcr.io/demo/app:staging",
 			]);
 		});

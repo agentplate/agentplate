@@ -53,17 +53,22 @@ Begin the moment you are spawned.
 
 Let the chosen target produce its own artifacts rather than hand-rolling shell.
 The target adapter's `generateConfig` emits the right Dockerfile / CI / IaC for
-the app profile; drive it through the engine:
+the app profile; ask the engine for it with a **dry run**, which writes no
+artifacts and deploys nothing:
 
 ```bash
 agentplate target detect          # confirm the target + AppProfile from the plan
-# the engine calls the target's generateConfig() and writes its artifacts
-# (kind: dockerfile | ci | iac | manifest | helm | script | config | ignore)
-# into your worktree, so a later --dry-run can diff them.
+agentplate deploy --target <name> --env <environment> --dry-run --json
+# → "artifacts": one entry per generated file, each with its path, kind
+#   (dockerfile | ci | iac | manifest | helm | script | config | ignore),
+#   content, and the action a real deploy would take (create | unchanged |
+#   keep | overwrite). No file in your tree is written.
 ```
 
-Then refine what was generated to fit this repo — within `FILE_SCOPE`, keeping
-secrets as bindings, never values.
+Write the artifacts you need from that plan into your worktree yourself, then
+refine them to fit this repo — within `FILE_SCOPE`, keeping secrets as
+bindings, never values. Never run `agentplate deploy` without `--dry-run`: a
+real deploy is the deployer's gated job (and it would ship, not just write).
 
 ### Local validity checks only (never apply)
 

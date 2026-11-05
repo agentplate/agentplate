@@ -1,16 +1,19 @@
 /**
  * Tests for the Docker + GitHub Actions deploy target.
  *
- * Real implementations only: detect() reads real files in a real temp dir, and
- * the deploy/rollback assertions exercise ONLY the dry-run path so no `docker`
- * binary is ever invoked. generateConfig() is a pure function of the context,
- * so it is asserted directly with no environment setup.
+ * Real implementations only: detect() reads real files in a real temp dir.
+ * Real `docker` is never invoked: dry-run deploy/rollback paths spawn nothing,
+ * and the real-run paths run against a stub `docker` script put first on PATH
+ * that records its argv/stdin/env. generateConfig() is a pure function of the
+ * context, so it is asserted directly with no environment setup.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import yaml from "js-yaml";
+import { ValidationError } from "../../errors.ts";
 import type { AppProfile, DeployContext, DeployResult, DeploySecretStore } from "../types.ts";
 import { DockerGhaTarget } from "./docker-gha.ts";
 
@@ -166,10 +169,11 @@ describe("DockerGhaTarget.detect", () => {
 });
 
 describe("DockerGhaTarget.generateConfig", () => {
-	test("emits Dockerfile + .dockerignore + deploy.yml with GHCR_TOKEN required", async () => {
+	test("emits Dockerfile + .dockerignore + deploy.yml; GHCR_TOKEN only for local pushes", async () => {
 		const ctx = makeContext({ profile: serviceProfile, environment: "production" });
 		const config = await new DockerGhaTarget().generateConfig(ctx);
 
+		// The local deploy pushes with GHCR_TOKEN; CI needs no user-minted secret.
 		expect(config.requiredSecretKeys).toEqual(["GHCR_TOKEN"]);
 		expect(config.summary.length).toBeGreaterThan(0);
 
@@ -188,11 +192,79 @@ describe("DockerGhaTarget.generateConfig", () => {
 
 		const workflow = config.artifacts.find((a) => a.path === ".github/workflows/deploy.yml");
 		expect(workflow?.kind).toBe("ci");
-		expect(workflow?.content).toContain("secrets.GHCR_TOKEN");
-		expect(workflow?.content).toContain("registry: ghcr.io");
-		expect(workflow?.content).toContain("docker/build-push-action");
+		expect(workflow?.content).toContain("docker login ghcr.io");
 		// Environment input wired through.
 		expect(workflow?.content).toContain("production");
+	});
+
+	test("the workflow pushes with the job's GITHUB_TOKEN, never a long-lived PAT", async () => {
+		const config = await new DockerGhaTarget().generateConfig(
+			makeContext({ profile: serviceProfile, environment: "production" }),
+		);
+		const workflow =
+			config.artifacts.find((a) => a.path === ".github/workflows/deploy.yml")?.content ?? "";
+		expect(workflow).not.toContain("GHCR_TOKEN");
+		const parsed = yaml.load(workflow) as {
+			permissions: unknown;
+			jobs: Record<
+				string,
+				{
+					permissions: unknown;
+					steps: Array<{
+						name: string;
+						env?: Record<string, string>;
+						run?: string;
+						with?: unknown;
+					}>;
+				}
+			>;
+		};
+		// The ephemeral token is scoped to exactly what the push needs.
+		expect(parsed.permissions).toEqual({});
+		const job = parsed.jobs["build-and-push"];
+		expect(job?.permissions).toEqual({ contents: "read", packages: "write" });
+		// It reaches docker login over stdin, never argv.
+		const login = job?.steps.find((s) => s.name === "Log in to GHCR");
+		expect(login?.env).toEqual({ REGISTRY_TOKEN: `\${{ secrets.GITHUB_TOKEN }}` });
+		expect(login?.run).toBe(
+			`printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin`,
+		);
+		const checkout = job?.steps.find((s) => s.name === "Checkout");
+		expect(checkout?.with).toEqual({ "persist-credentials": false });
+	});
+
+	test("the workflow uses no third-party actions and pins every action to a full sha", async () => {
+		const config = await new DockerGhaTarget().generateConfig(
+			makeContext({ profile: serviceProfile }),
+		);
+		const workflow =
+			config.artifacts.find((a) => a.path === ".github/workflows/deploy.yml")?.content ?? "";
+		const uses = [...workflow.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1] ?? "");
+		expect(uses.length).toBeGreaterThan(0);
+		for (const ref of uses) {
+			// First-party only (actions/*), pinned to an immutable 40-hex commit sha.
+			expect(ref).toMatch(/^actions\/[A-Za-z0-9_.-]+@[0-9a-f]{40}$/);
+		}
+		expect(workflow).not.toContain("docker/login-action");
+		expect(workflow).not.toContain("docker/build-push-action");
+		expect(workflow).not.toContain("docker/setup-buildx-action");
+	});
+
+	test("rejects a dockerTimeoutSeconds setting that is not a non-negative number", async () => {
+		const target = new DockerGhaTarget();
+		for (const value of ["soon", "", -5, true]) {
+			await expect(
+				target.generateConfig(
+					makeContext({ profile: serviceProfile, settings: { dockerTimeoutSeconds: value } }),
+				),
+			).rejects.toThrow(ValidationError);
+		}
+		// Numbers, numeric strings, and 0 (no cap) are accepted.
+		for (const value of [900, "60", 0]) {
+			await target.generateConfig(
+				makeContext({ profile: serviceProfile, settings: { dockerTimeoutSeconds: value } }),
+			);
+		}
 	});
 
 	test("the workflow tags images with github.sha + the environment, never a frozen tag", async () => {
@@ -272,9 +344,124 @@ describe("DockerGhaTarget.generateConfig", () => {
 			makeContext({ profile: staticProfile }),
 		);
 		const dockerfile = config.artifacts.find((a) => a.path === "Dockerfile");
-		expect(dockerfile?.content).toContain("nginx:1.27-alpine");
+		expect(dockerfile?.content).toContain("nginx-unprivileged:1.27-alpine");
 		expect(dockerfile?.content).toContain("/usr/share/nginx/html");
 		expect(dockerfile?.content).toContain('CMD ["nginx", "-g", "daemon off;"]');
+		// Only the build output is published, never the project sources.
+		expect(dockerfile?.content).toContain("COPY --from=builder /app/dist /usr/share/nginx/html");
+		expect(dockerfile?.content).not.toContain("COPY . /usr/share/nginx/html");
+	});
+});
+
+/** Generate config for `profile` and return the named artifact's content. */
+async function artifactFor(profile: AppProfile, path: string): Promise<string> {
+	const config = await new DockerGhaTarget().generateConfig(makeContext({ profile }));
+	const artifact = config.artifacts.find((a) => a.path === path);
+	if (artifact === undefined) throw new Error(`no ${path} generated`);
+	return artifact.content;
+}
+
+/** The instructions of a Dockerfile's final (shipped) stage. */
+function finalStage(dockerfile: string): string[] {
+	const lines = dockerfile.split("\n").map((l) => l.trim());
+	const lastFrom = lines.map((l) => l.startsWith("FROM ")).lastIndexOf(true);
+	return lines.slice(lastFrom);
+}
+
+const bareStaticProfile: AppProfile = {
+	language: "static",
+	framework: null,
+	kind: "static",
+	buildCommand: null,
+	startCommand: null,
+	port: null,
+	packageManager: null,
+	runtimeEnvKeys: [],
+};
+
+describe("DockerGhaTarget generated images (least privilege)", () => {
+	const serviceProfiles: Array<[string, AppProfile, string]> = [
+		["plain node service", serviceProfile, "node"],
+		["built node service", { ...serviceProfile, buildCommand: "npm run build" }, "node"],
+		[
+			"plain bun service",
+			{ ...serviceProfile, language: "bun", packageManager: "bun.lock" },
+			"bun",
+		],
+		[
+			"built bun service",
+			{
+				...serviceProfile,
+				language: "bun",
+				packageManager: "bun.lock",
+				buildCommand: "bun run build",
+			},
+			"bun",
+		],
+	];
+
+	for (const [label, profile, user] of serviceProfiles) {
+		test(`a ${label} runs as the image's non-root "${user}" user`, async () => {
+			const stage = finalStage(await artifactFor(profile, "Dockerfile"));
+			const userLines = stage.filter((l) => l.startsWith("USER "));
+			expect(userLines).toEqual([`USER ${user}`]);
+			// USER comes before the CMD that starts the app, and the app owns its files.
+			expect(stage.findIndex((l) => l.startsWith("USER "))).toBeLessThan(
+				stage.findIndex((l) => l.startsWith("CMD ")),
+			);
+			expect(
+				stage.some((l) => l.startsWith(`COPY --`) && l.includes(`--chown=${user}:${user}`)),
+			).toBe(true);
+		});
+	}
+
+	test("static sites are served by unprivileged nginx on 8080", async () => {
+		for (const profile of [
+			bareStaticProfile,
+			{
+				...bareStaticProfile,
+				language: "node" as const,
+				framework: "vite",
+				buildCommand: "npm run build",
+			},
+		]) {
+			const stage = finalStage(await artifactFor(profile, "Dockerfile"));
+			expect(stage[0]).toBe("FROM nginxinc/nginx-unprivileged:1.27-alpine");
+			expect(stage).toContain("EXPOSE 8080");
+			expect(stage).not.toContain("EXPOSE 80");
+		}
+	});
+
+	test(".dockerignore keeps credentials and agentplate state out of every build context", async () => {
+		for (const profile of [serviceProfile, bareStaticProfile]) {
+			const ignore = (await artifactFor(profile, ".dockerignore")).split("\n");
+			for (const pattern of [
+				".git",
+				".agentplate",
+				"**/.env",
+				"**/.env.*",
+				"**/.npmrc",
+				"**/secrets.local.yaml",
+				"**/*.local.yaml",
+				"**/*.pem",
+				"**/*.key",
+				"**/.ssh",
+				"**/.aws",
+			]) {
+				expect(ignore).toContain(pattern);
+			}
+		}
+	});
+
+	test("a bare static site's .dockerignore drops every dotfile and never re-includes .env.example", async () => {
+		const ignore = (await artifactFor(bareStaticProfile, ".dockerignore")).split("\n");
+		expect(ignore).toContain("**/.*");
+		expect(ignore).toContain("!.well-known");
+		expect(ignore).not.toContain("!.env.example");
+		// A service may read its .env.example at runtime; it is not served publicly.
+		const serviceIgnore = (await artifactFor(serviceProfile, ".dockerignore")).split("\n");
+		expect(serviceIgnore).toContain("!.env.example");
+		expect(serviceIgnore).not.toContain("**/.*");
 	});
 });
 
@@ -423,6 +610,165 @@ describe("DockerGhaTarget.rollback (dry-run only)", () => {
 		expect(result.ok).toBe(false);
 		expect(result.errorMessage).toContain("no recorded image ref");
 		expect(result.outputs.rolledBack).toBe("false");
+	});
+});
+
+/**
+ * A stand-in `docker` executable (real docker is unsafe to drive from tests). It
+ * appends each invocation's argv, whether GHCR_TOKEN reached its env, and (for
+ * `login`) what it read on stdin to $FAKE_DOCKER_LOG. FAKE_DOCKER_BUILD_SLEEP
+ * makes `build` hang; FAKE_DOCKER_LOGIN_FAIL=1 makes `login` fail.
+ */
+const FAKE_DOCKER = `#!/bin/sh
+printf 'argv: %s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+printf 'env-token: %s\\n' "\${GHCR_TOKEN:-none}" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  login)
+    printf 'stdin: %s\\n' "$(cat)" >> "$FAKE_DOCKER_LOG"
+    if [ "$FAKE_DOCKER_LOGIN_FAIL" = "1" ]; then echo "denied" >&2; exit 1; fi
+    echo "Login Succeeded" ;;
+  build)
+    if [ -n "$FAKE_DOCKER_BUILD_SLEEP" ]; then sleep "$FAKE_DOCKER_BUILD_SLEEP"; fi ;;
+esac
+exit 0
+`;
+
+describe("DockerGhaTarget real run (stub docker CLI on PATH)", () => {
+	// Built by concatenation so the fixture never looks like a real token at rest.
+	const token = ["ghp", "_", "stubtoken", "0123456789abcdef0123456789ab"].join("");
+	const savedEnv = { ...process.env };
+	let dir: string;
+	let log: string;
+
+	beforeEach(async () => {
+		dir = await mkdtemp(join(tmpdir(), "fg-docker-gha-run-"));
+		const bin = join(dir, "bin");
+		await mkdir(bin);
+		await writeFile(join(bin, "docker"), FAKE_DOCKER, { mode: 0o755 });
+		log = join(dir, "docker.log");
+		await writeFile(log, "");
+		process.env.PATH = `${bin}:${savedEnv.PATH ?? ""}`;
+		process.env.FAKE_DOCKER_LOG = log;
+		delete process.env.GHCR_TOKEN;
+		delete process.env.FAKE_DOCKER_BUILD_SLEEP;
+		delete process.env.FAKE_DOCKER_LOGIN_FAIL;
+	});
+
+	afterEach(async () => {
+		for (const key of Object.keys(process.env)) {
+			if (!(key in savedEnv)) delete process.env[key];
+		}
+		Object.assign(process.env, savedEnv);
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	const readLog = async (): Promise<string[]> =>
+		(await readFile(log, "utf8")).split("\n").filter((l) => l !== "");
+
+	const realCtx = (overrides: Partial<DeployContext> = {}): DeployContext =>
+		makeContext({
+			profile: serviceProfile,
+			worktreePath: dir,
+			projectRoot: dir,
+			secretEnv: { GHCR_TOKEN: token },
+			settings: { registry: "ghcr.io/acme/api", sha: "abcdef1234567890" },
+			...overrides,
+		});
+
+	test("logs in to GHCR over stdin (never argv/env) before pushing both tags", async () => {
+		const result = await new DockerGhaTarget().deploy(realCtx());
+		expect(result.ok).toBe(true);
+		expect(result.outputs.pushed).toBe("true");
+
+		const lines = await readLog();
+		const argv = lines.filter((l) => l.startsWith("argv: "));
+		expect(argv).toEqual([
+			"argv: build -t ghcr.io/acme/api:abcdef123456 -t ghcr.io/acme/api:staging .",
+			"argv: login ghcr.io --username acme --password-stdin",
+			"argv: push ghcr.io/acme/api:abcdef123456",
+			"argv: push ghcr.io/acme/api:staging",
+		]);
+		// The token arrived on login's stdin and nowhere else.
+		expect(lines).toContain(`stdin: ${token}`);
+		expect(argv.join("\n")).not.toContain(token);
+		expect(lines.filter((l) => l.startsWith("env-token: "))).toEqual(
+			Array(4).fill("env-token: none"),
+		);
+		expect(result.log).not.toContain(token);
+	});
+
+	test("uses the configured username for docker login", async () => {
+		await new DockerGhaTarget().deploy(
+			realCtx({ settings: { registry: "ghcr.io/acme/api", username: "octocat" } }),
+		);
+		expect(await readLog()).toContain("argv: login ghcr.io --username octocat --password-stdin");
+	});
+
+	test("never sends GHCR_TOKEN to a registry other than ghcr.io", async () => {
+		const result = await new DockerGhaTarget().deploy(
+			realCtx({ settings: { registry: "registry.example.com/team/api", sha: "abc123" } }),
+		);
+		expect(result.ok).toBe(true);
+		const lines = await readLog();
+		expect(lines.some((l) => l.startsWith("argv: login"))).toBe(false);
+		expect(lines.some((l) => l.startsWith("stdin: "))).toBe(false);
+		expect(lines).toContain("argv: push registry.example.com/team/api:abc123");
+	});
+
+	test("a failed docker login stops before any push", async () => {
+		process.env.FAKE_DOCKER_LOGIN_FAIL = "1";
+		const result = await new DockerGhaTarget().deploy(realCtx());
+		expect(result.ok).toBe(false);
+		expect(result.errorMessage).toBe("docker login ghcr.io failed (exit 1)");
+		expect(result.outputs.pushed).toBe("false");
+		expect((await readLog()).some((l) => l.startsWith("argv: push"))).toBe(false);
+	});
+
+	test("without a token it builds but neither logs in nor pushes", async () => {
+		const result = await new DockerGhaTarget().deploy(realCtx({ secretEnv: {} }));
+		expect(result.ok).toBe(true);
+		expect(result.outputs.pushed).toBe("false");
+		const argv = (await readLog()).filter((l) => l.startsWith("argv: "));
+		expect(argv).toEqual([
+			"argv: build -t ghcr.io/acme/api:abcdef123456 -t ghcr.io/acme/api:staging .",
+		]);
+	});
+
+	test("kills a docker build that outlives dockerTimeoutSeconds", async () => {
+		// The stub's `sleep` is a grandchild that keeps the pipes open after the
+		// killed shell exits; the deploy must still return promptly.
+		process.env.FAKE_DOCKER_BUILD_SLEEP = "5";
+		const started = Date.now();
+		const result = await new DockerGhaTarget().deploy(
+			realCtx({ settings: { registry: "ghcr.io/acme/api", dockerTimeoutSeconds: 0.3 } }),
+		);
+		expect(Date.now() - started).toBeLessThan(4000);
+		expect(result.ok).toBe(false);
+		expect(result.errorMessage).toContain("docker build timed out");
+		expect(result.log).toContain("timed out after 0.3s");
+		expect((await readLog()).some((l) => l.startsWith("argv: push"))).toBe(false);
+	});
+
+	test("rollback logs in over stdin before pushing the re-pointed tag", async () => {
+		const prior: DeployResult = {
+			ok: true,
+			urls: [],
+			deploymentId: "ghcr.io/acme/api:oldsha123456",
+			log: "",
+			outputs: { imageRef: "ghcr.io/acme/api:oldsha123456" },
+			errorMessage: null,
+		};
+		const result = await new DockerGhaTarget().rollback(realCtx(), prior);
+		expect(result.ok).toBe(true);
+		expect(result.outputs.pushed).toBe("true");
+		const lines = await readLog();
+		expect(lines.filter((l) => l.startsWith("argv: "))).toEqual([
+			"argv: image inspect ghcr.io/acme/api:oldsha123456",
+			"argv: tag ghcr.io/acme/api:oldsha123456 ghcr.io/acme/api:staging",
+			"argv: login ghcr.io --username acme --password-stdin",
+			"argv: push ghcr.io/acme/api:staging",
+		]);
+		expect(lines).toContain(`stdin: ${token}`);
 	});
 });
 

@@ -2,10 +2,12 @@
  * Docker + GitHub Actions deploy target.
  *
  * The baseline, most-universal target: containerize the app and ship a GitHub
- * Actions workflow that builds the image, logs in to GHCR, and pushes a tag.
- * It is the least credential-coupled target — a single `GHCR_TOKEN` is the only
- * secret — which makes it a sane default fit for almost any web service or
- * static site.
+ * Actions workflow that builds the image, logs in to GHCR with the job's own
+ * ephemeral `GITHUB_TOKEN`, and pushes a tag. It is the least
+ * credential-coupled target — a local push needs a single `GHCR_TOKEN`, which
+ * `docker login ghcr.io` reads from stdin — which makes it a sane default fit
+ * for almost any web service or static site. Generated images run as a non-root
+ * user, and every docker call is bounded by `dockerTimeoutSeconds`.
  *
  * Mechanics only (no AI). The staged pipeline calls these methods; this file
  * never embeds pipeline policy. The split mirrors the runtime adapters:
@@ -20,7 +22,8 @@
  *                      keeps it (no Dockerfile is generated for it).
  *   deploy()         — the ONE outward-facing mutation. Honors `ctx.dryRun`:
  *                      a dry run plans (no `docker` invoked) and a real run
- *                      builds (and pushes when a token is present).
+ *                      builds (and, when a token is present, logs in to GHCR
+ *                      and pushes).
  *   verify()         — read-only smoke check (HTTP GET, else local image probe).
  *   rollback()       — best-effort re-point of the environment tag at the image
  *                      of the release being restored.
@@ -53,11 +56,26 @@ import type {
 	VerifyResult,
 } from "../types.ts";
 
-/** The single secret this target needs at deploy time (GHCR push auth). */
+/** The single secret this target needs at deploy time (local GHCR push auth). */
 const GHCR_TOKEN_KEY = "GHCR_TOKEN";
+
+/** The only registry {@link GHCR_TOKEN_KEY} is ever sent to. */
+const GHCR_REGISTRY = "ghcr.io";
 
 /** Default container port when none can be inferred from the app. */
 const DEFAULT_PORT = 3000;
+
+/**
+ * Default wall-clock cap for each `docker` invocation (build, login, push, …),
+ * overridable per target with the `dockerTimeoutSeconds` setting (0 = no cap).
+ */
+const DEFAULT_DOCKER_TIMEOUT_SECONDS = 1800;
+
+/** After SIGTERM on timeout, how long to wait before escalating to SIGKILL. */
+const KILL_GRACE_MS = 5000;
+
+/** After a timed-out child exits, how long to wait for its pipes to drain. */
+const PIPE_DRAIN_GRACE_MS = 1000;
 
 /** Result of running a subprocess (never throws on non-zero exit). */
 interface ProcResult {
@@ -66,35 +84,119 @@ interface ProcResult {
 	exitCode: number;
 	/** True when the binary itself could not be spawned (e.g. not installed). */
 	spawnFailed: boolean;
+	/** True when the child was killed for running past `timeoutMs`. */
+	timedOut: boolean;
+}
+
+/** Per-invocation options for {@link runCommand}. */
+interface RunCommandOptions {
+	/** Written to the child's stdin (how a secret reaches `docker login`, never argv). */
+	stdin?: string;
+	/** Kill the child after this many ms; 0/undefined = no cap. */
+	timeoutMs?: number;
 }
 
 /**
  * Run a command and capture its output. Mirrors the merge resolver's `runGit`:
  * non-zero exits are returned, not thrown, because callers branch on them. A
  * spawn failure (binary missing) is surfaced via `spawnFailed` rather than an
- * exception so deploy/verify can degrade gracefully.
+ * exception so deploy/verify can degrade gracefully. A child that outlives
+ * `timeoutMs` is sent SIGTERM (then SIGKILL) and reported via `timedOut`.
  */
 async function runCommand(
 	argv: string[],
 	cwd: string,
-	env?: Record<string, string>,
+	opts: RunCommandOptions = {},
 ): Promise<ProcResult> {
+	let proc: ReturnType<typeof spawnPiped>;
 	try {
-		const proc = Bun.spawn(argv, {
-			cwd,
-			stdout: "pipe",
-			stderr: "pipe",
-			env: env ? { ...process.env, ...env } : process.env,
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		return { stdout, stderr, exitCode, spawnFailed: false };
+		proc = spawnPiped(argv, cwd, opts);
 	} catch (error) {
-		return { stdout: "", stderr: (error as Error).message, exitCode: -1, spawnFailed: true };
+		return {
+			stdout: "",
+			stderr: (error as Error).message,
+			exitCode: -1,
+			spawnFailed: true,
+			timedOut: false,
+		};
 	}
+	let timedOut = false;
+	let killTimer: ReturnType<typeof setTimeout> | null = null;
+	const timeoutMs = opts.timeoutMs ?? 0;
+	const timer =
+		timeoutMs > 0
+			? setTimeout(() => {
+					timedOut = true;
+					proc.kill("SIGTERM");
+					killTimer = setTimeout(() => proc.kill("SIGKILL"), KILL_GRACE_MS);
+				}, timeoutMs)
+			: null;
+	const output = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (timer) clearTimeout(timer);
+	if (killTimer) clearTimeout(killTimer);
+	if (!timedOut) {
+		const [stdout, stderr] = await output;
+		return { stdout, stderr, exitCode, spawnFailed: false, timedOut: false };
+	}
+	// A grandchild (e.g. the buildx plugin) can hold the pipes open after the CLI
+	// is killed: take what drained within a short grace and stop waiting.
+	const drained = await Promise.race([output, Bun.sleep(PIPE_DRAIN_GRACE_MS).then(() => null)]);
+	const [stdout, stderr] = drained ?? ["", ""];
+	const note = `timed out after ${timeoutMs / 1000}s; killed`;
+	return {
+		stdout,
+		stderr: stderr === "" ? note : `${stderr}\n${note}`,
+		exitCode,
+		spawnFailed: false,
+		timedOut: true,
+	};
+}
+
+/** Spawn with piped output; stdin is the given string (closed after) or ignored. */
+function spawnPiped(argv: string[], cwd: string, opts: RunCommandOptions) {
+	return Bun.spawn(argv, {
+		cwd,
+		stdin: opts.stdin === undefined ? "ignore" : new Blob([opts.stdin]),
+		stdout: "pipe",
+		stderr: "pipe",
+		env: process.env,
+	});
+}
+
+/** True when the command ran to completion and exited 0. */
+function succeeded(result: ProcResult): boolean {
+	return !result.spawnFailed && !result.timedOut && result.exitCode === 0;
+}
+
+/** Human-readable failure for a docker step: timeout, else its exit code. */
+function stepFailure(step: string, result: ProcResult): string {
+	return result.timedOut
+		? `${step} timed out (see the dockerTimeoutSeconds setting)`
+		: `${step} failed (exit ${result.exitCode})`;
+}
+
+/**
+ * The per-command docker timeout for a context, in ms (0 = no cap). Read from
+ * the `dockerTimeoutSeconds` setting; a value that is not a non-negative number
+ * is a config error, never silently ignored.
+ */
+function dockerTimeoutMs(ctx: DeployContext): number {
+	const raw = ctx.settings.dockerTimeoutSeconds;
+	if (raw === undefined) return DEFAULT_DOCKER_TIMEOUT_SECONDS * 1000;
+	const seconds =
+		typeof raw === "number"
+			? raw
+			: typeof raw === "string" && raw.trim() !== ""
+				? Number(raw)
+				: Number.NaN;
+	if (!Number.isFinite(seconds) || seconds < 0) {
+		throw new ValidationError(
+			`docker-gha setting dockerTimeoutSeconds must be a non-negative number of seconds ` +
+				`(0 = no cap), got ${JSON.stringify(raw)}`,
+		);
+	}
+	return Math.round(seconds * 1000);
 }
 
 /** Minimal shape we read out of a project's package.json (everything optional). */
@@ -355,6 +457,68 @@ function repositoryOf(ref: string): string {
 	return colon > name.lastIndexOf("/") ? name.slice(0, colon) : name;
 }
 
+/**
+ * The registry host an image ref pushes to, lowercased. Docker's rule: the first
+ * path segment is a registry only if it has a `.` or `:` or is `localhost`;
+ * otherwise the ref is a Docker Hub name.
+ */
+function registryHost(ref: string): string {
+	const slash = ref.indexOf("/");
+	const first = slash === -1 ? "" : ref.slice(0, slash);
+	const isHost = first.includes(".") || first.includes(":") || first === "localhost";
+	return isHost ? first.toLowerCase() : "docker.io";
+}
+
+/**
+ * The username for `docker login ghcr.io`: the `username` setting, else the
+ * owner segment of a `ghcr.io/<owner>/<image>` repo. GHCR authenticates the
+ * token itself; the username only has to be non-empty.
+ */
+function ghcrUsername(ctx: DeployContext, repo: string): string {
+	const configured = settingString(ctx.settings, "username")?.trim();
+	if (configured !== undefined && configured !== "") return configured;
+	const parts = repo.split("/");
+	const owner = parts.length > 2 ? parts[1] : undefined;
+	return owner !== undefined && owner !== "" ? owner : "agentplate";
+}
+
+/**
+ * Authenticate the local docker CLI to GHCR with `GHCR_TOKEN` before a push. The
+ * token goes over stdin (`--password-stdin`), never argv or env. Returns null on
+ * success (or when there is nothing to log in to), else the failure message.
+ * The token is only ever sent to ghcr.io: a push to any other registry relies on
+ * that registry's existing `docker login`.
+ */
+async function loginForPush(
+	ctx: DeployContext,
+	pushRef: string,
+	timeoutMs: number,
+	logLines: string[],
+): Promise<string | null> {
+	const token = ctx.secretEnv[GHCR_TOKEN_KEY];
+	if (token === undefined || token === "") return null;
+	const registry = registryHost(pushRef);
+	if (registry !== GHCR_REGISTRY) {
+		logLines.push(
+			`(registry ${registry} is not ${GHCR_REGISTRY}: GHCR_TOKEN is not sent to it; ` +
+				"pushing with its existing docker login)",
+		);
+		return null;
+	}
+	const username = ghcrUsername(ctx, repositoryOf(pushRef));
+	const login = await runCommand(
+		["docker", "login", GHCR_REGISTRY, "--username", username, "--password-stdin"],
+		ctx.worktreePath,
+		{ stdin: token, timeoutMs },
+	);
+	logLines.push(
+		`$ docker login ${GHCR_REGISTRY} --username ${username} --password-stdin`,
+		login.stdout,
+		login.stderr,
+	);
+	return succeeded(login) ? null : stepFailure(`docker login ${GHCR_REGISTRY}`, login);
+}
+
 /** The worktree's HEAD commit sha, or undefined (not a git repo / no commits). */
 async function readHeadSha(cwd: string): Promise<string | undefined> {
 	const result = await runCommand(["git", "rev-parse", "HEAD"], cwd);
@@ -390,10 +554,26 @@ function assertKnownEnvironment(environment: string, known: readonly string[]): 
 // Artifact templates (deterministic strings)
 // ---------------------------------------------------------------------------
 
+/**
+ * The unprivileged user each service base image ships (`node:*` has `node`,
+ * `oven/bun:*` has `bun`). Service images drop root and run as it.
+ */
+function runtimeUser(profile: AppProfile): string {
+	return profile.language === "bun" ? "bun" : "node";
+}
+
+/**
+ * nginx image for static sites: the official unprivileged variant runs as a
+ * non-root user and therefore listens on 8080, not 80.
+ */
+const STATIC_NGINX_IMAGE = "nginxinc/nginx-unprivileged:1.27-alpine";
+const STATIC_NGINX_PORT = 8080;
+
 /** Multi-stage Dockerfile for a built Node/Bun service. */
 function dockerfileBuiltService(profile: AppProfile): string {
 	const isBun = profile.language === "bun";
 	const baseImage = isBun ? "oven/bun:1" : "node:22-slim";
+	const user = runtimeUser(profile);
 	const installCmd = isBun
 		? "bun install --frozen-lockfile"
 		: profile.packageManager === "pnpm-lock.yaml"
@@ -416,7 +596,10 @@ function dockerfileBuiltService(profile: AppProfile): string {
 		`FROM ${baseImage} AS runner`,
 		`ENV NODE_ENV=production`,
 		`WORKDIR /app`,
-		`COPY --from=builder /app /app`,
+		`# Run as the base image's unprivileged user, never root.`,
+		`RUN chown ${user}:${user} /app`,
+		`COPY --from=builder --chown=${user}:${user} /app /app`,
+		`USER ${user}`,
 		`EXPOSE ${port}`,
 		`CMD ${dockerExecForm(startCmd)}`,
 		``,
@@ -427,6 +610,7 @@ function dockerfileBuiltService(profile: AppProfile): string {
 function dockerfilePlainService(profile: AppProfile): string {
 	const isBun = profile.language === "bun";
 	const baseImage = isBun ? "oven/bun:1" : "node:22-slim";
+	const user = runtimeUser(profile);
 	const installCmd = isBun ? "bun install --frozen-lockfile" : "npm ci --omit=dev";
 	const startCmd = profile.startCommand ?? (isBun ? "bun run start" : "npm run start");
 	const port = profile.port ?? DEFAULT_PORT;
@@ -436,15 +620,23 @@ function dockerfilePlainService(profile: AppProfile): string {
 		`FROM ${baseImage}`,
 		`ENV NODE_ENV=production`,
 		`WORKDIR /app`,
-		`COPY . .`,
+		`# Run as the base image's unprivileged user, never root.`,
+		`RUN chown ${user}:${user} /app`,
+		`COPY --chown=${user}:${user} . .`,
 		`RUN ${installCmd}`,
+		`USER ${user}`,
 		`EXPOSE ${port}`,
 		`CMD ${dockerExecForm(startCmd)}`,
 		``,
 	].join("\n");
 }
 
-/** Two-stage Dockerfile that builds static assets and serves them via nginx. */
+/**
+ * Dockerfile that serves a static site via unprivileged nginx. A built site
+ * (Vite/CRA) is compiled in a builder stage and only its output directory is
+ * published; a bare site (no build tooling) publishes the context, which its
+ * generated `.dockerignore` strips of dotfiles and credentials.
+ */
 function dockerfileStatic(profile: AppProfile): string {
 	const isBun = profile.language === "bun";
 	const baseImage = isBun ? "oven/bun:1" : "node:22-slim";
@@ -454,8 +646,8 @@ function dockerfileStatic(profile: AppProfile): string {
 	const outDir = profile.framework === "cra" ? "build" : "dist";
 	const builderStage =
 		profile.language === "static"
-			? // No build tooling: copy the prebuilt site straight into nginx.
-				[`FROM nginx:1.27-alpine`, `COPY . /usr/share/nginx/html`]
+			? // No build tooling: the (dockerignore-filtered) context is the site.
+				[`FROM ${STATIC_NGINX_IMAGE}`, `COPY . /usr/share/nginx/html`]
 			: [
 					`FROM ${baseImage} AS builder`,
 					`WORKDIR /app`,
@@ -463,14 +655,15 @@ function dockerfileStatic(profile: AppProfile): string {
 					`RUN ${installCmd}`,
 					`RUN ${buildCmd}`,
 					``,
-					`FROM nginx:1.27-alpine`,
+					`FROM ${STATIC_NGINX_IMAGE}`,
+					`# Publish only the build output, never the sources.`,
 					`COPY --from=builder /app/${outDir} /usr/share/nginx/html`,
 				];
 	return [
 		`# syntax=docker/dockerfile:1`,
-		`# Static site served by nginx${profile.language === "static" ? "" : " (built from source)"}.`,
+		`# Static site served by non-root nginx${profile.language === "static" ? "" : " (built from source)"}.`,
 		...builderStage,
-		`EXPOSE 80`,
+		`EXPOSE ${STATIC_NGINX_PORT}`,
 		`CMD ["nginx", "-g", "daemon off;"]`,
 		``,
 	].join("\n");
@@ -489,37 +682,77 @@ function renderDockerfile(profile: AppProfile): string {
 	return dockerfilePlainService(profile);
 }
 
-/** Standard `.dockerignore` keeping build context small + secret-free. */
-function renderDockerignore(): string {
+/**
+ * Credential files that must never enter a build context (and so never a layer
+ * of a pushed image), matched at any depth. Includes agentplate's own
+ * `secrets.local.yaml` / `config.local.yaml` and registry auth like `.npmrc`.
+ */
+const SECRET_IGNORE_PATTERNS = [
+	"**/.env",
+	"**/.env.*",
+	"**/.npmrc",
+	"**/.netrc",
+	"**/.pypirc",
+	"**/.aws",
+	"**/.ssh",
+	"**/secrets.local.yaml",
+	"**/*.local.yaml",
+	"**/*.pem",
+	"**/*.key",
+	"**/*.p12",
+	"**/*.pfx",
+];
+
+/**
+ * Standard `.dockerignore` keeping the build context small + secret-free. A
+ * bare static site publishes its context as-is, so it additionally drops every
+ * dotfile/dot-directory (keeping `.well-known/`) and does not re-include
+ * `.env.example`, which nginx would otherwise serve publicly.
+ */
+function renderDockerignore(profile: AppProfile): string {
+	const bareStatic = profile.language === "static";
 	return [
-		"node_modules",
-		"npm-debug.log",
-		"bun-debug.log",
+		"# Generated by agentplate: keep the build context small and secret-free.",
 		".git",
 		".gitignore",
 		".github",
 		".agentplate",
+		"node_modules",
+		"npm-debug.log",
+		"bun-debug.log",
 		"Dockerfile",
 		".dockerignore",
 		"*.md",
-		".env",
-		".env.*",
-		"!.env.example",
 		"dist",
 		"build",
 		".next",
 		"coverage",
 		".DS_Store",
 		"",
+		"# Credentials never enter the image.",
+		...SECRET_IGNORE_PATTERNS,
+		...(bareStatic
+			? ["", "# Served publicly as-is: no dotfiles except .well-known.", "**/.*", "!.well-known"]
+			: ["!.env.example"]),
+		"",
 	].join("\n");
 }
 
 /**
- * GitHub Actions workflow: build the image, log in to GHCR with
- * `secrets.GHCR_TOKEN`, and push it tagged with the commit being built
- * (`github.sha`) plus the moving environment tag. Exposes an `environment` input
- * so the same workflow drives preview/staging/production. `ctx.environment`
- * must already be validated (see {@link assertKnownEnvironment}).
+ * `actions/checkout`, pinned to a full commit sha (verified with
+ * `git ls-remote --tags https://github.com/actions/checkout`). It is the only
+ * action the generated workflow uses: everything else is the runner's own
+ * docker CLI, so no third-party action ever sees a token.
+ */
+const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1";
+
+/**
+ * GitHub Actions workflow: build the image with the runner's docker CLI, log in
+ * to GHCR with the job's ephemeral `GITHUB_TOKEN` (`packages: write`, no
+ * long-lived PAT), and push it tagged with the commit being built (`github.sha`)
+ * plus the moving environment tag. Exposes an `environment` input so the same
+ * workflow drives preview/staging/production. `ctx.environment` must already be
+ * validated (see {@link assertKnownEnvironment}).
  */
 function renderDeployWorkflow(ctx: DeployContext): string {
 	const repo = imageRepo(ctx);
@@ -546,6 +779,9 @@ concurrency:
   group: deploy-\${{ github.event.inputs.environment || '${environment}' }}
   cancel-in-progress: false
 
+# Least privilege: no token scopes by default; the job asks only for its own.
+permissions: {}
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -558,26 +794,28 @@ jobs:
       ENVIRONMENT_REF: ${repo}:\${{ github.event.inputs.environment || '${environment}' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: ${CHECKOUT_ACTION}
+        with:
+          persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # The job's ephemeral GITHUB_TOKEN (packages: write) authenticates the push,
+      # over stdin; no long-lived PAT and no third-party action ever sees it.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: \${{ github.actor }}
-          password: \${{ secrets.GHCR_TOKEN }}
+        env:
+          REGISTRY_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            \${{ env.IMAGE_REF }}
-            \${{ env.ENVIRONMENT_REF }}
+      - name: Build image
+        run: docker build --tag "$IMAGE_REF" --tag "$ENVIRONMENT_REF" .
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE_REF"
+          docker push "$ENVIRONMENT_REF"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
 `;
 }
 
@@ -596,8 +834,8 @@ export class DockerGhaTarget implements DeployTarget {
 	readonly label = "Docker + GitHub Actions";
 	readonly description =
 		"Containerize the app and ship a GitHub Actions workflow that builds the image, " +
-		"logs in to GHCR, and pushes a tagged image. The most universal, least " +
-		"credential-coupled target (a single GHCR_TOKEN).";
+		"logs in to GHCR with the job's GITHUB_TOKEN, and pushes a tagged image. The most " +
+		"universal, least credential-coupled target (local pushes need a single GHCR_TOKEN).";
 	readonly caps: DeployCaps = {
 		canRollback: true,
 		irreversible: false,
@@ -653,6 +891,8 @@ export class DockerGhaTarget implements DeployTarget {
 
 	async generateConfig(ctx: DeployContext): Promise<GeneratedConfig> {
 		assertKnownEnvironment(ctx.environment, this.caps.environments);
+		// Reject a bad timeout setting now, before the engine writes any artifact.
+		dockerTimeoutMs(ctx);
 		const profile = ctx.profile;
 		// A project we could not profile (Go, Python, …) that ships its own
 		// Dockerfile builds with it: a generated Node image would be wrong for it.
@@ -667,7 +907,7 @@ export class DockerGhaTarget implements DeployTarget {
 			});
 		}
 		artifacts.push(
-			{ path: ".dockerignore", content: renderDockerignore(), kind: "ignore" },
+			{ path: ".dockerignore", content: renderDockerignore(profile), kind: "ignore" },
 			{
 				path: ".github/workflows/deploy.yml",
 				content: renderDeployWorkflow(ctx),
@@ -679,8 +919,8 @@ export class DockerGhaTarget implements DeployTarget {
 			: `Generated a ${profile.kind === "static" ? "static (nginx)" : profile.language} Dockerfile, `;
 		const summary =
 			dockerfileNote +
-			`.dockerignore, and a GitHub Actions deploy workflow (GHCR push, ` +
-			`environment=${ctx.environment}). Requires secret GHCR_TOKEN.`;
+			`.dockerignore, and a GitHub Actions deploy workflow (GHCR push with the job's ` +
+			`GITHUB_TOKEN, environment=${ctx.environment}). Local deploys push with secret GHCR_TOKEN.`;
 		return {
 			artifacts,
 			requiredSecretKeys: [GHCR_TOKEN_KEY],
@@ -712,11 +952,14 @@ export class DockerGhaTarget implements DeployTarget {
 		}
 
 		// Real run: build the image. `docker` may be unavailable — degrade, don't throw.
+		// No secret reaches build/push env: docker reads none from it, and the
+		// token goes to `docker login` over stdin only.
+		const timeoutMs = dockerTimeoutMs(ctx);
 		const logLines: string[] = [];
 		const build = await runCommand(
 			["docker", "build", "-t", ref, "-t", envRef, "."],
 			ctx.worktreePath,
-			ctx.secretEnv,
+			{ timeoutMs },
 		);
 		if (build.spawnFailed) {
 			return {
@@ -729,34 +972,37 @@ export class DockerGhaTarget implements DeployTarget {
 			};
 		}
 		logLines.push(`$ docker build -t ${ref} -t ${envRef} .`, build.stdout, build.stderr);
-		if (build.exitCode !== 0) {
+		if (!succeeded(build)) {
 			return {
 				ok: false,
 				urls: [],
 				deploymentId: null,
 				log: sanitize(logLines.join("\n").trim()),
 				outputs: { ...baseOutputs, pushed: "false" },
-				errorMessage: `docker build failed (exit ${build.exitCode})`,
+				errorMessage: stepFailure("docker build", build),
 			};
 		}
 
-		// Push only when a token is present (GHCR auth is the operator's via env/CI):
-		// the immutable ref first, then the environment tag that now points at it.
+		// Push only when a token is present, after logging in to GHCR with it: the
+		// immutable ref first, then the environment tag that now points at it.
 		let pushed = false;
 		if (hasToken) {
+			const pushFailed = (errorMessage: string): DeployResult => ({
+				ok: false,
+				urls: [],
+				deploymentId: ref,
+				log: sanitize(logLines.join("\n").trim()),
+				outputs: { ...baseOutputs, pushed: "false" },
+				errorMessage,
+			});
+			const loginError = await loginForPush(ctx, ref, timeoutMs, logLines);
+			if (loginError !== null) return pushFailed(loginError);
 			for (const pushRef of [ref, envRef]) {
-				const push = await runCommand(["docker", "push", pushRef], ctx.worktreePath, ctx.secretEnv);
+				const push = await runCommand(["docker", "push", pushRef], ctx.worktreePath, {
+					timeoutMs,
+				});
 				logLines.push(`$ docker push ${pushRef}`, push.stdout, push.stderr);
-				if (push.exitCode !== 0 || push.spawnFailed) {
-					return {
-						ok: false,
-						urls: [],
-						deploymentId: ref,
-						log: sanitize(logLines.join("\n").trim()),
-						outputs: { ...baseOutputs, pushed: "false" },
-						errorMessage: `docker push failed (exit ${push.exitCode})`,
-					};
-				}
+				if (!succeeded(push)) return pushFailed(stepFailure("docker push", push));
 			}
 			pushed = true;
 		}
@@ -798,11 +1044,9 @@ export class DockerGhaTarget implements DeployTarget {
 
 		// No URL: confirm the built image exists locally.
 		const ref = deployment.deploymentId ?? imageRef(ctx);
-		const inspect = await runCommand(
-			["docker", "image", "inspect", ref],
-			ctx.worktreePath,
-			ctx.secretEnv,
-		);
+		const inspect = await runCommand(["docker", "image", "inspect", ref], ctx.worktreePath, {
+			timeoutMs: dockerTimeoutMs(ctx),
+		});
 		if (inspect.spawnFailed) {
 			checks.push({
 				name: "image-inspect",
@@ -811,7 +1055,7 @@ export class DockerGhaTarget implements DeployTarget {
 			});
 			return { healthy: false, checks, probedUrl: null };
 		}
-		const ok = inspect.exitCode === 0;
+		const ok = succeeded(inspect);
 		checks.push({
 			name: "image-inspect",
 			ok,
@@ -865,14 +1109,13 @@ export class DockerGhaTarget implements DeployTarget {
 			};
 		}
 
+		const timeoutMs = dockerTimeoutMs(ctx);
 		const logLines: string[] = [];
 		// Best-effort: confirm the previous image is present, re-tag it as the
 		// environment's image, then push that tag.
-		const inspect = await runCommand(
-			["docker", "image", "inspect", restoreRef],
-			ctx.worktreePath,
-			ctx.secretEnv,
-		);
+		const inspect = await runCommand(["docker", "image", "inspect", restoreRef], ctx.worktreePath, {
+			timeoutMs,
+		});
 		if (inspect.spawnFailed) {
 			return failed(
 				`docker is unavailable: ${inspect.stderr}`,
@@ -880,26 +1123,26 @@ export class DockerGhaTarget implements DeployTarget {
 			);
 		}
 		logLines.push(`$ docker image inspect ${restoreRef}`, inspect.stdout, inspect.stderr);
-		if (inspect.exitCode !== 0) {
+		if (!succeeded(inspect)) {
 			return failed(logLines.join("\n"), `previous image ${restoreRef} not available locally`);
 		}
 
-		const tag = await runCommand(
-			["docker", "tag", restoreRef, envRef],
-			ctx.worktreePath,
-			ctx.secretEnv,
-		);
+		const tag = await runCommand(["docker", "tag", restoreRef, envRef], ctx.worktreePath, {
+			timeoutMs,
+		});
 		logLines.push(`$ docker tag ${restoreRef} ${envRef}`, tag.stdout, tag.stderr);
-		if (tag.exitCode !== 0 || tag.spawnFailed) {
-			return failed(logLines.join("\n"), `docker tag (rollback) failed (exit ${tag.exitCode})`);
+		if (!succeeded(tag)) {
+			return failed(logLines.join("\n"), stepFailure("docker tag (rollback)", tag));
 		}
 
 		let pushed = false;
 		if (hasToken) {
-			const push = await runCommand(["docker", "push", envRef], ctx.worktreePath, ctx.secretEnv);
+			const loginError = await loginForPush(ctx, envRef, timeoutMs, logLines);
+			if (loginError !== null) return failed(logLines.join("\n"), loginError);
+			const push = await runCommand(["docker", "push", envRef], ctx.worktreePath, { timeoutMs });
 			logLines.push(`$ docker push ${envRef}`, push.stdout, push.stderr);
-			if (push.exitCode !== 0 || push.spawnFailed) {
-				return failed(logLines.join("\n"), `docker push (rollback) failed (exit ${push.exitCode})`);
+			if (!succeeded(push)) {
+				return failed(logLines.join("\n"), stepFailure("docker push (rollback)", push));
 			}
 			pushed = true;
 		}
@@ -958,7 +1201,9 @@ export class DockerGhaTarget implements DeployTarget {
 		checks.push({
 			name: "ghcr-token",
 			ok: hasToken,
-			detail: hasToken ? "GHCR_TOKEN is set" : "GHCR_TOKEN is not set (required to push)",
+			detail: hasToken
+				? "GHCR_TOKEN is set"
+				: "GHCR_TOKEN is not set (required for a local push; the CI workflow uses GITHUB_TOKEN)",
 		});
 
 		return checks;
