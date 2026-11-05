@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PROVIDERS } from "../providers/registry.ts";
 import { containsSecret, sanitize } from "./sanitizer.ts";
 
 describe("sanitizer", () => {
@@ -130,5 +131,114 @@ describe("sanitizer — JSON-quoted secrets", () => {
 		const once = sanitize('{"GHCR_TOKEN": "abc123"}');
 		expect(sanitize(once)).toBe(once);
 		expect(containsSecret(once)).toBe(false);
+	});
+});
+
+describe("sanitizer — assignment rules do not over-redact ordinary code", () => {
+	test("camelCase / config identifiers with non-secret values are left untouched", () => {
+		for (const text of [
+			"id: { primaryKey: true }",
+			"sortKeys: false",
+			"tokenizer: cl100k",
+			"const tokenizer = new Tokenizer();",
+			"maxTokens: 4096",
+			"const apiKey = config.apiKey;",
+			"apiKey: string;",
+			"password: string,",
+			"password: z.string().min(8),",
+			"secret = os.environ['X']",
+			"const key = 'value';",
+			"keyboard: true",
+			'sortKey: "createdAt"',
+			"type K = keyof T;",
+			"const API_KEY = process.env.API_KEY;",
+			`GHCR_TOKEN: ${"$"}{{ secrets.GHCR_TOKEN }}`,
+			"ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY",
+			"MAX_TOKENS=4096",
+			"if (token === expected) return;",
+		]) {
+			expect(sanitize(text)).toBe(text);
+		}
+	});
+
+	test("secret-looking values in code / config assignments are still redacted", () => {
+		const cases: Array<[string, string]> = [
+			["password: hunter2", "password: [REDACTED]"],
+			['password = "correct horse battery staple"', 'password = "[REDACTED]"'],
+			['"apiKey": "abc123def456ghi789"', '"apiKey": "[REDACTED]"'],
+			["api_key = 'Zx9fQ2LmP0aB7tYc'", "api_key = '[REDACTED]'"],
+			["clientSecret: Zx9fQ2LmP0aB7tYcWq81", "clientSecret: [REDACTED]"],
+			["x-api-key: 0f8e9d7c6b5a4f3e2d1c", "x-api-key: [REDACTED]"],
+			["export API_KEY='quoted value here'", "export API_KEY='[REDACTED]'"],
+			["GHCR_TOKEN=abc", "GHCR_TOKEN=[REDACTED]"],
+			["{ DB_PASSWORD: hunter2, port: 5432 }", "{ DB_PASSWORD: [REDACTED], port: 5432 }"],
+		];
+		for (const [input, expected] of cases) expect(sanitize(input)).toBe(expected);
+	});
+});
+
+describe("sanitizer — escaped quotes inside JSON secret values", () => {
+	test("an escaped quote does not end the value early (the rest is not leaked)", () => {
+		const out = sanitize('{"GHCR_TOKEN": "ab\\"cd-rest", "image": "app"}');
+		expect(out).not.toContain("cd-rest");
+		expect(JSON.parse(out)).toEqual({ GHCR_TOKEN: "[REDACTED]", image: "app" });
+	});
+
+	test("the same inside an already JSON-encoded string", () => {
+		const inner = JSON.stringify({ GHCR_TOKEN: 'ab"cd\\-rest', image: "app" });
+		const outer = JSON.stringify({ input: inner });
+		const out = sanitize(outer);
+		expect(out).not.toContain("cd");
+		expect(JSON.parse(JSON.parse(out).input)).toEqual({ GHCR_TOKEN: "[REDACTED]", image: "app" });
+	});
+});
+
+describe("sanitizer — every catalog provider's key is scrubbed", () => {
+	// Fake samples of each provider's documented key format, prefixes split so
+	// secret scanners do not flag the fixtures. Providers with no fixed format
+	// (Ollama, custom) are covered by the assignment forms and knownSecrets.
+	const bareKeys: Record<string, string> = {
+		ANTHROPIC_API_KEY: ["sk-ant", "api03", "AbCdEf0123456789_xyz-AbCdEf0123456789AA"].join("-"),
+		OPENAI_API_KEY: ["sk-proj", "AbCdEf0123456789_xyz-AbCdEf0123456789"].join("-"),
+		OPENROUTER_API_KEY: ["sk-or-v1", "0123456789abcdef0123456789abcdef0123456789abcdef"].join("-"),
+		OPENCODE_API_KEY: ["sk", "AbCdEf0123456789AbCdEf0123456789"].join("-"),
+		DEEPSEEK_API_KEY: ["sk", "0123456789abcdef0123456789abcdef"].join("-"),
+		GEMINI_API_KEY: ["AIza", "SyA-0123456789_abcdefghijABCDEFGHIJ"].join(""),
+	};
+	const opaque = ["opaque", "0123456789", "abcdefABCDEF"].join("-");
+
+	for (const provider of PROVIDERS) {
+		const name = provider.authEnvVar;
+		const value = bareKeys[name] ?? opaque;
+
+		test(`${provider.id}: ${name} assignments are redacted in every common form`, () => {
+			for (const text of [
+				`${name}=${value}`,
+				`export ${name}="${value}"`,
+				`${name}: ${value}`,
+				JSON.stringify({ [name]: value }),
+				JSON.stringify({ input: JSON.stringify({ [name]: value }) }),
+			]) {
+				expect(sanitize(text)).not.toContain(value);
+			}
+		});
+
+		test(`${provider.id}: a bare key in free text is redacted`, () => {
+			const text = `curl failed with key ${value} in a JSON fixture {"apiKey": "${value}"}`;
+			const out = bareKeys[name] === undefined ? sanitize(text, [value]) : sanitize(text);
+			expect(out).not.toContain(value);
+		});
+	}
+
+	test("Google OAuth (Gemini CLI login) and Slack tokens are redacted", () => {
+		const oauth = ["ya29", "a0AfH6SMBx0123456789abcdefghij"].join(".");
+		const slack = ["xoxb", "123456789012", "abcdefghijKLMNOP"].join("-");
+		expect(sanitize(`token ${oauth} and ${slack}`)).toBe("token [REDACTED] and [REDACTED]");
+	});
+
+	test("knownSecrets redacts literal values, ignoring too-short placeholders", () => {
+		expect(sanitize("key is ollama", ["ollama"])).toBe("key is ollama");
+		expect(sanitize("a opaque-value-42 b", ["opaque-value-42"])).toBe("a [REDACTED] b");
+		expect(containsSecret("a opaque-value-42 b", ["opaque-value-42"])).toBe(true);
 	});
 });
