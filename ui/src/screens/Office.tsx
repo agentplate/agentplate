@@ -19,7 +19,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { Group } from "three";
 import * as THREE from "three";
 import { getHandoffs } from "../api.ts";
-import { bindMovementKeys } from "../fpsKeys.ts";
+import { bindMovementKeys, pointerLockedTo } from "../fpsKeys.ts";
 import {
 	IconClick,
 	IconFps,
@@ -1354,20 +1354,22 @@ const OFFICE_CANVAS_ID = "office-canvas";
  */
 function FpsControls(): JSX.Element {
 	const { camera, gl } = useThree();
+	// The element pointer lock is taken on. It is handed to <PointerLockControls>
+	// as `domElement` below: without that, drei locks R3F's wrapper <div>
+	// (`events.connected`), so `pointerLockElement` would never be the canvas
+	// and WASD would never register.
+	const lockTarget = gl.domElement;
 	const keys = useRef<Record<string, boolean>>({});
 
 	useEffect(() => {
 		camera.position.set(0, 1.7, 6);
-		return bindMovementKeys(
-			window,
-			document,
-			keys.current,
-			() => document.pointerLockElement === gl.domElement,
+		return bindMovementKeys(window, document, keys.current, () =>
+			pointerLockedTo(document, lockTarget),
 		);
-	}, [camera, gl]);
+	}, [camera, lockTarget]);
 
 	useFrame((_, dt) => {
-		if (document.pointerLockElement !== gl.domElement) return;
+		if (!pointerLockedTo(document, lockTarget)) return;
 		const speed = 6 * Math.min(dt, 0.05);
 		const front = new THREE.Vector3();
 		camera.getWorldDirection(front);
@@ -1386,7 +1388,7 @@ function FpsControls(): JSX.Element {
 		}
 	});
 
-	return <PointerLockControls selector={`#${OFFICE_CANVAS_ID}`} />;
+	return <PointerLockControls domElement={lockTarget} selector={`#${OFFICE_CANVAS_ID}`} />;
 }
 
 // --- Scene + screen ---------------------------------------------------------

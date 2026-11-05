@@ -2,7 +2,9 @@
 // Excluded from the UI tsconfig (its CI job has no bun types).
 
 import { describe, expect, test } from "bun:test";
-import { bindMovementKeys, type PointerLockDoc } from "./fpsKeys.ts";
+import { PerspectiveCamera } from "three";
+import { PointerLockControls } from "three-stdlib";
+import { bindMovementKeys, type PointerLockDoc, pointerLockedTo } from "./fpsKeys.ts";
 
 class FakeDoc extends EventTarget implements PointerLockDoc {
 	pointerLockElement: Element | null = null;
@@ -79,5 +81,70 @@ describe("bindMovementKeys", () => {
 		expect(Object.keys(keys)).toEqual([]);
 		win.dispatchEvent(key("keydown", "KeyS"));
 		expect(keys.KeyS).toBeUndefined();
+	});
+});
+
+// The real controls class drei's <PointerLockControls> wraps: lock() calls
+// `requestPointerLock()` on whatever element it was connected to. These pin the
+// contract FpsControls relies on — the predicate must compare against that
+// same element (drei defaults it to R3F's wrapper <div>, not the <canvas>).
+class LockableDoc extends FakeDoc {
+	exitPointerLock(): void {
+		this.pointerLockElement = null;
+		this.dispatchEvent(new Event("pointerlockchange"));
+	}
+}
+
+function lockable(doc: LockableDoc): Element {
+	const el = {
+		ownerDocument: doc,
+		requestPointerLock(): void {
+			doc.pointerLockElement = el;
+			doc.dispatchEvent(new Event("pointerlockchange"));
+		},
+	};
+	return el as unknown as Element;
+}
+
+describe("pointer lock wiring (real three-stdlib PointerLockControls)", () => {
+	function wire(lockOn: "canvas" | "wrapper") {
+		const win = new EventTarget();
+		const doc = new LockableDoc();
+		const canvas = lockable(doc);
+		const wrapper = lockable(doc);
+		const controls = new PointerLockControls(new PerspectiveCamera());
+		controls.connect((lockOn === "canvas" ? canvas : wrapper) as HTMLElement);
+		const keys: Record<string, boolean> = {};
+		const unbind = bindMovementKeys(win, doc, keys, () => pointerLockedTo(doc, canvas));
+		return { win, doc, canvas, controls, keys, unbind };
+	}
+
+	test("controls connected to the canvas: lock() → WASD registers", () => {
+		const { win, doc, canvas, controls, keys, unbind } = wire("canvas");
+		controls.lock();
+		expect(pointerLockedTo(doc, canvas)).toBe(true);
+		win.dispatchEvent(key("keydown", "KeyW"));
+		expect(keys.KeyW).toBe(true);
+		controls.unlock();
+		expect(Object.keys(keys)).toEqual([]);
+		unbind();
+		controls.dispose();
+	});
+
+	test("controls left on drei's default (wrapper) never satisfy a canvas predicate", () => {
+		// The regression: lock lands on the wrapper, so WASD never registers.
+		const { win, doc, canvas, controls, keys, unbind } = wire("wrapper");
+		controls.lock();
+		expect(doc.pointerLockElement).not.toBeNull();
+		expect(pointerLockedTo(doc, canvas)).toBe(false);
+		win.dispatchEvent(key("keydown", "KeyW"));
+		expect(keys.KeyW).toBeUndefined();
+		unbind();
+		controls.dispose();
+	});
+
+	test("pointerLockedTo is false for a null target", () => {
+		const doc = new FakeDoc();
+		expect(pointerLockedTo(doc, null)).toBe(false);
 	});
 });

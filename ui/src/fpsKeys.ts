@@ -12,6 +12,16 @@ export interface PointerLockDoc extends EventTarget {
 	readonly visibilityState?: string;
 }
 
+/**
+ * True while the pointer is locked to exactly `target`. The FPS controls must
+ * compare against the same element they lock: drei's <PointerLockControls>
+ * defaults to R3F's event wrapper <div>, not the <canvas>, so Office passes
+ * `domElement` explicitly and uses this predicate with that same element.
+ */
+export function pointerLockedTo(doc: PointerLockDoc, target: Element | null): boolean {
+	return target !== null && doc.pointerLockElement === target;
+}
+
 /** A keyboard-ish event: just the physical key code. */
 interface CodeEvent extends Event {
 	readonly code?: string;
