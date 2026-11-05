@@ -6,20 +6,15 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { muted, printInfo, printSuccess } from "../logging/color.ts";
-import { createMailClient } from "../mail/client.ts";
-import type { MailMessage, MailType } from "../types.ts";
+import { createMailClient, isMailType, resolveSender } from "../mail/client.ts";
+import type { MailMessage } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
+/** `--from` help: inside an agent's turn mail is always sent as that agent. */
+const FROM_HELP = "sender (default: this agent inside its turn, else operator)";
 
 function printMessage(m: MailMessage): void {
 	printInfo(`${m.read ? " " : "•"} [${m.type}] ${m.from} → ${m.to}: ${m.subject}`);
@@ -32,7 +27,7 @@ function sendCommand(): Command {
 		.requiredOption("--to <agent>", "recipient")
 		.requiredOption("--subject <text>", "subject")
 		.requiredOption("--body <text>", "body")
-		.option("--from <name>", "sender", "operator")
+		.option("--from <name>", FROM_HELP)
 		.option("--type <type>", "message type", "status")
 		.option("--priority <level>", "low|normal|high|urgent", "normal")
 		.option("--payload <json>", "structured JSON payload")
@@ -43,7 +38,7 @@ function sendCommand(): Command {
 					to: string;
 					subject: string;
 					body: string;
-					from: string;
+					from?: string;
 					type: string;
 					priority: string;
 					payload?: string;
@@ -52,15 +47,18 @@ function sendCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
+				const from = resolveSender(opts.from);
+				const type = opts.type;
+				if (!isMailType(type)) throw new ValidationError(`Unknown mail type "${type}".`);
 				const root = requireInit();
 				const client = createMailClient(root);
 				try {
 					const message = client.send({
-						from: opts.from,
+						from,
 						to: opts.to,
 						subject: opts.subject,
 						body: opts.body,
-						type: opts.type as MailType,
+						type,
 						priority: opts.priority as MailMessage["priority"],
 						payload: opts.payload ?? null,
 					});
@@ -150,12 +148,13 @@ function replyCommand(): Command {
 		.description("Reply to a message in the same thread")
 		.argument("<id>", "message id to reply to")
 		.requiredOption("--body <text>", "reply body")
-		.option("--from <name>", "sender", "operator")
-		.action((id: string, opts: { body: string; from: string }) => {
+		.option("--from <name>", FROM_HELP)
+		.action((id: string, opts: { body: string; from?: string }) => {
+			const from = resolveSender(opts.from);
 			const root = requireInit();
 			const client = createMailClient(root);
 			try {
-				const message = client.reply(id, opts.body, opts.from);
+				const message = client.reply(id, opts.body, from);
 				printSuccess(`Replied (${message.id})`);
 			} finally {
 				client.close();

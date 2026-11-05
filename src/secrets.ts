@@ -16,6 +16,9 @@ import { join } from "node:path";
 import yaml from "js-yaml";
 import { AGENTPLATE_DIR } from "./config.ts";
 import { ConfigError } from "./errors.ts";
+import { createLogger } from "./logging/logger.ts";
+
+const log = createLogger({ scope: "secrets" });
 
 /** Filename of the gitignored secrets store. */
 export const SECRETS_FILE = "secrets.local.yaml";
@@ -44,13 +47,20 @@ const SECRETS_SCHEMA = yaml.FAILSAFE_SCHEMA.extend({
 	],
 });
 
+/** Invalid entries already warned about (`path\0key`), so each warns once per process. */
+const warnedInvalid = new Set<string>();
+
 /**
  * Parse the secrets file into `name → value`, where `null` is an entry with no
- * value (`NAME:` left blank). A nested mapping or list cannot be a secret, so it
- * raises a {@link ConfigError} naming the key instead of being silently dropped —
- * otherwise the next {@link setSecret} rewrite would erase it from disk.
+ * value (`NAME:` left blank). A nested mapping or list cannot be a secret:
+ *
+ * - `mode: "read"` (lookups) skips that entry with a one-time warning naming
+ *   the key, so one bad entry cannot break every other secret lookup.
+ * - `mode: "write"` (before {@link setSecret} rewrites the file) raises a
+ *   {@link ConfigError} naming the key instead — the rewrite would otherwise
+ *   silently erase it from disk.
  */
-function readSecretsFile(path: string): Record<string, string | null> {
+function readSecretsFile(path: string, mode: "read" | "write"): Record<string, string | null> {
 	if (!existsSync(path)) return {};
 	let parsed: unknown;
 	try {
@@ -67,10 +77,14 @@ function readSecretsFile(path: string): Record<string, string | null> {
 		if (typeof value !== "string" && value !== null) {
 			// Under SECRETS_SCHEMA the only other node kinds are mappings and lists.
 			const kind = Array.isArray(value) ? "list" : "mapping";
-			throw new ConfigError(
-				`Secret ${key} in ${path} must be a plain string value, not a ${kind}. ` +
-					"Fix or remove that entry.",
-			);
+			const problem = `Secret ${key} in ${path} must be a plain string value, not a ${kind}.`;
+			if (mode === "write") throw new ConfigError(`${problem} Fix or remove that entry.`);
+			const warnKey = `${path}\0${key}`;
+			if (!warnedInvalid.has(warnKey)) {
+				warnedInvalid.add(warnKey);
+				log.warn(`${problem} Ignoring it; fix or remove that entry.`);
+			}
+			continue;
 		}
 		result[key] = value;
 	}
@@ -80,7 +94,7 @@ function readSecretsFile(path: string): Record<string, string | null> {
 /** Load all stored secrets for a project root (empty object if none). */
 export function loadSecrets(root: string): Record<string, string> {
 	const result: Record<string, string> = {};
-	for (const [key, value] of Object.entries(readSecretsFile(secretsPath(root)))) {
+	for (const [key, value] of Object.entries(readSecretsFile(secretsPath(root), "read"))) {
 		if (value !== null) result[key] = value;
 	}
 	return result;
@@ -93,7 +107,7 @@ export function loadSecrets(root: string): Record<string, string> {
  */
 export function setSecret(root: string, key: string, value: string): void {
 	const path = secretsPath(root);
-	const current = readSecretsFile(path);
+	const current = readSecretsFile(path, "write");
 	current[key] = value;
 	const header =
 		"# Agentplate secrets — gitignored, never commit this file.\n" +

@@ -1,7 +1,8 @@
 /**
  * Credential routing for the claude runtime's endpoint override: a shell-exported
- * ANTHROPIC_API_KEY must never reach a non-Anthropic `ANTHROPIC_BASE_URL` unless
- * the provider explicitly resolved that env var itself.
+ * ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN must never reach a non-Anthropic
+ * `ANTHROPIC_BASE_URL` unless the provider explicitly resolved that env var
+ * itself, and a gateway provider's own key is presented as the bearer.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -11,18 +12,25 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../config.ts";
 import { setSecret } from "../secrets.ts";
 import type { AgentplateConfig, ProviderConfig } from "../types.ts";
+import { agentChildEnv } from "../utils/child-process.ts";
 import { ClaudeRuntime, isAnthropicBaseUrl } from "./claude.ts";
 import { resolveModel } from "./resolve.ts";
 
 const runtime = new ClaudeRuntime();
 const SHELL_KEY = "sk-ant-shell-exported-key-0123456789";
+// Built by concatenation so the fixture never looks like a real token at rest.
+const SHELL_TOKEN = ["sk-ant-oat01", "shell", "exported", "token", "0123456789"].join("-");
 
-/** The child env every spawn site builds: `{...process.env, ...runtimeEnv}`. */
+/** The child env every spawn site builds: the allowlisted parent env + runtime env. */
 function childEnv(
 	runtimeEnv: Record<string, string>,
-	parent: Record<string, string | undefined> = { ANTHROPIC_API_KEY: SHELL_KEY, PATH: "/usr/bin" },
+	parent: Record<string, string | undefined> = {
+		ANTHROPIC_API_KEY: SHELL_KEY,
+		ANTHROPIC_AUTH_TOKEN: SHELL_TOKEN,
+		PATH: "/usr/bin",
+	},
 ): Record<string, string | undefined> {
-	return { ...parent, ...runtimeEnv };
+	return agentChildEnv(runtimeEnv, { passthrough: runtime.envPassthrough, parent });
 }
 
 describe("isAnthropicBaseUrl", () => {
@@ -56,20 +64,71 @@ describe("ClaudeRuntime.buildEnv — shell ANTHROPIC_API_KEY vs. non-Anthropic b
 		});
 		const child = childEnv(env);
 		expect(child.ANTHROPIC_API_KEY).toBe("");
+		expect(child.ANTHROPIC_AUTH_TOKEN).toBe("");
 		expect(child.ANTHROPIC_BASE_URL).toBe("https://openrouter.ai/api");
 		expect(child.OPENROUTER_API_KEY).toBe("or-key");
 		expect(child.PATH).toBe("/usr/bin");
 	});
 
-	test("subscription mode + non-Anthropic baseUrl: shell key is withheld", () => {
+	test("gateway credential (authTokenEnv) is presented as ANTHROPIC_AUTH_TOKEN", () => {
+		// OpenRouter's Claude Code recipe: base URL + its key as the bearer + an
+		// explicitly empty ANTHROPIC_API_KEY. Without the mapping the CLI sends no
+		// gateway credential at all (it never reads OPENROUTER_API_KEY).
+		const env = runtime.buildEnv({
+			model: "qwen/qwen3-coder:free",
+			env: { OPENROUTER_API_KEY: "or-key" },
+			authTokenEnv: "OPENROUTER_API_KEY",
+			baseUrl: "https://openrouter.ai/api/v1",
+			authMode: "api-key",
+		});
+		const child = childEnv(env);
+		expect(child.ANTHROPIC_AUTH_TOKEN).toBe("or-key");
+		expect(child.ANTHROPIC_API_KEY).toBe("");
+		expect(child.ANTHROPIC_BASE_URL).toBe("https://openrouter.ai/api");
+	});
+
+	test("the gateway mapping never sends a provider key to Anthropic or without a baseUrl", () => {
+		const anthropic = runtime.buildEnv({
+			model: "m",
+			env: { OTHER_KEY: "k" },
+			authTokenEnv: "OTHER_KEY",
+			baseUrl: "https://api.anthropic.com",
+			authMode: "api-key",
+		});
+		expect(anthropic.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+		const noBaseUrl = runtime.buildEnv({
+			model: "m",
+			env: { OTHER_KEY: "k" },
+			authTokenEnv: "OTHER_KEY",
+			authMode: "api-key",
+		});
+		expect(noBaseUrl).toEqual({ OTHER_KEY: "k" });
+	});
+
+	test("subscription mode + non-Anthropic baseUrl: shell key AND shell bearer are withheld", () => {
 		const env = runtime.buildEnv({
 			model: "m",
 			baseUrl: "https://attacker.example/v1",
 			authMode: "subscription",
 		});
-		expect(childEnv(env).ANTHROPIC_API_KEY).toBe("");
-		// No dummy bearer — the CLI's own login still carries auth.
-		expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+		const child = childEnv(env);
+		expect(child.ANTHROPIC_API_KEY).toBe("");
+		// Pinned to "" (unset to the CLI), never a dummy bearer — the CLI's own
+		// login still carries auth — and never the shell-exported token.
+		expect(child.ANTHROPIC_AUTH_TOKEN).toBe("");
+	});
+
+	test("a provider that set ANTHROPIC_AUTH_TOKEN itself gets it forwarded", () => {
+		const env = runtime.buildEnv({
+			model: "m",
+			env: { ANTHROPIC_AUTH_TOKEN: "gw-configured-token" },
+			authTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+			baseUrl: "https://gw.example.com",
+			authMode: "env",
+		});
+		const child = childEnv(env);
+		expect(child.ANTHROPIC_AUTH_TOKEN).toBe("gw-configured-token");
+		expect(child.ANTHROPIC_API_KEY).toBe("");
 	});
 
 	test("env mode with an unresolved credential: shell key is withheld", () => {
@@ -100,6 +159,7 @@ describe("ClaudeRuntime.buildEnv — shell ANTHROPIC_API_KEY vs. non-Anthropic b
 		});
 		expect(env).toEqual({ ANTHROPIC_BASE_URL: "https://api.anthropic.com" });
 		expect(childEnv(env).ANTHROPIC_API_KEY).toBe(SHELL_KEY);
+		expect(childEnv(env).ANTHROPIC_AUTH_TOKEN).toBe(SHELL_TOKEN);
 	});
 
 	test("no baseUrl leaves the shell key alone (legacy behavior)", () => {
@@ -112,18 +172,23 @@ describe("ClaudeRuntime.buildEnv — shell ANTHROPIC_API_KEY vs. non-Anthropic b
 describe("resolveModel → ClaudeRuntime.buildEnv → spawned child", () => {
 	let root: string;
 	let savedKey: string | undefined;
+	let savedToken: string | undefined;
 
 	beforeEach(() => {
 		root = mkdtempSync(join(tmpdir(), "agentplate-claude-env-"));
 		mkdirSync(join(root, ".agentplate"), { recursive: true });
 		savedKey = process.env.ANTHROPIC_API_KEY;
+		savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
 		process.env.ANTHROPIC_API_KEY = SHELL_KEY;
+		process.env.ANTHROPIC_AUTH_TOKEN = SHELL_TOKEN;
 	});
 
 	afterEach(() => {
 		rmSync(root, { recursive: true, force: true });
 		if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
 		else process.env.ANTHROPIC_API_KEY = savedKey;
+		if (savedToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+		else process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
 	});
 
 	function configWith(provider: ProviderConfig): AgentplateConfig {
@@ -133,16 +198,22 @@ describe("resolveModel → ClaudeRuntime.buildEnv → spawned child", () => {
 		return cfg;
 	}
 
-	/** Spawn a real child exactly like turn-runner does and read its ANTHROPIC_API_KEY. */
-	async function childApiKey(runtimeEnv: Record<string, string>): Promise<string> {
+	/** Spawn a real child exactly like turn-runner does and read one env var. */
+	async function childVar(runtimeEnv: Record<string, string>, name: string): Promise<string> {
 		const proc = Bun.spawn(
-			[process.execPath, "-e", "process.stdout.write(process.env.ANTHROPIC_API_KEY ?? '<unset>')"],
-			{ env: { ...process.env, ...runtimeEnv }, stdout: "pipe", stderr: "pipe" },
+			[process.execPath, "-e", `process.stdout.write(process.env.${name} ?? '<unset>')`],
+			{
+				env: agentChildEnv(runtimeEnv, { passthrough: runtime.envPassthrough }),
+				stdout: "pipe",
+				stderr: "pipe",
+			},
 		);
 		const out = await new Response(proc.stdout).text();
 		expect(await proc.exited).toBe(0);
 		return out;
 	}
+	const childApiKey = (env: Record<string, string>) => childVar(env, "ANTHROPIC_API_KEY");
+	const childAuthToken = (env: Record<string, string>) => childVar(env, "ANTHROPIC_AUTH_TOKEN");
 
 	test("a committed gateway config (subscription) cannot exfiltrate the shell key", async () => {
 		const cfg = configWith({
@@ -153,6 +224,7 @@ describe("resolveModel → ClaudeRuntime.buildEnv → spawned child", () => {
 		});
 		const resolved = resolveModel(cfg, root, "alias", undefined, () => {});
 		expect(await childApiKey(runtime.buildEnv(resolved))).toBe("");
+		expect(await childAuthToken(runtime.buildEnv(resolved))).toBe("");
 	});
 
 	test("an api-key gateway with its own credential sends that, not the shell key", async () => {
@@ -165,7 +237,10 @@ describe("resolveModel → ClaudeRuntime.buildEnv → spawned child", () => {
 			baseUrl: "https://openrouter.ai/api/v1",
 		});
 		const resolved = resolveModel(cfg, root, "alias", undefined, () => {});
+		expect(resolved.authTokenEnv).toBe("OPENROUTER_API_KEY");
 		expect(await childApiKey(runtime.buildEnv(resolved))).toBe("");
+		// The OpenRouter key authenticates as the bearer; the shell token never does.
+		expect(await childAuthToken(runtime.buildEnv(resolved))).toBe("or-file-key");
 	});
 
 	test("a gateway configured with authTokenEnv ANTHROPIC_API_KEY still receives it", async () => {

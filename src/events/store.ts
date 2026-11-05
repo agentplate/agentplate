@@ -13,7 +13,7 @@
 // into SQL so callers never load the whole log into memory.
 
 import type { Database } from "bun:sqlite";
-import { openDatabase } from "../db/sqlite.ts";
+import { type Migration, openDatabase, resolveLimit } from "../db/sqlite.ts";
 import type { EventRecord } from "../types.ts";
 
 /** Input accepted by `record()`. `id`/`createdAt` are assigned by the store. */
@@ -33,15 +33,34 @@ export interface ListEventsFilter {
 	agentName?: string;
 	runId?: string;
 	type?: string;
-	// Max rows to return. Must be a positive integer when provided; otherwise the
-	// whole (filtered) log is returned newest-first.
+	// Max rows to return. Omitted → the whole (filtered) log, newest-first. A value
+	// that is not a positive integer (0, negative, NaN) falls back to the default
+	// cap (DEFAULT_LIST_LIMIT) — it never means "no limit".
 	limit?: number;
+}
+
+/**
+ * One `(agent, UTC day)` bucket of recorded token/cost usage, as returned by
+ * {@link EventStore.usageTotals}.
+ */
+export interface UsageBucket {
+	agentName: string;
+	/** `YYYY-MM-DD`, the date part of the events' ISO-8601 `created_at` (UTC). */
+	day: string;
+	tokens: number;
+	costUsd: number;
 }
 
 /** Public surface returned by {@link createEventStore}. */
 export interface EventStore {
 	record(event: RecordEventInput): EventRecord;
 	list(filter?: ListEventsFilter): EventRecord[];
+	/**
+	 * Sum the token/cost usage recorded in event `detail` JSON (`{ tokens, cost }`,
+	 * or `costUsd`) over the WHOLE log, grouped by agent and day (oldest day first).
+	 * Aggregated in SQL so totals never depend on how many other events exist.
+	 */
+	usageTotals(): UsageBucket[];
 	/**
 	 * Delete every event logged by `agentName` (optionally scoped to one run);
 	 * returns the number of rows removed. Used when fully purging a reaped agent's
@@ -87,38 +106,71 @@ function rowToRecord(row: EventRow): EventRecord {
 }
 
 /**
+ * Ordered schema migrations (tracked in `PRAGMA user_version`; see openDatabase).
+ * Append new steps — never edit a shipped one.
+ *
+ * v1 — baseline. Flat schema. `seq` (INTEGER PRIMARY KEY AUTOINCREMENT) is the
+ * canonical insertion-order key we sort by — see EventRow for why created_at/id
+ * can't serve that role. `id` is the public UUID, kept UNIQUE so callers can look
+ * up by it. `created_at` is an ISO-8601 string (lexically sortable, used only for
+ * display and time-range filtering, not as the primary sort key). The indexes
+ * cover the columns we filter by; ordering is on `seq` (the PRIMARY KEY), which
+ * is already indexed. Idempotent, because pre-versioning DBs already hold it.
+ */
+export const EVENTS_MIGRATIONS: readonly Migration[] = [
+	{
+		version: 1,
+		sql: `
+			CREATE TABLE IF NOT EXISTS events (
+				seq INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				agent_name TEXT NOT NULL,
+				run_id TEXT,
+				type TEXT NOT NULL,
+				tool TEXT,
+				detail TEXT,
+				created_at TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_name);
+			CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+		`,
+	},
+];
+
+// Sum usage per (agent, day) across the whole log. Only rows whose `detail` is
+// valid JSON are inspected (the lone WHERE term, so json_type never sees
+// malformed text); a numeric `tokens` counts, and `cost` wins over `costUsd`
+// exactly as the JS reader it replaced did. Buckets with no usage are dropped.
+const USAGE_TOTALS_SQL = `
+	SELECT
+		agent_name,
+		substr(created_at, 1, 10) AS day,
+		SUM(IIF(json_type(detail, '$.tokens') IN ('integer', 'real'),
+			json_extract(detail, '$.tokens'), 0)) AS tokens,
+		SUM(CASE
+			WHEN json_type(detail, '$.cost') IN ('integer', 'real') THEN json_extract(detail, '$.cost')
+			WHEN json_type(detail, '$.costUsd') IN ('integer', 'real') THEN json_extract(detail, '$.costUsd')
+			ELSE 0
+		END) AS cost_usd
+	FROM events
+	WHERE json_valid(detail)
+	GROUP BY agent_name, day
+	HAVING tokens <> 0 OR cost_usd <> 0
+	ORDER BY day ASC, agent_name ASC`;
+
+/**
  * Open (creating if needed) the events store at `dbPath`.
  *
  * `dbPath` may be ":memory:" for tests or an absolute file path in a project's
- * `.agentplate/` directory. The table is created on open so callers never need a
- * separate migration step.
+ * `.agentplate/` directory. The schema is created/migrated on open so callers
+ * never need a separate migration step.
  */
 export function createEventStore(dbPath: string): EventStore {
 	// Guard on `events.seq` against an incompatible foreign `events` table.
-	const db: Database = openDatabase(dbPath, { guard: { table: "events", columns: ["seq"] } });
-
-	// Flat schema. `seq` (INTEGER PRIMARY KEY AUTOINCREMENT) is the canonical
-	// insertion-order key we sort by — see EventRow for why created_at/id can't
-	// serve that role. `id` is the public UUID, kept UNIQUE so callers can look up
-	// by it. `created_at` is an ISO-8601 string (lexically sortable, used only for
-	// display and time-range filtering, not as the primary sort key).
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS events (
-			seq INTEGER PRIMARY KEY AUTOINCREMENT,
-			id TEXT NOT NULL UNIQUE,
-			agent_name TEXT NOT NULL,
-			run_id TEXT,
-			type TEXT NOT NULL,
-			tool TEXT,
-			detail TEXT,
-			created_at TEXT NOT NULL
-		)
-	`);
-
-	// Index the columns we filter by. Ordering is on `seq` (the PRIMARY KEY), which
-	// is already indexed, so no extra index is needed for the newest-first sort.
-	db.exec("CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_name)");
-	db.exec("CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id)");
+	const db: Database = openDatabase(dbPath, {
+		guard: { table: "events", columns: ["seq"] },
+		migrations: EVENTS_MIGRATIONS,
+	});
 
 	function record(event: RecordEventInput): EventRecord {
 		// Assign identity + timestamp here so callers stay declarative. UUID is the
@@ -184,12 +236,11 @@ export function createEventStore(dbPath: string): EventStore {
 		           FROM events ${where}
 		           ORDER BY seq DESC`;
 
-		// Only apply LIMIT for a positive, finite integer. Anything else (0,
-		// negative, NaN, undefined) is treated as "no limit" rather than silently
-		// returning nothing or erroring. Capturing into a local `const` lets TS
-		// narrow it to `number` for the bind below.
-		const { limit } = filter;
-		if (typeof limit === "number" && Number.isInteger(limit) && limit > 0) {
+		// Omitted → no LIMIT. Anything else is normalized to a positive integer, so
+		// 0 / negative / NaN fall back to the default cap instead of dumping the
+		// whole (append-only, unbounded) log.
+		const limit = resolveLimit(filter.limit);
+		if (limit !== undefined) {
 			sql += " LIMIT $limit";
 			params.$limit = limit;
 		}
@@ -197,6 +248,21 @@ export function createEventStore(dbPath: string): EventStore {
 		const rows = db.query(sql).all(params) as EventRow[];
 
 		return rows.map(rowToRecord);
+	}
+
+	function usageTotals(): UsageBucket[] {
+		const rows = db.query(USAGE_TOTALS_SQL).all() as Array<{
+			agent_name: string;
+			day: string;
+			tokens: number;
+			cost_usd: number;
+		}>;
+		return rows.map((r) => ({
+			agentName: r.agent_name,
+			day: r.day,
+			tokens: r.tokens,
+			costUsd: r.cost_usd,
+		}));
 	}
 
 	function deleteByAgent(agentName: string, runId?: string): number {
@@ -220,5 +286,5 @@ export function createEventStore(dbPath: string): EventStore {
 		db.close();
 	}
 
-	return { record, list, deleteByAgent, close };
+	return { record, list, usageTotals, deleteByAgent, close };
 }

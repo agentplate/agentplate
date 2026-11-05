@@ -20,7 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { createDeployAudit } from "../deploy/audit.ts";
 import { buildDeployContext } from "../deploy/context.ts";
 import { getAllDeployTargets, getDeployTarget } from "../deploy/registry.ts";
@@ -37,52 +37,23 @@ import type {
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { muted, printError, printInfo, printSuccess, printWarning } from "../logging/color.ts";
-import { currentRunPath, deploysDbPath } from "../paths.ts";
+import { deploysDbPath } from "../paths.ts";
 import type { DeployAuditRow } from "../types.ts";
+import { gitOutput } from "../utils/git.ts";
+import { readCurrentRun, requireInit } from "./shared.ts";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
 /** Resolve + require an initialized project root (honors `--project`). */
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
-
-/** Read the active run id from `.agentplate/current-run.txt`, or null when unset. */
-function readCurrentRun(root: string): string | null {
-	const path = currentRunPath(root);
-	if (!existsSync(path)) return null;
-	try {
-		const trimmed = readFileSync(path, "utf8").trim();
-		return trimmed === "" ? null : trimmed;
-	} catch {
-		return null;
-	}
-}
-
 /**
  * Best-effort current commit sha for the audit row. Never throws: a project may
  * be a non-git directory or have no commits yet, in which case the audit records
  * an empty sha rather than failing the deploy.
  */
 async function readCommitSha(root: string): Promise<string> {
-	try {
-		const proc = Bun.spawn(["git", "rev-parse", "HEAD"], {
-			cwd: root,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-		if (exitCode !== 0) return "";
-		return stdout.trim();
-	} catch {
-		return "";
-	}
+	return (await gitOutput(root, ["rev-parse", "HEAD"])) ?? "";
 }
 
 /**

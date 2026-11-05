@@ -8,7 +8,9 @@
  * subscription runtime.
  *
  * The message is a POSITIONAL argument (`opencode run [message..]`), NOT a flag —
- * a leading `--prompt` makes OpenCode print usage and do nothing. Headless turns
+ * a leading `--prompt` makes OpenCode print usage and do nothing — and `run`
+ * appends piped stdin to it, so Agentplate passes no positional and writes the
+ * prompt to stdin (no argv size limit). Headless turns
  * use `opencode run --format json`, whose stdout is a stream of JSON events
  * (`{ type, sessionID, … }`); {@link OpenCodeRuntime.parseEvents} normalizes them.
  * Session continuity uses `--session <id>` captured from those events.
@@ -64,14 +66,22 @@ export class OpenCodeRuntime implements AgentRuntime {
 	/** OpenCode reads `AGENTS.md` from the cwd at startup. */
 	readonly instructionPath = "AGENTS.md";
 
+	/** `opencode run` appends piped stdin to its (here empty) message. */
+	readonly promptInput = "stdin" as const;
+
+	/** OpenCode's own config/login settings (`OPENCODE_CONFIG`, …). */
+	readonly envPassthrough = ["OPENCODE_*"] as const;
+
 	/**
 	 * Build argv for a single headless turn (`opencode run`).
 	 *
-	 * `run <message>` executes the prompt non-interactively — the message is the
-	 * trailing POSITIONAL (the `run` subcommand has no `--prompt` flag and prints
-	 * usage if given one). `--model provider/model` pins the model, `--format json`
-	 * emits the per-event JSON that {@link parseEvents} consumes, and `--session
-	 * <id>` resumes a prior turn (omitted on the first turn).
+	 * `run` executes non-interactively. The message is NOT a positional here:
+	 * `opencode run` appends piped stdin to its message, and the caller writes
+	 * the prompt there ({@link promptInput}) so a large prompt never hits the argv
+	 * limit (the `run` subcommand has no `--prompt` flag and prints usage if given
+	 * one). `--model provider/model` pins the model, `--format json` emits the
+	 * per-event JSON that {@link parseEvents} consumes, and `--session <id>`
+	 * resumes a prior turn (omitted on the first turn).
 	 *
 	 * Permission auto-approval is handled by the `OPENCODE_PERMISSION` env var (see
 	 * {@link buildEnv}), NOT a CLI flag: the `--dangerously-skip-permissions` flag
@@ -87,8 +97,6 @@ export class OpenCodeRuntime implements AgentRuntime {
 			"--format",
 			"json",
 			...(opts.resumeSessionId ? ["--session", opts.resumeSessionId] : []),
-			// Message is the trailing positional argument.
-			opts.prompt ?? "",
 		];
 	}
 
@@ -128,15 +136,13 @@ export class OpenCodeRuntime implements AgentRuntime {
 
 	/**
 	 * Build argv for a one-shot, non-streaming call (`opencode run --format text`).
-	 * The model is appended only when provided; the prompt is the trailing
-	 * positional.
+	 * The model is appended only when provided; the prompt is piped on stdin.
 	 */
-	buildPrintCommand(prompt: string, model?: string): string[] {
+	buildPrintCommand(_prompt: string, model?: string): string[] {
 		const argv = ["opencode", "run", "--format", "text"];
 		if (model !== undefined) {
 			argv.push("--model", opencodeModel(model));
 		}
-		argv.push(prompt);
 		return argv;
 	}
 

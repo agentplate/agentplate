@@ -4,8 +4,8 @@
  * Two execution paths share the same git primitives:
  *
  *   mergeBranch()   — mutating. Checks out the target branch and runs a real
- *                     `git merge`. On conflict it either auto-resolves
- *                     (keep-theirs) or aborts cleanly, depending on `opts`.
+ *                     `git merge`. On conflict it either auto-resolves (only
+ *                     when that loses nothing — see below) or aborts cleanly.
  *   predictMerge()  — read-only. Reports whether a merge WOULD conflict and
  *                     which tier would apply via `git merge-tree --write-tree`,
  *                     which never touches HEAD, the index, or the working tree
@@ -19,67 +19,30 @@
  * "reimagine" from {@link MergeTier} are reserved for a later phase):
  *
  *   clean-merge   — `git merge --no-ff` succeeded with no conflicts.
- *   auto-resolve  — conflicts existed; we took the incoming branch's version of
- *                   every conflicted file (`git checkout --theirs`, or `git rm`
- *                   when the branch deleted it), staged ONLY those files, and
- *                   committed. This is "agent work wins", matching the
- *                   orchestration model where the branch is the source of truth.
- *                   Conflicts inside `.agentplate/` are never auto-resolved.
+ *   auto-resolve  — conflicts existed, and for EVERY conflicted file the target
+ *                   side is unchanged from the merge base (index stage 2 ==
+ *                   stage 1). Only then do we take the incoming branch's version
+ *                   (`git checkout --theirs`, or `git rm` when the branch deleted
+ *                   it), stage ONLY those files, and commit. Conflicts inside
+ *                   `.agentplate/` are never auto-resolved.
  *
- * WHY keep-theirs for auto-resolve: agent worktrees are branched from the
- * target and own an exclusive file scope, so when a conflict does occur the
- * branch side is the intended change and the target side is stale. Taking
- * "theirs" wholesale is the deterministic, no-LLM resolution. Semantically
- * risky conflicts are a future-phase concern (ai-resolve).
+ * WHY auto-resolve is this narrow: taking "theirs" for a whole file discards
+ * every change the target made to it — including hunks git had already merged
+ * cleanly, i.e. other agents' work that already landed. There is no AI
+ * resolution tier yet (ai-resolve is reserved), so a conflicted file that the
+ * target side also changed is never resolved automatically: the merge is
+ * aborted and reported as failed with those files listed, for a human (or a
+ * later tier) to resolve. In practice ordinary content conflicts (both sides
+ * edited the file) therefore fail; auto-resolve only applies to the rare shapes
+ * where git flags a conflict yet the target's copy is still the base version.
  */
 
 import { AGENTPLATE_DIR } from "../config.ts";
 import { SubprocessError, WorktreeError } from "../errors.ts";
 import type { MergeResult } from "../types.ts";
+import { runGit, runGitChecked } from "../utils/git.ts";
 
 /** Result of running a git subprocess. */
-interface GitResult {
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-}
-
-/**
- * Run a git command in `repoRoot` and capture its output. Never throws on a
- * non-zero exit — callers inspect `exitCode` because for git a non-zero exit is
- * frequently expected (a merge conflict is exit 1, not a crash).
- */
-async function runGit(repoRoot: string, args: string[]): Promise<GitResult> {
-	const proc = Bun.spawn(["git", ...args], {
-		cwd: repoRoot,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	return { stdout, stderr, exitCode };
-}
-
-/**
- * Run a git command that is expected to succeed. Throws {@link SubprocessError}
- * (carrying the git exit code) on any non-zero exit. Use this only for steps
- * where a failure is genuinely exceptional (checkout of an existing branch,
- * staging, committing a resolution).
- */
-async function runGitChecked(repoRoot: string, args: string[]): Promise<GitResult> {
-	const result = await runGit(repoRoot, args);
-	if (result.exitCode !== 0) {
-		throw new SubprocessError(
-			`git ${args.join(" ")} failed (exit ${result.exitCode}): ${result.stderr.trim()}`,
-			result.exitCode,
-		);
-	}
-	return result;
-}
-
 /**
  * Split git's NUL-delimited (`-z`) path output into a clean array. `-z` paths
  * are verbatim (never C-quoted), so they can be passed straight back to git.
@@ -88,28 +51,85 @@ function parseNulList(stdout: string): string[] {
 	return stdout.split("\0").filter((entry) => entry.length > 0);
 }
 
+/**
+ * Index stages of one unmerged path, each as "<mode> <oid>" (absent when that
+ * side has no version of the path: added on one side only, or deleted).
+ */
+interface UnmergedEntry {
+	path: string;
+	base?: string;
+	ours?: string;
+	theirs?: string;
+}
+
+/**
+ * Group `ls-files -u -z` / `merge-tree --write-tree -z` conflict entries
+ * ("<mode> <oid> <stage>\t<path>") by path, preserving first-seen order.
+ * Exported for tests.
+ */
+export function parseUnmergedEntries(entries: string[]): UnmergedEntry[] {
+	const byPath = new Map<string, UnmergedEntry>();
+	for (const entry of entries) {
+		const tab = entry.indexOf("\t");
+		if (tab === -1) continue;
+		const [mode, oid, stage] = entry.slice(0, tab).split(" ");
+		const path = entry.slice(tab + 1);
+		let rec = byPath.get(path);
+		if (!rec) {
+			rec = { path };
+			byPath.set(path, rec);
+		}
+		const version = `${mode} ${oid}`;
+		if (stage === "1") rec.base = version;
+		else if (stage === "2") rec.ours = version;
+		else if (stage === "3") rec.theirs = version;
+	}
+	return [...byPath.values()];
+}
+
+/** How auto-resolve would treat each conflicted path. */
+interface AutoResolvePlan {
+	/** Target unchanged vs base, branch has a version: take theirs. */
+	keep: string[];
+	/** Target unchanged vs base, branch deleted it: take the deletion. */
+	remove: string[];
+	/** Target changed the path too: taking theirs would lose landed work. */
+	unsafe: string[];
+}
+
+/**
+ * Decide, per conflicted path, whether keep-theirs is lossless. It is only when
+ * the target's version (stage 2) exists and is identical to the merge base's
+ * (stage 1): then the target contributed nothing to that path that taking the
+ * branch's version could discard. Anything else — the target edited, added, or
+ * deleted the path — is unsafe. Exported for tests.
+ */
+export function planAutoResolve(entries: UnmergedEntry[]): AutoResolvePlan {
+	const plan: AutoResolvePlan = { keep: [], remove: [], unsafe: [] };
+	for (const e of entries) {
+		const targetUnchanged = e.base !== undefined && e.ours === e.base;
+		if (!targetUnchanged) plan.unsafe.push(e.path);
+		else if (e.theirs !== undefined) plan.keep.push(e.path);
+		else plan.remove.push(e.path);
+	}
+	return plan;
+}
+
 /** Files currently in an unmerged (conflicted) state in the index. */
 async function conflictedFiles(repoRoot: string): Promise<string[]> {
 	const { stdout } = await runGit(repoRoot, ["diff", "--name-only", "-z", "--diff-filter=U"]);
 	return parseNulList(stdout);
 }
 
-/**
- * Paths whose incoming ("theirs", index stage 3) version exists, among the
- * currently unmerged entries. A conflicted path missing from this set was
- * deleted on the incoming branch (modify/delete, delete/delete).
- */
-async function pathsWithTheirVersion(repoRoot: string): Promise<Set<string>> {
-	// `ls-files -u -z` entries are "<mode> <oid> <stage>\t<path>".
+/** The unmerged index entries of the in-progress merge, grouped by path. */
+async function unmergedEntries(repoRoot: string): Promise<UnmergedEntry[]> {
 	const { stdout } = await runGitChecked(repoRoot, ["ls-files", "-u", "-z"]);
-	const theirs = new Set<string>();
-	for (const entry of parseNulList(stdout)) {
-		const tab = entry.indexOf("\t");
-		if (tab === -1) continue;
-		const stage = entry.slice(0, tab).split(" ")[2];
-		if (stage === "3") theirs.add(entry.slice(tab + 1));
-	}
-	return theirs;
+	return parseUnmergedEntries(parseNulList(stdout));
+}
+
+/** Why auto-resolve refuses conflicts the target side also changed. */
+function unsafeMessage(unsafe: string[]): string {
+	return `the target also changed ${unsafe.length} conflicted file(s) (${unsafe.join(", ")}); taking the incoming version would discard work already on the target, so they must be resolved manually`;
 }
 
 /** True if `path` (repo-relative) lives in Agentplate's own state directory. */
@@ -171,7 +191,8 @@ async function ensureOnBranch(repoRoot: string, branch: string): Promise<void> {
 }
 
 /**
- * Resolve every conflicted path keep-theirs and stage exactly those paths.
+ * Apply a fully-safe {@link AutoResolvePlan} (no `unsafe` paths) and stage
+ * exactly the conflicted paths.
  *
  * Only the conflicted files are staged (never `git add -A`): the root checkout
  * may hold unrelated untracked/modified operator files and Agentplate runtime
@@ -179,10 +200,8 @@ async function ensureOnBranch(repoRoot: string, branch: string): Promise<void> {
  * `--literal-pathspecs` keeps a file literally named e.g. `*.ts` from matching
  * other paths.
  */
-async function resolveKeepTheirs(repoRoot: string, conflicts: string[]): Promise<void> {
-	const theirs = await pathsWithTheirVersion(repoRoot);
-	const keep = conflicts.filter((file) => theirs.has(file));
-	const remove = conflicts.filter((file) => !theirs.has(file));
+async function resolveKeepTheirs(repoRoot: string, plan: AutoResolvePlan): Promise<void> {
+	const { keep, remove } = plan;
 	if (keep.length > 0) {
 		await runGitChecked(repoRoot, ["--literal-pathspecs", "checkout", "--theirs", "--", ...keep]);
 		await runGitChecked(repoRoot, ["--literal-pathspecs", "add", "--", ...keep]);
@@ -204,9 +223,11 @@ async function resolveKeepTheirs(repoRoot: string, conflicts: string[]): Promise
  * it throws, so the repo is never left with a MERGE_HEAD.
  *
  * @param opts.autoResolve When true, conflicts are resolved keep-theirs and
- *   committed (tier "auto-resolve"). When false (default), a conflicting merge
- *   is aborted and reported as failed, leaving the repo with no in-progress
- *   merge.
+ *   committed (tier "auto-resolve") — but only if no conflicted file was also
+ *   changed on the target (see the module doc); otherwise the merge is aborted
+ *   and reported as failed with the files listed. When false (default), any
+ *   conflicting merge is aborted and reported as failed. Either way a failed
+ *   merge leaves the repo with no in-progress merge.
  */
 export async function mergeBranch(
 	repoRoot: string,
@@ -228,8 +249,15 @@ export async function mergeBranch(
 
 	// --no-ff: always create a merge commit so the branch's history is preserved
 	// as a distinct unit. --no-edit: accept the default merge message
-	// non-interactively (no editor in a headless context).
-	const merge = await runGit(repoRoot, ["merge", "--no-ff", "--no-edit", branchName]);
+	// non-interactively (no editor in a headless context). The full ref keeps a
+	// same-named tag (`refs/tags/<name>`) from being merged instead of the
+	// branch that assertLocalBranch validated.
+	const merge = await runGit(repoRoot, [
+		"merge",
+		"--no-ff",
+		"--no-edit",
+		`refs/heads/${branchName}`,
+	]);
 
 	if (merge.exitCode === 0) {
 		return {
@@ -286,11 +314,23 @@ export async function mergeBranch(
 
 	// Auto-resolve: take the incoming branch's version of each conflicted file
 	// (`--theirs` during a merge is the branch being merged in), stage only those
-	// files, and commit the in-progress merge with its default message. Any
-	// failure part-way (a hook, an unexpected conflict shape) aborts the merge we
-	// started so the root checkout is never left half-merged.
+	// files, and commit the in-progress merge with its default message — but
+	// only if that is lossless for every file. Any failure part-way (a hook, an
+	// unexpected conflict shape) aborts the merge we started so the root
+	// checkout is never left half-merged.
 	try {
-		await resolveKeepTheirs(repoRoot, conflicts);
+		const plan = planAutoResolve(await unmergedEntries(repoRoot));
+		if (plan.unsafe.length > 0) {
+			await runGitChecked(repoRoot, ["merge", "--abort"]);
+			return {
+				branchName,
+				status: "failed",
+				tier: null,
+				conflictFiles: conflicts,
+				message: `Merge of ${branchName} into ${targetBranch} not auto-resolved: ${unsafeMessage(plan.unsafe)}. Merge aborted.`,
+			};
+		}
+		await resolveKeepTheirs(repoRoot, plan);
 		await runGitChecked(repoRoot, ["commit", "--no-edit"]);
 	} catch (err) {
 		if (await mergeInProgress(repoRoot)) {
@@ -304,7 +344,7 @@ export async function mergeBranch(
 		status: "merged",
 		tier: "auto-resolve",
 		conflictFiles: conflicts,
-		message: `Merged ${branchName} into ${targetBranch}; auto-resolved ${conflicts.length} conflict(s) by keeping incoming changes.`,
+		message: `Merged ${branchName} into ${targetBranch}; auto-resolved ${conflicts.length} conflict(s) the target had not changed by keeping incoming changes.`,
 	};
 }
 
@@ -321,14 +361,17 @@ export async function mergeBranch(
  * reclaims. It compares the committed branch tips only; uncommitted changes in
  * the root checkout do not affect the prediction.
  *
- * Returned status is "pending" (a prediction, not a completed merge):
- *   - clean    -> tier "clean-merge", no conflict files
- *   - conflict -> tier "auto-resolve" (what mergeBranch would apply), files listed
+ * Mirrors {@link mergeBranch} given the same `opts`:
+ *   - clean                     -> "pending", tier "clean-merge"
+ *   - conflict, auto-resolvable -> "pending", tier "auto-resolve", files listed
+ *   - any other conflict (auto-resolve off, `.agentplate/` state, or the target
+ *     also changed a conflicted file) -> "failed", tier null, files listed
  */
 export async function predictMerge(
 	repoRoot: string,
 	branchName: string,
 	targetBranch: string,
+	opts: { autoResolve?: boolean } = {},
 ): Promise<MergeResult> {
 	// Validate first: merge-tree reports a missing branch with exit 1, the same
 	// code it uses for "conflicts".
@@ -338,7 +381,6 @@ export async function predictMerge(
 	const trial = await runGit(repoRoot, [
 		"merge-tree",
 		"--write-tree",
-		"--name-only",
 		"--no-messages",
 		"-z",
 		`refs/heads/${targetBranch}`,
@@ -363,8 +405,12 @@ export async function predictMerge(
 		);
 	}
 
-	// Exit 1 = conflicts; `-z` output is "<tree-oid>\0<path>\0<path>\0...".
-	const conflicts = trial.exitCode === 1 ? parseNulList(trial.stdout).slice(1) : [];
+	// Exit 1 = conflicts; `-z` output is "<tree-oid>\0" then one
+	// "<mode> <oid> <stage>\t<path>\0" entry per conflicted stage — the same
+	// shape as `ls-files -u -z`, so the same auto-resolve plan applies.
+	const entries =
+		trial.exitCode === 1 ? parseUnmergedEntries(parseNulList(trial.stdout).slice(1)) : [];
+	const conflicts = entries.map((e) => e.path);
 	if (conflicts.length === 0) {
 		// Anything else means git refused the merge for a structural reason (e.g.
 		// unrelated histories). Report it as a failure prediction rather than
@@ -390,11 +436,32 @@ export async function predictMerge(
 		};
 	}
 
+	if (!opts.autoResolve) {
+		return {
+			branchName,
+			status: "failed",
+			tier: null,
+			conflictFiles: conflicts,
+			message: `${branchName} would conflict with ${targetBranch} in ${conflicts.length} file(s); auto-resolve disabled, the merge would be aborted.`,
+		};
+	}
+
+	const plan = planAutoResolve(entries);
+	if (plan.unsafe.length > 0) {
+		return {
+			branchName,
+			status: "failed",
+			tier: null,
+			conflictFiles: conflicts,
+			message: `${branchName} would conflict with ${targetBranch} and not be auto-resolved: ${unsafeMessage(plan.unsafe)}.`,
+		};
+	}
+
 	return {
 		branchName,
 		status: "pending",
 		tier: "auto-resolve",
 		conflictFiles: conflicts,
-		message: `${branchName} would conflict with ${targetBranch} in ${conflicts.length} file(s); auto-resolve would keep incoming changes.`,
+		message: `${branchName} would conflict with ${targetBranch} in ${conflicts.length} file(s) the target has not changed; auto-resolve would keep incoming changes.`,
 	};
 }

@@ -8,8 +8,9 @@
 
 import { useMemo, useState } from "react";
 import { postChat, postTask } from "../api.ts";
-import { Badge, Card, fmtAgo } from "../lib.tsx";
 import { IconChat, PageIcon } from "../icons.tsx";
+import { feedKey, withStableKeys } from "../keys.ts";
+import { Badge, Card, fmtAgo } from "../lib.tsx";
 import type { FeedItem } from "../types.ts";
 
 const CAPABILITIES = ["builder", "lead", "scout", "reviewer"] as const;
@@ -143,11 +144,26 @@ export function ChatScreen({ feed }: { feed: FeedItem[] }): JSX.Element {
 					{conversation.length === 0 ? (
 						<div className="empty">No messages yet. Say hello to the coordinator below.</div>
 					) : (
-						<ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 12 }}>
-							{conversation.map((m, i) => (
+						<ul
+							style={{
+								listStyle: "none",
+								margin: 0,
+								padding: 0,
+								display: "flex",
+								flexDirection: "column",
+								gap: 12,
+							}}
+						>
+							{withStableKeys(conversation, feedKey).map(({ item: m, key }) => (
 								<li
-									key={`${m.ts}-${i}`}
-									style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 12, borderBottom: "1px solid var(--border-soft)" }}
+									key={key}
+									style={{
+										display: "flex",
+										flexDirection: "column",
+										gap: 4,
+										paddingBottom: 12,
+										borderBottom: "1px solid var(--border-soft)",
+									}}
 								>
 									<div style={{ display: "flex", alignItems: "center", gap: 8 }}>
 										<span className="mono" style={{ fontWeight: 600 }}>
@@ -183,7 +199,10 @@ export function ChatScreen({ feed }: { feed: FeedItem[] }): JSX.Element {
 					</Card>
 
 					<Card title="Submit a task" meta="spawns a worker">
-						<form onSubmit={submitTask} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+						<form
+							onSubmit={submitTask}
+							style={{ display: "flex", flexDirection: "column", gap: 12 }}
+						>
 							<textarea
 								style={textareaStyle}
 								placeholder="Describe the task for a worker agent…"
@@ -192,7 +211,15 @@ export function ChatScreen({ feed }: { feed: FeedItem[] }): JSX.Element {
 								rows={3}
 							/>
 							<div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-								<label style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 13 }}>
+								<label
+									style={{
+										display: "flex",
+										alignItems: "center",
+										gap: 8,
+										color: "var(--text-dim)",
+										fontSize: 13,
+									}}
+								>
 									Capability
 									<select
 										style={selectStyle}

@@ -23,6 +23,9 @@
 import type { ResolvedModel } from "../types.ts";
 import type { AgentEvent, AgentRuntime, DirectSpawnOpts, InteractiveSpawnOpts } from "./types.ts";
 
+/** Codex's "read the prompt from stdin" positional. */
+const STDIN_PROMPT = "-";
+
 export class CodexRuntime implements AgentRuntime {
 	/** Registry id; also the value users pass to `--runtime codex`. */
 	readonly id = "codex";
@@ -32,6 +35,12 @@ export class CodexRuntime implements AgentRuntime {
 
 	/** Codex reads `AGENTS.md` from the working directory at startup. */
 	readonly instructionPath = "AGENTS.md";
+
+	/** A `-` prompt makes `codex exec` (and `exec resume`) read it from stdin. */
+	readonly promptInput = "stdin" as const;
+
+	/** Codex's own config/login dir (`CODEX_HOME`) and endpoint override. */
+	readonly envPassthrough = ["CODEX_*", "OPENAI_BASE_URL"] as const;
 
 	/**
 	 * Build argv for one headless streaming turn (`codex exec --json`).
@@ -47,11 +56,13 @@ export class CodexRuntime implements AgentRuntime {
 	 * - `resume <id>` (a subcommand) is emitted ONLY on follow-up turns; the first
 	 *   turn omits it so Codex starts a fresh session.
 	 *
-	 * The prompt is the trailing positional. Returned as an argv array (never a
-	 * shell string) so no value is subject to shell interpolation.
+	 * The trailing positional is `-`: Codex reads the prompt from stdin, which the
+	 * caller writes ({@link promptInput}), so a large prompt never hits the argv
+	 * limit. Returned as an argv array (never a shell string) so no value is
+	 * subject to shell interpolation.
 	 */
 	buildDirectSpawn(opts: DirectSpawnOpts): string[] {
-		const prompt = opts.prompt ?? "";
+		const prompt = STDIN_PROMPT;
 		// Only resume when a prior turn handed us a real session id. An empty string
 		// is treated as "no resume" so the first turn opens a new session.
 		if (opts.resumeSessionId) {
@@ -109,18 +120,18 @@ export class CodexRuntime implements AgentRuntime {
 	}
 
 	/**
-	 * Build argv for a one-shot, non-streaming call (`codex exec`). Used by
-	 * AI-assisted merge resolution and skill distillation, where we want only the
-	 * final text answer, not an event stream. The bypass flag keeps it
-	 * non-interactive; the model is appended only when provided so the caller can
-	 * defer to Codex's own default.
+	 * Build argv for a one-shot, non-streaming call (`codex exec`). Used by skill
+	 * distillation, where we want only the final text answer, not an event
+	 * stream. The bypass flag keeps it non-interactive; the model is appended only
+	 * when provided so the caller can defer to Codex's own default. The prompt is
+	 * read from stdin (trailing `-`).
 	 */
-	buildPrintCommand(prompt: string, model?: string): string[] {
+	buildPrintCommand(_prompt: string, model?: string): string[] {
 		const argv = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"];
 		if (model !== undefined) {
 			argv.push("--model", model);
 		}
-		argv.push(prompt);
+		argv.push(STDIN_PROMPT);
 		return argv;
 	}
 

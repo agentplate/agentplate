@@ -14,7 +14,7 @@ import {
 	IconUsers,
 	PageIcon,
 } from "../icons.tsx";
-import { Badge, Card, Stat, agentColor, stateTone } from "../lib.tsx";
+import { agentColor, Badge, Card, Stat, stateTone } from "../lib.tsx";
 import type { AgentSession, Overview, StatusCounts } from "../types.ts";
 
 export function MissionControl({
@@ -154,4 +154,3 @@ export function MissionControl({
 		</div>
 	);
 }
-

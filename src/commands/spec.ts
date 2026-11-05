@@ -23,21 +23,13 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printSuccess } from "../logging/color.ts";
 import { assertSafeTaskId, specPath, specsDir } from "../paths.ts";
+import { requireInit } from "./shared.ts";
 
 /** Resolve the project root, throwing if Agentplate is not initialized there. */
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
-
 /** Read the `--json` global flag off the action's trailing Command instance. */
 function wantsJson(command: Command): boolean {
 	return command.optsWithGlobals().json === true;

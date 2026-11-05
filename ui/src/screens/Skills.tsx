@@ -3,11 +3,11 @@
 // Table of distilled skills: title + goal, a status badge, confidence rendered
 // as a bar/percent, and applied/success counts. Polls GET /api/skills.
 
-import { Badge, Card, Stat } from "../lib.tsx";
-import type { BadgeTone } from "../lib.tsx";
-import { IconActive, IconSkills, IconTarget, PageIcon } from "../icons.tsx";
-import type { SkillSummary } from "../types.ts";
 import { getSkills } from "../api.ts";
+import { IconActive, IconSkills, IconTarget, PageIcon } from "../icons.tsx";
+import type { BadgeTone } from "../lib.tsx";
+import { Badge, Card, Stat } from "../lib.tsx";
+import type { SkillSummary } from "../types.ts";
 import { usePolling } from "../usePolling.ts";
 
 function statusTone(status: string): BadgeTone {
@@ -62,10 +62,7 @@ export function SkillsScreen(): JSX.Element {
 				/>
 			</div>
 
-			<Card
-				title="Skill library"
-				meta={`${skills.length} skill${skills.length === 1 ? "" : "s"}`}
-			>
+			<Card title="Skill library" meta={`${skills.length} skill${skills.length === 1 ? "" : "s"}`}>
 				<div className="grid-wrap">
 					<table className="grid">
 						<thead>

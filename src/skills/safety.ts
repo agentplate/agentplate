@@ -23,6 +23,7 @@
 
 import { findDangerousCommands, hasDeployVerb } from "../agents/guard-rules.ts";
 import { containsSecret, sanitize } from "../logging/sanitizer.ts";
+import { listProviders } from "../providers/registry.ts";
 import type { SkillDraft } from "./types.ts";
 
 /** Outcome of scrubbing a single draft. */
@@ -55,11 +56,12 @@ function redactField(
 	value: string | undefined,
 	field: string,
 	violations: string[],
+	known: readonly string[],
 ): string | undefined {
 	if (value === undefined) return undefined;
-	if (containsSecret(value)) {
+	if (containsSecret(value, known)) {
 		violations.push(`secret redacted in ${field}`);
-		return sanitize(value);
+		return sanitize(value, known);
 	}
 	return value;
 }
@@ -72,18 +74,35 @@ function redactArrayField(
 	values: string[] | undefined,
 	field: string,
 	violations: string[],
+	known: readonly string[],
 ): string[] | undefined {
 	if (values === undefined) return undefined;
 	let found = false;
 	const cleaned = values.map((value) => {
-		if (containsSecret(value)) {
+		if (containsSecret(value, known)) {
 			found = true;
-			return sanitize(value);
+			return sanitize(value, known);
 		}
 		return value;
 	});
 	if (found) violations.push(`secret redacted in ${field}`);
 	return cleaned;
+}
+
+/**
+ * The live values of every provider API key the catalog configures
+ * (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OLLAMA_API_KEY`, …) that are set
+ * in this process's environment. Redacted literally, whatever their format, so
+ * even a key with no recognizable prefix (Ollama, a custom endpoint) cannot be
+ * copied into a skill.
+ */
+function configuredProviderKeys(): string[] {
+	const values: string[] = [];
+	for (const provider of listProviders()) {
+		const value = process.env[provider.authEnvVar];
+		if (value !== undefined && value !== "") values.push(value);
+	}
+	return values;
 }
 
 /**
@@ -111,9 +130,12 @@ function rewriteHomePaths(body: string, violations: string[]): string {
  * Steps (in order):
  *  1. Non-create/update actions (notably `skip`) are inherently safe — return the
  *     draft unchanged with `ok: true`.
- *  2. Redact secrets in `title`, `goal`, `body`, `whenToUse`, and `tags`. A hit
- *     records a non-fatal `secret redacted in <field>` violation but the cleaned
- *     copy proceeds.
+ *  2. Redact secrets in `title`, `goal`, `body`, `whenToUse`, `filePatterns`
+ *     and `tags` — recognized key formats plus the literal values of the
+ *     provider keys set in the environment. A hit records a non-fatal
+ *     `secret redacted in <field>` violation but the cleaned copy proceeds.
+ *     (`targetSlug` is not scrubbed: it must name an existing skill, so it is
+ *     never written as new content.)
  *  3. Scan the whole body (prose and every code fence, whatever its language)
  *     plus `title`, `goal`, each `whenToUse` entry and each tag for dangerous
  *     commands and deploy verbs. A hit is FATAL: `dangerous command: <hit>` /
@@ -136,11 +158,13 @@ export function sanitizeSkillDraft(draft: SkillDraft): SafetyReport {
 
 	// Step 2: redact secrets across every free-text field. Arrays are scrubbed
 	// element-wise so a leaked key inside one tag/when-to-use entry is caught.
-	const title = redactField(draft.title, "title", violations);
-	const goal = redactField(draft.goal, "goal", violations);
-	const whenToUse = redactArrayField(draft.whenToUse, "whenToUse", violations);
-	const tags = redactArrayField(draft.tags, "tags", violations);
-	let body = redactField(draft.body, "body", violations);
+	const known = configuredProviderKeys();
+	const title = redactField(draft.title, "title", violations, known);
+	const goal = redactField(draft.goal, "goal", violations, known);
+	const whenToUse = redactArrayField(draft.whenToUse, "whenToUse", violations, known);
+	const filePatterns = redactArrayField(draft.filePatterns, "filePatterns", violations, known);
+	const tags = redactArrayField(draft.tags, "tags", violations, known);
+	let body = redactField(draft.body, "body", violations, known);
 
 	// Track dangerous/deploy hits separately from the (non-fatal) redaction and
 	// rewrite violations so `ok` reflects only fatals.
@@ -189,7 +213,7 @@ export function sanitizeSkillDraft(draft: SkillDraft): SafetyReport {
 	if (title !== undefined) redactedDraft.title = title;
 	if (goal !== undefined) redactedDraft.goal = goal;
 	if (whenToUse !== undefined) redactedDraft.whenToUse = whenToUse;
-	if (draft.filePatterns !== undefined) redactedDraft.filePatterns = draft.filePatterns;
+	if (filePatterns !== undefined) redactedDraft.filePatterns = filePatterns;
 	if (tags !== undefined) redactedDraft.tags = tags;
 	if (body !== undefined) redactedDraft.body = body;
 

@@ -2,7 +2,8 @@
  * `agentplate stop <agent>` — mark an agent session stopped (and optionally remove
  * its worktree). Headless agents are spawn-per-turn, so there is no long-lived
  * process; stopping records the terminal state so no further turns run, and
- * SIGTERMs the current turn's process if one is live.
+ * SIGTERMs the current turn's process if one is live, waiting (bounded, escalating
+ * to SIGKILL) for it to exit before any worktree is removed from under it.
  *
  * Worktree removal goes through the reaper's {@link isRemovableWorktree} guard:
  * only paths inside `.agentplate/worktrees/` are ever removed — never the project
@@ -11,8 +12,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
-import { NotFoundError, ValidationError } from "../errors.ts";
+import { NotFoundError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { printHint, printSuccess, printWarning } from "../logging/color.ts";
@@ -20,9 +20,10 @@ import { createMailStore } from "../mail/store.ts";
 import { createMergeQueue } from "../merge/queue.ts";
 import { eventsDbPath, mailDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { type PurgeReport, purgeAgentData } from "../sessions/purge.ts";
-import { isPidAlive, isRemovableWorktree } from "../sessions/reaper.ts";
+import { isRemovableWorktree, terminatePid } from "../sessions/reaper.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { deleteBranch, removeWorktree } from "../worktree/manager.ts";
+import { requireInit } from "./shared.ts";
 
 export function createStopCommand(): Command {
 	return new Command("stop")
@@ -41,10 +42,7 @@ export function createStopCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				// --purge implies removing the worktree: a full wipe leaves no worktree.
 				const cleanWorktree = opts.cleanWorktree || opts.purge === true;
 				const store = createSessionStore(sessionsDbPath(root));
@@ -52,17 +50,18 @@ export function createStopCommand(): Command {
 					const session = store.getSessionByAgent(agent);
 					if (!session) throw new NotFoundError(`No session for agent "${agent}"`);
 					store.updateSessionState(session.id, "stopped");
-					// End a turn still in flight, so nothing keeps writing to the worktree.
-					if (session.pid != null && isPidAlive(session.pid)) {
-						try {
-							process.kill(session.pid, "SIGTERM");
-						} catch {
-							// Exited in the meantime.
-						}
-					}
+					// End a turn still in flight and wait for it to exit, so nothing keeps
+					// writing to the worktree while (or after) it is removed.
+					const turnExited = session.pid == null || (await terminatePid(session.pid));
 
 					let worktreeRemoved = false;
-					if (cleanWorktree && !isRemovableWorktree(root, session.worktreePath)) {
+					if (cleanWorktree && !turnExited) {
+						if (!useJson) {
+							printWarning(
+								`Not removing ${session.worktreePath}: turn process ${session.pid} did not exit.`,
+							);
+						}
+					} else if (cleanWorktree && !isRemovableWorktree(root, session.worktreePath)) {
 						if (!useJson) {
 							printWarning(
 								`Not removing ${session.worktreePath}: not an agentplate worktree (only paths inside .agentplate/worktrees/ are removed).`,

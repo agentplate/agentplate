@@ -410,12 +410,12 @@ export function buildTasks(ctx: ApiContext): TaskItem[] {
 	const byTask = new Map<string, TaskItem>();
 	try {
 		// 1. Seed from spec files (so queued-but-unspawned tasks appear).
-		const specsDir = join(ctx.root, ".agentplate", "specs");
-		if (existsSync(specsDir)) {
-			for (const file of readdirSync(specsDir)) {
+		const specs = specsDir(ctx.root);
+		if (existsSync(specs)) {
+			for (const file of readdirSync(specs)) {
 				if (!file.endsWith(".md")) continue;
 				const taskId = file.slice(0, -3);
-				const summary = firstSpecLine(join(specsDir, file));
+				const summary = firstSpecLine(join(specs, file));
 				byTask.set(taskId, {
 					taskId,
 					status: "pending",
@@ -511,9 +511,11 @@ export interface CostsReport {
 /**
  * Build the costs report by aggregating per-turn token/cost events. Headless
  * turns record the runtime's reported usage (e.g. a Claude `result` event) into
- * the event store as detail JSON (`{ tokens, cost }`); this sums them by agent and
- * by day. When no usage has been recorded yet it returns `hasData:false` and the
- * UI renders the same charts with an empty state.
+ * the event store as detail JSON (`{ tokens, cost }`); the event store sums them
+ * in SQL by agent and day over the whole log (not a capped window of the newest
+ * events, which silently dropped older turns' spend once the log grew). When no
+ * usage has been recorded yet it returns `hasData:false` and the UI renders the
+ * same charts with an empty state.
  */
 export function buildCosts(ctx: ApiContext): CostsReport {
 	const store = createEventStore(eventsDbPath(ctx.root));
@@ -522,31 +524,18 @@ export function buildCosts(ctx: ApiContext): CostsReport {
 	let totalTokens = 0;
 	let totalCostUsd = 0;
 	try {
-		for (const e of store.list({ limit: 5000 })) {
-			let tokens = 0;
-			let cost = 0;
-			if (e.detail) {
-				try {
-					const d = JSON.parse(e.detail) as { tokens?: number; cost?: number; costUsd?: number };
-					tokens = typeof d.tokens === "number" ? d.tokens : 0;
-					cost =
-						typeof d.cost === "number" ? d.cost : typeof d.costUsd === "number" ? d.costUsd : 0;
-				} catch {
-					// detail isn't JSON — no token data here.
-				}
-			}
-			if (tokens === 0 && cost === 0) continue;
+		for (const bucket of store.usageTotals()) {
+			const { tokens, costUsd } = bucket;
 			totalTokens += tokens;
-			totalCostUsd += cost;
-			const a = byAgent.get(e.agentName) ?? { tokens: 0, costUsd: 0 };
+			totalCostUsd += costUsd;
+			const a = byAgent.get(bucket.agentName) ?? { tokens: 0, costUsd: 0 };
 			a.tokens += tokens;
-			a.costUsd += cost;
-			byAgent.set(e.agentName, a);
-			const day = e.createdAt.slice(0, 10);
-			const dd = byDay.get(day) ?? { tokens: 0, costUsd: 0 };
+			a.costUsd += costUsd;
+			byAgent.set(bucket.agentName, a);
+			const dd = byDay.get(bucket.day) ?? { tokens: 0, costUsd: 0 };
 			dd.tokens += tokens;
-			dd.costUsd += cost;
-			byDay.set(day, dd);
+			dd.costUsd += costUsd;
+			byDay.set(bucket.day, dd);
 		}
 	} finally {
 		store.close();

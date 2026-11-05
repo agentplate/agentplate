@@ -188,4 +188,32 @@ describe("agentplate stop — live turn", () => {
 			turn.kill();
 		}
 	});
+
+	test("--clean-worktree removes the worktree only after the turn process exited", async () => {
+		const wt = await createWorktree(root, "builder-1", "agentplate/builder-1");
+		// A turn that takes a moment to wind down after SIGTERM and writes on its way
+		// out. Removing the worktree before it exits would leave this file behind.
+		const late = join(wt.path, "late.txt");
+		const turn = Bun.spawn(
+			[
+				"sh",
+				"-c",
+				`trap 'sleep 0.5; echo late > "${late}"; exit 0' TERM; echo ready; while :; do sleep 0.1; done`,
+			],
+			{ stdout: "pipe" },
+		);
+		try {
+			await turn.stdout.getReader().read(); // trap installed
+			seed({ state: "working", pid: turn.pid, worktreePath: wt.path });
+
+			await stop("builder-1", "--clean-worktree");
+
+			expect(turn.exitCode).toBe(0);
+			expect(existsSync(wt.path)).toBe(false);
+			expect(stateOf("builder-1")).toBe("stopped");
+		} finally {
+			turn.kill("SIGKILL");
+			await turn.exited;
+		}
+	});
 });

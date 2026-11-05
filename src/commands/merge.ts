@@ -8,7 +8,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { printError, printInfo, printSuccess } from "../logging/color.ts";
@@ -18,6 +18,7 @@ import { mergeBranch, predictMerge } from "../merge/resolver.ts";
 import { mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, MergeResult } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 export function createMergeCommand(): Command {
 	return new Command("merge")
@@ -39,10 +40,7 @@ export function createMergeCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				const config = loadConfig(root);
 				const target = opts.into ?? config.project.canonicalBranch;
 
@@ -74,15 +72,35 @@ export function createMergeCommand(): Command {
 				if (opts.dryRun) {
 					const predictions: MergeResult[] = [];
 					for (const { branch } of branches) {
-						predictions.push(await predictMerge(root, branch, target));
+						// One bad entry (e.g. a completed session whose branch was deleted)
+						// is reported on its own line instead of aborting the whole --all run.
+						try {
+							predictions.push(
+								await predictMerge(root, branch, target, {
+									autoResolve: config.merge.aiResolveEnabled,
+								}),
+							);
+						} catch (err) {
+							predictions.push({
+								branchName: branch,
+								status: "failed",
+								tier: null,
+								conflictFiles: [],
+								message: err instanceof Error ? err.message : String(err),
+							});
+						}
 					}
 					if (useJson) {
 						jsonOutput({ dryRun: true, target, predictions });
 						return;
 					}
 					for (const p of predictions) {
+						if (p.status === "failed") {
+							printError(`${p.branchName} → ${target}: predicted failure — ${p.message}`);
+							continue;
+						}
 						printInfo(
-							`${p.branchName} → ${target}: predicted ${p.tier ?? "conflict"}` +
+							`${p.branchName} → ${target}: predicted ${p.tier}` +
 								(p.conflictFiles.length ? ` (${p.conflictFiles.length} conflict file(s))` : ""),
 						);
 					}

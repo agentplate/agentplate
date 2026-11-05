@@ -5,18 +5,21 @@
  *
  *   architect → builder → devops → (merge) → [gate] → deployer → verifier
  *
- * The build stages spawn task-scoped agents (via the same sling engine the
- * orchestration core uses); the deploy stage reuses {@link runDeploy}, which
- * owns the gate, artifact generation, deploy, verify, and audit. Ship is the
- * thin conductor that sequences them and threads the run id + dry-run flag.
+ * Today only the deploy half is automated: the deploy stage reuses
+ * {@link runDeploy}, which owns the gate, artifact generation, deploy, verify,
+ * and audit, and always ships the CURRENT project tree. The build stages
+ * (architect/builder/devops agents) are not spawned by ship yet — they are
+ * driven through `agentplate sling` — so ship records them as "skipped" and
+ * never reports work it did not do. An autonomous build loop can layer on top
+ * without changing this contract.
  *
- * `--dry-run` is honored end to end: build stages still run (they only touch the
- * worktree), but the deploy stage plans without any outward-facing mutation.
+ * `--dry-run` is honored end to end: the deploy stage plans without any
+ * outward-facing mutation and writes nothing.
  */
 
 import { writeFileSync } from "node:fs";
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { getDeployTarget } from "../deploy/registry.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
@@ -24,6 +27,7 @@ import { brand, muted, printError, printHint, printInfo, printSuccess } from "..
 import { currentRunPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { type DeployRunResult, runDeploy } from "./deploy.ts";
+import { requireInit } from "./shared.ts";
 
 export interface ShipOptions {
 	target?: string;
@@ -51,11 +55,20 @@ export interface ShipResult {
 	urls: string[];
 }
 
+/** Detail recorded for a build stage ship does not run itself (yet). */
+function buildStageNotRun(capability: string): string {
+	return (
+		"not run — ship does not spawn build agents yet; " +
+		`use \`agentplate sling <task> --capability ${capability}\``
+	);
+}
+
 /**
- * Run the ship pipeline. Build-stage execution (spawning architect/builder/devops
- * agents) is gated behind `opts.build` so a user can ship an already-built tree
- * with `--no-build`; when enabled it records the intent as a coordinator run and
- * the stages are driven by the operator/agents through the normal sling path.
+ * Run the ship pipeline. Ship does not spawn the architect/builder/devops agents
+ * itself: with `opts.build` (the default) those stages are recorded honestly as
+ * "skipped" (drive them through `agentplate sling`), and with `--no-build` as a
+ * single skipped "build" stage. Either way the deploy stage ships the current
+ * tree, and only stages that actually ran are ever reported "ok".
  */
 export async function runShip(root: string, idea: string, opts: ShipOptions): Promise<ShipResult> {
 	const config = loadConfig(root);
@@ -81,26 +94,17 @@ export async function runShip(root: string, idea: string, opts: ShipOptions): Pr
 
 	const stages: ShipStage[] = [];
 
-	// Build stages: architect → builder → devops. These are spawn-driven; ship
-	// records the plan and the operator/coordinator drives the agents. In the
-	// basic core we record the intent so the pipeline is observable; a fully
-	// autonomous build loop layers on top without changing this contract.
+	// Build stages: architect → builder → devops. Ship does not spawn these
+	// agents (yet), so it must not claim they ran: they are recorded as skipped,
+	// and the deploy stage below ships the current tree as-is.
 	if (opts.build) {
-		stages.push({
-			name: "architect",
-			status: "ok",
-			detail: `plan: build "${idea}" for ${target}/${opts.env}`,
-		});
-		stages.push({
-			name: "builder",
-			status: "ok",
-			detail: "scaffold/implement in worktree (sling builder)",
-		});
-		stages.push({
-			name: "devops",
-			status: "ok",
-			detail: "generate CI/CD + infra via target.generateConfig",
-		});
+		for (const capability of ["architect", "builder", "devops"]) {
+			stages.push({
+				name: capability,
+				status: "skipped",
+				detail: buildStageNotRun(capability),
+			});
+		}
 	} else {
 		stages.push({ name: "build", status: "skipped", detail: "--no-build: shipping current tree" });
 	}
@@ -156,20 +160,20 @@ export async function runShip(root: string, idea: string, opts: ShipOptions): Pr
 
 export function createShipCommand(): Command {
 	return new Command("ship")
-		.description("Build → configure CI/CD → deploy an app in one pipeline run")
+		.description(
+			"Configure CI/CD and deploy the current tree in one pipeline run " +
+				"(build stages are not automated yet: drive them with `agentplate sling`)",
+		)
 		.argument("[idea]", "what to build/ship (description or spec)", "current project")
 		.option("--target <name>", "deploy target (default: config deploy.default)")
 		.option("--env <environment>", "target environment", "preview")
 		.option("--dry-run", "plan only — generate config, no outward-facing deploy", false)
 		.option("--yes", "pre-approve the deploy gate", false)
-		.option("--no-build", "skip build stages; ship the current tree")
+		.option("--no-build", "record one skipped build stage; ship the current tree")
 		.option("--json", "output JSON")
 		.action(async (idea: string, opts: ShipOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const result = await runShip(root, idea, opts);
 
 			if (useJson) {
@@ -189,6 +193,12 @@ export function createShipCommand(): Command {
 								? "⛔"
 								: "✗";
 				printInfo(`  ${mark} ${stage.name}: ${muted(stage.detail)}`);
+			}
+			if (opts.build) {
+				printHint(
+					"ship did not build anything: it deploys the current tree. Build first with " +
+						"`agentplate sling`, or pass --no-build.",
+				);
 			}
 			if (result.urls.length > 0) {
 				printSuccess(`Deployed: ${result.urls.join(", ")}`);

@@ -11,14 +11,19 @@
  *
  * On disk each skill is a directory `.agentplate/skills/<slug>/` containing
  * `skill.md` (YAML frontmatter + markdown body — the source of truth) and
- * `outcomes.jsonl` (append-only outcome log). A derived, gitignored SQLite FTS
- * index (`skills.db`) accelerates retrieval and is rebuildable from the files.
+ * `outcomes.jsonl` (append-only outcome log). Retrieval reads these files
+ * directly; there is no separate index.
  */
 
 import type { OutcomeStatus } from "../types.ts";
 
-/** Lifecycle status. `quarantined`/`deprecated` skills are excluded from retrieval. */
-export type SkillStatus = "active" | "deprecated" | "quarantined";
+/**
+ * Lifecycle status. Only `active` skills are retrieved into overlays. A `draft`
+ * is a skill written while `skills.requireReview` is on; it waits for
+ * `agentplate skill approve <slug>`. `quarantined`/`deprecated` skills are
+ * retired, by feedback or by an operator.
+ */
+export type SkillStatus = "active" | "draft" | "deprecated" | "quarantined";
 
 /** Provenance of a distilled skill. */
 export interface SkillProvenance {

@@ -5,19 +5,20 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG } from "../config.ts";
+import { AGENTPLATE_DIR, CONFIG_FILE, DEFAULT_CONFIG, serializeConfig } from "../config.ts";
+import { ValidationError } from "../errors.ts";
 import { createEventStore, type EventStore } from "../events/store.ts";
 import { createMailClient, type MailClient } from "../mail/client.ts";
-import { eventsDbPath, sessionsDbPath } from "../paths.ts";
+import { appliedSkillsPath, eventsDbPath, mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { claudeRuntime } from "../runtimes/claude.ts";
 import { MockRuntime } from "../runtimes/mock.ts";
 import type { AgentEvent, DirectSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore, type SessionStore } from "../sessions/store.ts";
 import type { AgentplateConfig, AgentSession, ResolvedModel } from "../types.ts";
-import { driveTurn } from "./drive.ts";
+import { driveAgentTurn, driveTurn } from "./drive.ts";
 
 /** Mock runtime that records the spawn opts (so we can assert the resume id). */
 class SpyRuntime extends MockRuntime {
@@ -74,9 +75,22 @@ function makeSession(over: Partial<AgentSession> = {}): AgentSession {
 	};
 }
 
+/** The real CLI entry, so a mock turn can send mail exactly as an agent does. */
+const CLI = join(import.meta.dir, "..", "index.ts");
+
+/** Shell snippet: run the real `agentplate mail send <args>` against the test root. */
+function mailSend(args: string): string {
+	return `'${process.execPath}' '${CLI}' --project '${root}' mail send ${args}`;
+}
+
+/** A turn's terminal report to its parent, sent from inside the turn (no --from). */
+const DONE_ARGS = "--to lead-1 --subject done --body ok --type worker_done";
+
 beforeEach(() => {
 	root = mkdtempSync(join(tmpdir(), "agentplate-drive-"));
 	mkdirSync(join(root, ".agentplate"), { recursive: true });
+	// Initialized, so the in-turn `agentplate mail` CLI accepts the root.
+	writeFileSync(join(root, AGENTPLATE_DIR, CONFIG_FILE), serializeConfig(DEFAULT_CONFIG), "utf8");
 	worktree = mkdtempSync(join(tmpdir(), "agentplate-drive-wt-"));
 	store = createSessionStore(sessionsDbPath(root));
 	events = createEventStore(eventsDbPath(root));
@@ -173,48 +187,41 @@ describe("driveTurn — keyless-local provider env (authMode 'none')", () => {
 	});
 });
 
+/** Run one mock turn for `session` with skills off (no distillation work). */
+async function driveQuiet(session: AgentSession, config = cfg()): Promise<string> {
+	config.skills.enabled = false;
+	const out = await driveTurn({
+		root,
+		config,
+		runtime: new SpyRuntime(),
+		store,
+		events,
+		mail,
+		session,
+		model: { model: "m", env: {} },
+		prompt: "go",
+	});
+	return out.finalState;
+}
+
 describe("driveTurn — state transition", () => {
-	test("becomes 'completed' when the agent has emitted its terminal mail", async () => {
+	test("becomes 'completed' when the agent sends its terminal mail during the turn", async () => {
 		const session = makeSession();
 		store.upsertSession(session);
-		// The agent's own worker_done mail marks the task complete.
-		mail.send({
-			from: session.agentName,
-			to: "lead-1",
-			subject: "done",
-			body: "",
-			type: "worker_done",
-		});
+		// The agent reports done the way its overlay says to, without any --from.
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
 
-		const config = cfg();
-		config.skills.enabled = false; // keep the completed path free of distillation work
-		const out = await driveTurn({
-			root,
-			config,
-			runtime: new SpyRuntime(),
-			store,
-			events,
-			mail,
-			session,
-			model: { model: "m", env: {} },
-			prompt: "finish",
-		});
-		expect(out.finalState).toBe("completed");
+		expect(await driveQuiet(session)).toBe("completed");
 		expect(store.getSession(session.id)?.state).toBe("completed");
+		// The mail is attributed to the agent whose turn sent it, not to "operator".
+		expect(mail.list({ to: "lead-1" }).map((m) => m.from)).toEqual(["builder-1"]);
 	});
 
 	test("a stop that lands mid-turn sticks: the finishing turn never resurrects it", async () => {
 		const session = makeSession();
 		store.upsertSession(session);
-		// Terminal mail already sent, so without the stop this turn would be 'completed'.
-		mail.send({
-			from: session.agentName,
-			to: "lead-1",
-			subject: "d",
-			body: "",
-			type: "worker_done",
-		});
-		process.env.AGENTPLATE_MOCK_CMD = "sleep 0.4";
+		// Terminal mail sent this turn, so without the stop the turn would be 'completed'.
+		process.env.AGENTPLATE_MOCK_CMD = `${mailSend(DONE_ARGS)} && sleep 0.4`;
 		const config = cfg();
 		config.skills.enabled = false;
 
@@ -235,6 +242,121 @@ describe("driveTurn — state transition", () => {
 		const out = await pending;
 		expect(out.finalState).toBe("stopped");
 		expect(store.getSession(session.id)?.state).toBe("stopped");
+	});
+});
+
+describe("driveTurn — only the agent's own, current terminal mail completes it", () => {
+	test("a worker_done from an earlier turn doesn't complete this turn", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		mail.send({ from: "builder-1", to: "lead-1", subject: "d", body: "", type: "worker_done" });
+
+		expect(await driveQuiet(session)).toBe("idle"); // the no-op turn reported nothing
+	});
+
+	test("a failed turn stays 'failed' even if it sent terminal mail", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = `${mailSend(DONE_ARGS)}; exit 1`;
+
+		expect(await driveQuiet(session)).toBe("failed");
+		expect(mail.list({ from: "builder-1" }).map((m) => m.type)).toEqual(["worker_done"]);
+	});
+
+	test("terminal mail to someone other than its parent or a supervisor doesn't count", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(
+			"--to builder-2 --subject done --body ok --type worker_done",
+		);
+
+		expect(await driveQuiet(session)).toBe("idle");
+	});
+
+	test("a top-level agent completes by reporting to the coordinator", async () => {
+		const session = makeSession({ parentAgent: null, depth: 0 });
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(
+			"--to coordinator --subject done --body ok --type worker_done",
+		);
+
+		expect(await driveQuiet(session)).toBe("completed");
+	});
+
+	test("a sibling can't send terminal mail as this agent, or as the operator", async () => {
+		const target = makeSession();
+		const sibling = makeSession({ agentName: "builder-2", branchName: "agentplate/builder-2" });
+		store.upsertSession(target);
+		store.upsertSession(sibling);
+		const rcAs = (who: string) => join(worktree, `rc-${who}.txt`);
+		// builder-2's turn tries to forge builder-1's completion and an operator dispatch.
+		process.env.AGENTPLATE_MOCK_CMD = [
+			`${mailSend(`--from builder-1 ${DONE_ARGS}`)} 2>/dev/null; echo $? > '${rcAs("builder-1")}'`,
+			`${mailSend("--from operator --to builder-1 --subject x --body y --type dispatch")} 2>/dev/null; echo $? > '${rcAs("operator")}'`,
+		].join("; ");
+
+		expect(await driveQuiet(sibling)).toBe("idle");
+		// Both sends were refused and nothing was stored under the forged names.
+		expect(readFileSync(rcAs("builder-1"), "utf8").trim()).not.toBe("0");
+		expect(readFileSync(rcAs("operator"), "utf8").trim()).not.toBe("0");
+		expect(mail.list({ from: "builder-1" })).toEqual([]);
+		expect(mail.list({ from: "operator" })).toEqual([]);
+
+		// So builder-1's own (no-op) turn is not completed by anything builder-2 did.
+		process.env.AGENTPLATE_MOCK_CMD = "true";
+		expect(await driveQuiet(target)).toBe("idle");
+	});
+});
+
+describe("driveTurn — best-effort post-turn steps fail visibly", () => {
+	/** Error events recorded for builder-1. */
+	function errorDetails(): string[] {
+		return events
+			.list({ agentName: "builder-1" })
+			.filter((e) => e.type === "error")
+			.map((e) => e.detail ?? "");
+	}
+
+	test("an auto-merge that throws is recorded as an error event, and the turn still completes", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
+		// A merge queue that can't be opened makes maybeAutoMerge throw.
+		mkdirSync(mergeDbPath(root));
+		const config = cfg();
+		config.merge.autoMerge = "on-complete";
+		config.agents.skipGates = true;
+
+		expect(await driveQuiet(session, config)).toBe("completed");
+		expect(errorDetails().some((d) => d.startsWith("Auto-merge failed:"))).toBe(true);
+	});
+
+	test("a skills-loop failure is recorded as an error event, and the turn still completes", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		process.env.AGENTPLATE_MOCK_CMD = mailSend(DONE_ARGS);
+		// An applied-skills record that is a directory makes the feedback step throw
+		// (it cannot be removed as a file).
+		mkdirSync(appliedSkillsPath(root, session.agentName), { recursive: true });
+		const config = cfg();
+		config.skills.enabled = true;
+		config.agents.skipGates = true;
+
+		const out = await driveTurn({
+			root,
+			config,
+			runtime: new SpyRuntime(),
+			store,
+			events,
+			mail,
+			session,
+			model: { model: "m", env: {} },
+			prompt: "go",
+		});
+		expect(out.finalState).toBe("completed");
+		expect(errorDetails().some((d) => d.startsWith("Skill feedback/distillation failed:"))).toBe(
+			true,
+		);
 	});
 });
 
@@ -319,6 +441,72 @@ describe("driveTurn — failure handling", () => {
 	});
 });
 
+describe("driveTurn — atomic turn claim", () => {
+	test("refuses a session another driver already claimed, without building its prompt", async () => {
+		const session = makeSession({ state: "idle" });
+		store.upsertSession(session);
+		expect(store.claimTurn(session.id)).toBe(true); // the other driver won
+		const log = join(worktree, "turns.log");
+		process.env.AGENTPLATE_MOCK_CMD = `echo turn >> '${log}'`;
+		let promptBuilt = false;
+
+		await expect(
+			driveTurn({
+				root,
+				config: cfg(),
+				runtime: new SpyRuntime(),
+				store,
+				events,
+				mail,
+				session, // stale snapshot: still says 'idle'
+				model: { model: "m", env: {} },
+				prompt: () => {
+					promptBuilt = true;
+					return "go";
+				},
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
+
+		expect(promptBuilt).toBe(false); // no mail consumed by the loser
+		expect(existsSync(log)).toBe(false); // and no second runtime spawned
+		expect(store.getSession(session.id)?.state).toBe("working"); // winner's claim intact
+	});
+
+	test("two drivers racing for one idle agent: one turn runs, the loser leaves new mail unread", async () => {
+		const session = makeSession({ state: "idle", runtimeSessionId: "sess-prior" });
+		store.upsertSession(session);
+		mail.send({ from: "lead-1", to: session.agentName, subject: "m1", body: "a", type: "status" });
+		const log = join(worktree, "turns.log");
+		process.env.AGENTPLATE_MOCK_CMD = `echo turn >> '${log}'; sleep 0.3`;
+		const config = cfg();
+		config.runtime.default = "mock";
+
+		// Driver A (e.g. `watch`) claims the turn and is mid-turn…
+		const first = driveAgentTurn({ root, config, session, store, events, mail });
+		await waitFor(() => store.getSession(session.id)?.pid != null);
+		// …new mail lands, and driver B (a manual `turn`, from its own stale
+		// 'idle' snapshot and its own DB handles) tries to drive the same agent.
+		mail.send({ from: "lead-1", to: session.agentName, subject: "m2", body: "b", type: "status" });
+		const storeB = createSessionStore(sessionsDbPath(root));
+		const mailB = createMailClient(root);
+		try {
+			await expect(
+				driveAgentTurn({ root, config, session, store: storeB, events, mail: mailB }),
+			).rejects.toBeInstanceOf(ValidationError);
+		} finally {
+			storeB.close();
+			mailB.close();
+		}
+		await first;
+
+		expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["turn"]); // exactly one turn
+		// m1 went to A's turn; m2 is still waiting for the NEXT turn, not swallowed by B.
+		expect(mail.check(session.agentName, { unreadOnly: true }).map((m) => m.subject)).toEqual([
+			"m2",
+		]);
+	});
+});
+
 describe("driveTurn — secret redaction in recorded errors", () => {
 	const KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -365,5 +553,49 @@ describe("driveTurn — secret redaction in recorded errors", () => {
 			true,
 		);
 		expect(details.some((d) => d.includes(KEY))).toBe(false);
+	});
+});
+
+describe("driveAgentTurn — injected mail", () => {
+	function mockCfg(): AgentplateConfig {
+		const c = cfg();
+		c.runtime.default = "mock";
+		c.skills.enabled = false;
+		return c;
+	}
+
+	function sendToBuilder(body: string): void {
+		mail.send({ from: "lead-1", to: "builder-1", subject: "logs", body, type: "status" });
+	}
+
+	test("a turn that fails to spawn leaves its mail unread (not silently consumed)", async () => {
+		// A vanished worktree makes Bun.spawn throw before the runtime ever runs.
+		const session = makeSession({ worktreePath: join(root, "worktree-gone") });
+		store.upsertSession(session);
+		sendToBuilder("build log: 3 failures");
+
+		await expect(
+			driveAgentTurn({ root, config: mockCfg(), session, store, events, mail }),
+		).rejects.toThrow();
+
+		expect(mail.check("builder-1", { unreadOnly: true })).toHaveLength(1);
+		expect(store.getSession(session.id)?.state).toBe("failed");
+	});
+
+	test("a spawned turn receives all of its (large) mail on stdin, which is then marked read", async () => {
+		const session = makeSession();
+		store.upsertSession(session);
+		const promptFile = join(worktree, "prompt.txt");
+		process.env.AGENTPLATE_MOCK_CMD = `cat > '${promptFile}'`;
+		// Several long logs: together well past Linux's 128 KiB single-argv cap.
+		for (let i = 0; i < 4; i++) sendToBuilder(`log ${i}\n${"x".repeat(50_000)}`);
+
+		const out = await driveAgentTurn({ root, config: mockCfg(), session, store, events, mail });
+
+		expect(out.finalState).toBe("idle");
+		const prompt = readFileSync(promptFile, "utf8");
+		expect(prompt).toStartWith("You have 4 new message(s):");
+		expect(prompt.length).toBeGreaterThan(200_000);
+		expect(mail.check("builder-1", { unreadOnly: true })).toHaveLength(0);
 	});
 });

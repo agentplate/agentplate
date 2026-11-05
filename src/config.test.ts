@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DEFAULT_CONFIG,
+	findProjectRoot,
 	isInitialized,
 	loadConfig,
 	serializeConfig,
@@ -41,8 +42,8 @@ describe("loadConfig", () => {
 		const cfg = loadConfig(root);
 		expect(cfg.project.name).toBe("my-app");
 		expect(cfg.runtime.default).toBe("codex");
-		// Untouched defaults remain.
-		expect(cfg.merge.aiResolveEnabled).toBe(true);
+		// Untouched defaults remain (auto-resolve is off unless opted in).
+		expect(cfg.merge.aiResolveEnabled).toBe(false);
 	});
 
 	test("an old config without merge.autoMerge inherits the 'off' default (deep merge)", () => {
@@ -120,5 +121,53 @@ describe("isInitialized / serializeConfig", () => {
 		writeConfig(root, "config.yaml", yamlText);
 		const cfg = loadConfig(root);
 		expect(cfg.runtime.default).toBe(DEFAULT_CONFIG.runtime.default);
+	});
+});
+
+/** Run git in `cwd`, throwing on a non-zero exit. */
+function git(cwd: string, args: string[]): void {
+	const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	if (proc.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${proc.stderr.toString()}`);
+	}
+}
+
+describe("findProjectRoot", () => {
+	test("walks up from a subdirectory to the directory holding .agentplate/", () => {
+		const sub = join(root, "src", "deep");
+		mkdirSync(sub, { recursive: true });
+		expect(findProjectRoot(sub)).toBe(root);
+	});
+
+	test("inside an agent worktree with a committed config, resolves the real root", () => {
+		// A real repo whose .agentplate/config.yaml is committed (as the scaffold
+		// README says), so git checks it out into every agent worktree.
+		writeConfig(root, "config.yaml", serializeConfig(DEFAULT_CONFIG));
+		writeConfig(root, ".gitignore", "worktrees/\n*.db\n");
+		const id = ["-c", "user.email=t@example.com", "-c", "user.name=t"];
+		git(root, ["init", "-q", "-b", "main"]);
+		git(root, ["add", "-A"]);
+		git(root, [...id, "commit", "-qm", "init"]);
+		const wt = join(root, ".agentplate", "worktrees", "builder-1");
+		git(root, ["worktree", "add", "-q", "-b", "agentplate/builder-1", wt]);
+		mkdirSync(join(wt, "src"), { recursive: true });
+
+		// Precondition: the worktree looks initialized on its own…
+		expect(isInitialized(wt)).toBe(true);
+		// …yet an agent running in it (or below it) must reach the project root.
+		expect(findProjectRoot(wt)).toBe(root);
+		expect(findProjectRoot(join(wt, "src"))).toBe(root);
+	});
+
+	test("a worktree nested inside another worktree resolves the outermost root", () => {
+		const outer = join(root, ".agentplate", "worktrees", "lead-1");
+		const nested = join(outer, ".agentplate", "worktrees", "builder-1");
+		mkdirSync(join(nested, ".agentplate"), { recursive: true });
+		expect(findProjectRoot(nested)).toBe(root);
+	});
+
+	test("the --project override still wins", () => {
+		setProjectRootOverride(root);
+		expect(findProjectRoot(tmpdir())).toBe(root);
 	});
 });

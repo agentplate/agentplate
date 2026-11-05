@@ -14,7 +14,7 @@
  */
 
 import type { ResolvedModel } from "../types.ts";
-import type { AgentRuntime, DirectSpawnOpts, InteractiveSpawnOpts } from "./types.ts";
+import type { AgentRuntime, DirectSpawnOpts, InteractiveSpawnOpts, PromptInput } from "./types.ts";
 
 export class MockRuntime implements AgentRuntime {
 	/** Registry id; tests resolve this explicitly via `getRuntime("mock")`. */
@@ -25,6 +25,13 @@ export class MockRuntime implements AgentRuntime {
 
 	/** Plain `CLAUDE.md` at the worktree root; the mock does not nest under `.claude/`. */
 	readonly instructionPath = "CLAUDE.md";
+
+	/**
+	 * Mirrors the claude runtime: the prompt arrives on the scripted command's
+	 * stdin, so a test can capture exactly what a turn was given (`cat > f`).
+	 * Typed as the union so a test subclass can model an argv runtime.
+	 */
+	readonly promptInput: PromptInput = "stdin";
 
 	/**
 	 * Build argv for one "turn" as a scripted bash command.

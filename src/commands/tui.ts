@@ -9,13 +9,13 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
-import { ValidationError } from "../errors.ts";
+import { loadConfig } from "../config.ts";
 import { accent, brand, chalk, muted } from "../logging/color.ts";
 import { sessionsDbPath } from "../paths.ts";
 import { type ApiContext, buildFeed, buildTasks, resolveCurrentRunId } from "../serve/api.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, SessionState } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 const STATE_COLOR: Record<SessionState, (s: string) => string> = {
 	booting: chalk.yellow,
@@ -173,10 +173,7 @@ export function createTuiCommand(): Command {
 		.option("--interval <ms>", "refresh interval", "5000")
 		.option("--once", "render a single frame and exit")
 		.action((opts: { interval: string; once?: boolean }) => {
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 
 			const paint = () => {
 				process.stdout.write("\x1b[2J\x1b[H");

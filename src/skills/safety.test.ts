@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { sanitizeSkillDraft } from "./safety.ts";
 import type { SkillDraft } from "./types.ts";
 
@@ -72,7 +72,7 @@ describe("sanitizeSkillDraft — dangerous commands (fatal)", () => {
 		const report = sanitizeSkillDraft(draft);
 		expect(report.ok).toBe(false);
 		expect(report.violations.some((v) => v.startsWith("dangerous command:"))).toBe(true);
-		// The reported hit is the matched command token (the pattern is `\brm\s+-rf?\b`).
+		// The reported hit is the matched command token (`rm` plus its recursive flag).
 		expect(report.violations.some((v) => v.includes("rm -rf"))).toBe(true);
 	});
 
@@ -283,6 +283,47 @@ describe("sanitizeSkillDraft — secret redaction (non-fatal auto-fix)", () => {
 	});
 });
 
+describe("sanitizeSkillDraft — provider keys and code examples", () => {
+	const saved = process.env.OLLAMA_API_KEY;
+	afterEach(() => {
+		if (saved === undefined) delete process.env.OLLAMA_API_KEY;
+		else process.env.OLLAMA_API_KEY = saved;
+	});
+
+	test("the live value of a catalog provider key is redacted even with no known format", () => {
+		const value = ["opaque", "0123456789", "abcdefABCDEF"].join("-");
+		process.env.OLLAMA_API_KEY = value;
+		const report = sanitizeSkillDraft({
+			...cleanDraft(),
+			body: `Point the client at the gateway with key ${value} and retry.`,
+		});
+		expect(report.ok).toBe(true);
+		expect(report.violations).toContain("secret redacted in body");
+		expect(report.redactedDraft.body).not.toContain(value);
+	});
+
+	test("ordinary code in a skill body is not mangled or flagged as a secret", () => {
+		const body = [
+			"```ts",
+			"const users = table({ id: { primaryKey: true }, sortKeys: false });",
+			"const tokenizer = new Tokenizer();",
+			"const apiKey = config.apiKey;",
+			"const opts = { maxTokens: 4096 };",
+			"```",
+		].join("\n");
+		const report = sanitizeSkillDraft({ ...cleanDraft(), body });
+		expect(report.ok).toBe(true);
+		expect(report.violations).toEqual([]);
+		expect(report.redactedDraft.body).toBe(body);
+	});
+
+	test("an invisible-character-split command is still fatal", () => {
+		const report = sanitizeSkillDraft({ ...cleanDraft(), body: "Then run r​m -fr / to reset." });
+		expect(report.ok).toBe(false);
+		expect(report.violations).toContain("dangerous command: rm -fr");
+	});
+});
+
 describe("sanitizeSkillDraft — home-path rewriting (non-fatal auto-fix)", () => {
 	test("a macOS home-dir path is rewritten to <repo>/...", () => {
 		const draft: SkillDraft = {
@@ -359,6 +400,19 @@ describe("sanitizeSkillDraft — combined + structural guarantees", () => {
 		};
 		const report = sanitizeSkillDraft(draft);
 		expect(report.redactedDraft.filePatterns).toEqual(["src/a.ts", "test/**/*.ts"]);
+	});
+
+	test("a secret inside a filePatterns entry is redacted", () => {
+		const key = ["sk-or-v1", "0123456789abcdef0123456789abcdef0123456789abcdef"].join("-");
+		const report = sanitizeSkillDraft({
+			action: "create",
+			filePatterns: ["src/**/*.ts", `fixtures/${key}/*.json`],
+			body: "ok",
+		});
+		expect(report.ok).toBe(true);
+		expect(report.violations).toContain("secret redacted in filePatterns");
+		expect(report.redactedDraft.filePatterns?.[0]).toBe("src/**/*.ts");
+		expect(report.redactedDraft.filePatterns?.join(" ")).not.toContain(key);
 	});
 
 	test("does not mutate the input draft (returns a fresh copy)", () => {

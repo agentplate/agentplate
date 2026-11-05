@@ -5,9 +5,9 @@
 // operator can audit who handed what to whom. Polls GET /api/handoffs every 5s.
 
 import { getHandoffs } from "../api.ts";
-import { Badge, Card, clock, fmtAgo } from "../lib.tsx";
-import type { BadgeTone } from "../lib.tsx";
 import { IconArrowRight, IconHandoffs, PageIcon } from "../icons.tsx";
+import type { BadgeTone } from "../lib.tsx";
+import { Badge, Card, clock, fmtAgo } from "../lib.tsx";
 import type { Handoff } from "../types.ts";
 import { usePolling } from "../usePolling.ts";
 

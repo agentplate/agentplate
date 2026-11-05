@@ -14,22 +14,19 @@
 
 import { Command } from "commander";
 import { driveAgentTurn } from "../agents/drive.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
 import { eventsDbPath, sessionsDbPath } from "../paths.ts";
-import { createSessionStore } from "../sessions/store.ts";
-import type { SessionState } from "../types.ts";
+import { CLAIMABLE_STATES, createSessionStore } from "../sessions/store.ts";
+import { requireInit } from "./shared.ts";
 
 interface TurnOptions {
 	json?: boolean;
 }
-
-/** States a turn can be driven from: paused/awaiting mail (not terminal, not mid-turn). */
-const DRIVABLE_STATES: ReadonlySet<SessionState> = new Set<SessionState>(["idle", "booting"]);
 
 export function createTurnCommand(): Command {
 	return new Command("turn")
@@ -38,10 +35,7 @@ export function createTurnCommand(): Command {
 		.option("--json", "output JSON")
 		.action(async (agent: string, _opts: TurnOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 
 			const store = createSessionStore(sessionsDbPath(root));
@@ -50,7 +44,10 @@ export function createTurnCommand(): Command {
 			try {
 				const session = store.getSessionByAgent(agent);
 				if (!session) throw new NotFoundError(`No agent named "${agent}".`);
-				if (!DRIVABLE_STATES.has(session.state)) {
+				// Fast, friendly refusal from the snapshot. The real guard is the atomic
+				// claim inside driveTurn: if `watch` (or another `turn`) claims the agent
+				// between this read and our turn, we refuse there and inject no mail.
+				if (!CLAIMABLE_STATES.includes(session.state)) {
 					throw new ValidationError(
 						`Agent "${agent}" is ${session.state}; only an idle agent can take another turn.`,
 					);

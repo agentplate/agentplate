@@ -16,9 +16,10 @@
 import { Html, OrbitControls, PointerLockControls } from "@react-three/drei";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import * as THREE from "three";
 import type { Group } from "three";
+import * as THREE from "three";
 import { getHandoffs } from "../api.ts";
+import { bindMovementKeys, pointerLockedTo } from "../fpsKeys.ts";
 import {
 	IconClick,
 	IconFps,
@@ -140,7 +141,9 @@ const ROLE_KITS: Record<string, RoleKit> = {
 };
 
 function roleKit(capability: string): RoleKit {
-	return ROLE_KITS[capability] ?? { color: "#9aa0a8", hat: "none", prop: "none", label: capability };
+	return (
+		ROLE_KITS[capability] ?? { color: "#9aa0a8", hat: "none", prop: "none", label: capability }
+	);
 }
 
 // --- Behavior model ---------------------------------------------------------
@@ -352,15 +355,7 @@ function Hat({
 }
 
 /** A held prop, parented inside the right forearm group (rides with the hand). */
-function Prop({
-	kind,
-	dim,
-	op,
-}: {
-	kind: PropKind;
-	dim: boolean;
-	op: number;
-}): JSX.Element | null {
+function Prop({ kind, dim, op }: { kind: PropKind; dim: boolean; op: number }): JSX.Element | null {
 	const mat = (c: string) => <meshStandardMaterial color={c} transparent={dim} opacity={op} />;
 	// Anchor near the hand at the bottom of the forearm, slightly forward.
 	return (
@@ -681,6 +676,7 @@ function Actor({
 	const pantsMat = <meshStandardMaterial color={PANTS} transparent={dim} opacity={op} />;
 
 	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: a three.js scene-graph <group> (react-three-fiber), not a DOM element; agents are also reachable by keyboard from the Agents/Dashboard screens.
 		<group
 			ref={root}
 			scale={isCoordinator ? 1.14 : 1}
@@ -870,12 +866,14 @@ function Desk({ agent, position }: { agent: AgentSession; position: Vec3 }): JSX
 				<boxGeometry args={[1.5, 0.28, 0.03]} />
 				<meshStandardMaterial color={team} />
 			</mesh>
-			{([
-				[-0.66, -0.34],
-				[0.66, -0.34],
-				[-0.66, 0.34],
-				[0.66, 0.34],
-			] as const).map(([x, z]) => (
+			{(
+				[
+					[-0.66, -0.34],
+					[0.66, -0.34],
+					[-0.66, 0.34],
+					[0.66, 0.34],
+				] as const
+			).map(([x, z]) => (
 				<mesh key={`${x},${z}`} position={[x, 0.46, z]}>
 					<boxGeometry args={[0.08, 0.92, 0.08]} />
 					<meshStandardMaterial color={WOOD_TABLE_DARK} />
@@ -896,7 +894,11 @@ function Desk({ agent, position }: { agent: AgentSession; position: Vec3 }): JSX
 			</mesh>
 			<mesh position={[0, 1.32, -0.272]}>
 				<boxGeometry args={[0.6, 0.38, 0.02]} />
-				<meshStandardMaterial color={screen} emissive={screen} emissiveIntensity={active ? 0.85 : 0.4} />
+				<meshStandardMaterial
+					color={screen}
+					emissive={screen}
+					emissiveIntensity={active ? 0.85 : 0.4}
+				/>
 			</mesh>
 			{/* Keyboard, mouse, papers */}
 			<mesh position={[0, 0.97, 0.06]}>
@@ -942,7 +944,13 @@ function Desk({ agent, position }: { agent: AgentSession; position: Vec3 }): JSX
  * (gold strip + nameplate) faces +z toward the workforce, and the director sits
  * behind it (facing the team) while working — see `coordStation` in {@link Scene}.
  */
-function CoordinatorOffice({ position, agent }: { position: Vec3; agent: AgentSession }): JSX.Element {
+function CoordinatorOffice({
+	position,
+	agent,
+}: {
+	position: Vec3;
+	agent: AgentSession;
+}): JSX.Element {
 	const gold = ROLE_KITS.coordinator?.color ?? "#f5b301";
 	const screen = state3d(agent.state).color;
 	const active = agent.state === "working" || agent.state === "booting";
@@ -1335,28 +1343,33 @@ function RoadmapBoard({ position }: { position: Vec3 }): JSX.Element {
 
 // --- Controls ---------------------------------------------------------------
 
-/** FPS walk-around: pointer-lock mouse-look + WASD movement at eye height. */
+/** DOM id of the Office canvas wrapper: the only element whose click grabs pointer lock. */
+const OFFICE_CANVAS_ID = "office-canvas";
+
+/**
+ * FPS walk-around: pointer-lock mouse-look + WASD movement at eye height.
+ * Pointer lock is requested only by clicks on the canvas (not anywhere on the
+ * page), and WASD only moves while the pointer is locked to it; key state is
+ * cleared on blur / tab hide / unlock so a lost keyup can't leave it flying.
+ */
 function FpsControls(): JSX.Element {
-	const { camera } = useThree();
+	const { camera, gl } = useThree();
+	// The element pointer lock is taken on. It is handed to <PointerLockControls>
+	// as `domElement` below: without that, drei locks R3F's wrapper <div>
+	// (`events.connected`), so `pointerLockElement` would never be the canvas
+	// and WASD would never register.
+	const lockTarget = gl.domElement;
 	const keys = useRef<Record<string, boolean>>({});
 
 	useEffect(() => {
 		camera.position.set(0, 1.7, 6);
-		const down = (e: KeyboardEvent) => {
-			keys.current[e.code] = true;
-		};
-		const up = (e: KeyboardEvent) => {
-			keys.current[e.code] = false;
-		};
-		window.addEventListener("keydown", down);
-		window.addEventListener("keyup", up);
-		return () => {
-			window.removeEventListener("keydown", down);
-			window.removeEventListener("keyup", up);
-		};
-	}, [camera]);
+		return bindMovementKeys(window, document, keys.current, () =>
+			pointerLockedTo(document, lockTarget),
+		);
+	}, [camera, lockTarget]);
 
 	useFrame((_, dt) => {
+		if (!pointerLockedTo(document, lockTarget)) return;
 		const speed = 6 * Math.min(dt, 0.05);
 		const front = new THREE.Vector3();
 		camera.getWorldDirection(front);
@@ -1375,7 +1388,7 @@ function FpsControls(): JSX.Element {
 		}
 	});
 
-	return <PointerLockControls />;
+	return <PointerLockControls domElement={lockTarget} selector={`#${OFFICE_CANVAS_ID}`} />;
 }
 
 // --- Scene + screen ---------------------------------------------------------
@@ -1557,7 +1570,12 @@ function Scene({
 			{fps ? (
 				<FpsControls />
 			) : (
-				<OrbitControls enablePan minDistance={4} maxDistance={halfZ * 2.4} maxPolarAngle={Math.PI / 2.1} />
+				<OrbitControls
+					enablePan
+					minDistance={4}
+					maxDistance={halfZ * 2.4}
+					maxPolarAngle={Math.PI / 2.1}
+				/>
 			)}
 		</>
 	);
@@ -1623,8 +1641,8 @@ export function OfficeScreen({
 		<div>
 			<div className="page-head">
 				<h1 className="page-title">
-						<PageIcon icon={IconOffice} /> Office
-					</h1>
+					<PageIcon icon={IconOffice} /> Office
+				</h1>
 				<p className="page-sub">
 					Agents act out their work by role: each wears a kit (the coordinator presides from the
 					corner office), idle agents stand, working agents sit and type, and handoffs meet at the
@@ -1649,6 +1667,7 @@ export function OfficeScreen({
 				) : (
 					<>
 						<Canvas
+							id={OFFICE_CANVAS_ID}
 							shadows
 							camera={{ position: [0, 7, 13], fov: 45 }}
 							style={{ background: SKY }}

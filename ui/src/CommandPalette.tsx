@@ -55,7 +55,12 @@ export function CommandPalette({
 		const q = query.trim().toLowerCase();
 		const screens: Result[] = nav
 			.filter((n) => !q || n.label.toLowerCase().includes(q) || n.id.includes(q))
-			.map((n) => ({ kind: "screen", id: n.id, label: n.label, icon: NAV_ICON[n.id] ?? IconAgents }));
+			.map((n) => ({
+				kind: "screen",
+				id: n.id,
+				label: n.label,
+				icon: NAV_ICON[n.id] ?? IconAgents,
+			}));
 		const ags: Result[] = agents
 			.filter((name) => !q || name.toLowerCase().includes(q))
 			.map((name) => ({
@@ -101,6 +106,7 @@ export function CommandPalette({
 	const firstAgent = results.findIndex((r) => r.kind === "agent");
 
 	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-dismiss is a mouse-only convenience; keyboard users close with Escape in the focused input.
 		<div className="cmdk-backdrop" onMouseDown={onClose} role="presentation">
 			<div
 				className="cmdk"
@@ -134,10 +140,7 @@ export function CommandPalette({
 										onMouseEnter={() => setActive(i)}
 										onClick={() => run(r)}
 									>
-										<span
-											className="cmdk-icon"
-											style={r.color ? { color: r.color } : undefined}
-										>
+										<span className="cmdk-icon" style={r.color ? { color: r.color } : undefined}>
 											<Icon size={16} strokeWidth={2} />
 										</span>
 										<span className="cmdk-label">{r.label}</span>
@@ -149,9 +152,16 @@ export function CommandPalette({
 					)}
 				</div>
 				<div className="cmdk-foot">
-					<span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-					<span><kbd>↵</kbd> select</span>
-					<span><kbd>esc</kbd> close</span>
+					<span>
+						<kbd>↑</kbd>
+						<kbd>↓</kbd> navigate
+					</span>
+					<span>
+						<kbd>↵</kbd> select
+					</span>
+					<span>
+						<kbd>esc</kbd> close
+					</span>
 				</div>
 			</div>
 		</div>

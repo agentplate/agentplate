@@ -5,17 +5,17 @@
  * (per the project's "never mock what you can use for real" rule). We drive git
  * through Bun.spawn exactly as the resolver does, so the tests validate true git
  * behavior — clean merges, conflict detection, abort cleanliness, and the
- * keep-theirs auto-resolution.
+ * (lossless-only) keep-theirs auto-resolution.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { WorktreeError } from "../errors.ts";
 import { withMergeLock } from "./lock.ts";
-import { mergeBranch, predictMerge } from "./resolver.ts";
+import { mergeBranch, parseUnmergedEntries, planAutoResolve, predictMerge } from "./resolver.ts";
 
 let repo: string;
 
@@ -114,12 +114,6 @@ async function startConflictingMerge(): Promise<void> {
 	expect(await mergeHeadExists()).toBe(true);
 }
 
-/** Paths the merge commit at HEAD changed relative to its first parent (the target). */
-async function mergeCommitPaths(): Promise<string[]> {
-	const out = await git("diff", "--name-only", "-z", "HEAD^1", "HEAD");
-	return out.split("\0").filter((p) => p.length > 0);
-}
-
 beforeEach(async () => {
 	repo = mkdtempSync(join(tmpdir(), "agentplate-merge-"));
 	await initRepo();
@@ -191,27 +185,110 @@ describe("mergeBranch — conflict handling", () => {
 		expect(await readFile("file.txt")).toBe("MAIN-EDIT\nline2\nline3\n");
 	});
 
-	test("autoResolve=true merges by keeping incoming (theirs) changes", async () => {
+	test("autoResolve=true refuses a conflict the target also changed (nothing lost)", async () => {
 		await makeConflict();
+		const headBefore = (await git("rev-parse", "HEAD")).trim();
 
 		const result = await mergeBranch(repo, "agent/conflict", "main", { autoResolve: true });
 
-		expect(result.status).toBe("merged");
-		expect(result.tier).toBe("auto-resolve");
-		expect(result.conflictFiles).toContain("file.txt");
+		expect(result.status).toBe("failed");
+		expect(result.tier).toBeNull();
+		expect(result.conflictFiles).toEqual(["file.txt"]);
+		expect(result.message).toContain("file.txt");
+		expect(result.message).toContain("resolved manually");
 
-		// keep-theirs => the incoming branch's version wins.
-		expect(await readFile("file.txt")).toBe("BRANCH-EDIT\nline2\nline3\n");
+		// Aborted cleanly: target untouched, no MERGE_HEAD, clean tree.
+		expect((await git("rev-parse", "HEAD")).trim()).toBe(headBefore);
+		expect(await readFile("file.txt")).toBe("MAIN-EDIT\nline2\nline3\n");
+		expect(await mergeHeadExists()).toBe(false);
+		expect((await git("status", "--porcelain")).trim()).toBe("");
+	});
 
-		// Merge is committed: clean tree, no MERGE_HEAD.
-		const status = await git("status", "--porcelain");
-		expect(status.trim()).toBe("");
-		const mh = Bun.spawn(["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"], {
-			cwd: repo,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(await mh.exited).not.toBe(0);
+	test("auto-resolve never drops a target hunk git had merged cleanly", async () => {
+		// Audit repro: a 30-line file; main changes line 1 (conflicting) and line 12
+		// (another agent's landed work); the branch changes lines 1 and 25. The old
+		// `checkout --theirs` resolution silently lost MAIN-12.
+		const lines = Array.from({ length: 30 }, (_, i) => `line${i + 1}`);
+		const render = (edits: Record<number, string>): string =>
+			`${lines.map((l, i) => edits[i + 1] ?? l).join("\n")}\n`;
+		await writeFile("big.txt", render({}));
+		await commitAll("add big.txt");
+		await branchOff("agent/big");
+		await writeFile("big.txt", render({ 1: "AGENT-1", 25: "AGENT-25" }));
+		await commitAll("agent edits 1, 25");
+		await checkout("main");
+		await writeFile("big.txt", render({ 1: "MAIN-1", 12: "MAIN-12" }));
+		await commitAll("main edits 1, 12");
+
+		const prediction = await predictMerge(repo, "agent/big", "main", { autoResolve: true });
+		expect(prediction.status).toBe("failed");
+		expect(prediction.conflictFiles).toEqual(["big.txt"]);
+
+		const result = await mergeBranch(repo, "agent/big", "main", { autoResolve: true });
+		expect(result.status).toBe("failed");
+		expect(result.conflictFiles).toEqual(["big.txt"]);
+		expect(await git("show", "HEAD:big.txt")).toContain("MAIN-12");
+		expect(await readFile("big.txt")).toContain("MAIN-12");
+		expect(await mergeHeadExists()).toBe(false);
+	});
+});
+
+describe("planAutoResolve — keep-theirs only when the target is unchanged", () => {
+	const BASE = "100644 1111111111111111111111111111111111111111";
+	const OURS = "100644 2222222222222222222222222222222222222222";
+	const THEIRS = "100644 3333333333333333333333333333333333333333";
+	const entry = (version: string, stage: number, path: string): string =>
+		`${version} ${stage}\t${path}`;
+
+	test("parses ls-files -u style entries grouped by path", () => {
+		const parsed = parseUnmergedEntries([
+			entry(BASE, 1, "a b.txt"),
+			entry(OURS, 2, "a b.txt"),
+			entry(THEIRS, 3, "a b.txt"),
+			entry(BASE, 1, "gone.txt"),
+			"not-an-entry",
+		]);
+		expect(parsed).toEqual([
+			{ path: "a b.txt", base: BASE, ours: OURS, theirs: THEIRS },
+			{ path: "gone.txt", base: BASE },
+		]);
+	});
+
+	test("target == base: take theirs, or the branch's deletion", () => {
+		const plan = planAutoResolve(
+			parseUnmergedEntries([
+				entry(BASE, 1, "keep.txt"),
+				entry(BASE, 2, "keep.txt"),
+				entry(THEIRS, 3, "keep.txt"),
+				entry(BASE, 1, "rm.txt"),
+				entry(BASE, 2, "rm.txt"),
+			]),
+		);
+		expect(plan).toEqual({ keep: ["keep.txt"], remove: ["rm.txt"], unsafe: [] });
+	});
+
+	test("target edited, added, or deleted the path: unsafe", () => {
+		const plan = planAutoResolve(
+			parseUnmergedEntries([
+				// both edited
+				entry(BASE, 1, "edit.txt"),
+				entry(OURS, 2, "edit.txt"),
+				entry(THEIRS, 3, "edit.txt"),
+				// add/add
+				entry(OURS, 2, "add.txt"),
+				entry(THEIRS, 3, "add.txt"),
+				// target deleted, branch modified
+				entry(BASE, 1, "del.txt"),
+				entry(THEIRS, 3, "del.txt"),
+				// same blob, mode changed on the target
+				entry(BASE, 1, "mode.sh"),
+				entry(`100755 ${BASE.split(" ")[1]}`, 2, "mode.sh"),
+				entry(THEIRS, 3, "mode.sh"),
+			]),
+		);
+		expect(plan.keep).toEqual([]);
+		expect(plan.remove).toEqual([]);
+		expect(plan.unsafe).toEqual(["edit.txt", "add.txt", "del.txt", "mode.sh"]);
 	});
 });
 
@@ -246,11 +323,19 @@ describe("predictMerge — side-effect-free", () => {
 		await commitAll("main edit");
 
 		const headBefore = (await git("rev-parse", "HEAD")).trim();
+		// Default (auto-resolve off) and on: both sides edited, so either way the
+		// merge would fail rather than keep-theirs over main's edit.
 		const result = await predictMerge(repo, "agent/conflict", "main");
+		expect(result.status).toBe("failed");
+		expect(result.tier).toBeNull();
+		expect(result.conflictFiles).toEqual(["file.txt"]);
+		expect(result.message).toContain("auto-resolve disabled");
 
-		expect(result.status).toBe("pending");
-		expect(result.tier).toBe("auto-resolve");
-		expect(result.conflictFiles).toContain("file.txt");
+		const withAuto = await predictMerge(repo, "agent/conflict", "main", { autoResolve: true });
+		expect(withAuto.status).toBe("failed");
+		expect(withAuto.tier).toBeNull();
+		expect(withAuto.conflictFiles).toEqual(["file.txt"]);
+		expect(withAuto.message).toContain("resolved manually");
 
 		// No side effects: HEAD pinned, tree clean, no MERGE_HEAD, content intact.
 		expect((await git("rev-parse", "HEAD")).trim()).toBe(headBefore);
@@ -340,10 +425,11 @@ describe("predictMerge — never touches the operator checkout", () => {
 		await writeFile("ün i.txt", "main\n");
 		await commitAll("main adds");
 
-		const result = await predictMerge(repo, "agentplate/w", "main");
+		const result = await predictMerge(repo, "agentplate/w", "main", { autoResolve: true });
 
-		expect(result.tier).toBe("auto-resolve");
+		expect(result.status).toBe("failed");
 		expect(result.conflictFiles).toEqual(["ün i.txt"]);
+		expect(result.message).toContain("(ün i.txt)");
 	});
 });
 
@@ -382,9 +468,33 @@ describe("merge target/branch validation", () => {
 		expect(await headBranch()).toBe("main");
 		expect(await Bun.file(join(repo, "feature.txt")).exists()).toBe(false);
 	});
+
+	test("a tag with the same name as the branch is never merged instead", async () => {
+		// Tag `agentplate/w` points at unrelated work; the branch of the same name
+		// holds the real change. Bare `git merge agentplate/w` prefers the tag.
+		await branchOff("decoy");
+		await writeFile("decoy.txt", "not the branch\n");
+		await commitAll("decoy");
+		await git("tag", "agentplate/w");
+		await checkout("main");
+		await git("branch", "-D", "decoy");
+		await branchOff("agentplate/w");
+		await writeFile("feature.txt", "real\n");
+		await commitAll("real change");
+		await checkout("main");
+
+		const result = await mergeBranch(repo, "agentplate/w", "main");
+
+		expect(result.status).toBe("merged");
+		expect(await readFile("feature.txt")).toBe("real\n");
+		expect(existsSync(join(repo, "decoy.txt"))).toBe(false);
+		expect((await git("rev-parse", "HEAD^2")).trim()).toBe(
+			(await git("rev-parse", "refs/heads/agentplate/w")).trim(),
+		);
+	});
 });
 
-describe("mergeBranch — auto-resolve stages only conflicted files", () => {
+describe("mergeBranch — a refused auto-resolve leaves the checkout alone", () => {
 	/** Branch conflicts with main on file.txt; main also tracks notes.md. */
 	async function makeConflict(): Promise<void> {
 		await writeFile("notes.md", "committed notes\n");
@@ -397,17 +507,20 @@ describe("mergeBranch — auto-resolve stages only conflicted files", () => {
 		await commitAll("main edit");
 	}
 
-	test("operator files and .agentplate/merge.lock never enter the merge commit", async () => {
+	test("operator files and .agentplate/merge.lock are untouched and never committed", async () => {
 		await makeConflict();
 		await writeFile("operator-notes.txt", "private\n"); // untracked
 		await writeFile("notes.md", "operator wip\n"); // tracked, modified, unstaged
+		const headBefore = (await git("rev-parse", "HEAD")).trim();
 
 		const result = await withMergeLock(repo, () =>
 			mergeBranch(repo, "agentplate/w", "main", { autoResolve: true }),
 		);
 
-		expect(result.tier).toBe("auto-resolve");
-		expect(await mergeCommitPaths()).toEqual(["file.txt"]);
+		expect(result.status).toBe("failed");
+		expect(result.conflictFiles).toEqual(["file.txt"]);
+		expect((await git("rev-parse", "HEAD")).trim()).toBe(headBefore);
+		expect(await mergeHeadExists()).toBe(false);
 		const tracked = await git("ls-files");
 		expect(tracked).not.toContain("operator-notes.txt");
 		expect(tracked).not.toContain(".agentplate");
@@ -418,7 +531,7 @@ describe("mergeBranch — auto-resolve stages only conflicted files", () => {
 		expect(existsSync(join(repo, ".agentplate", "merge.lock"))).toBe(false);
 	});
 
-	test("a conflicted file named like a glob does not stage other files", async () => {
+	test("a conflicted file named like a glob is reported verbatim, nothing staged", async () => {
 		await branchOff("agentplate/w");
 		await writeFile("*.txt", "agent\n");
 		await commitAll("agent adds *.txt");
@@ -429,8 +542,9 @@ describe("mergeBranch — auto-resolve stages only conflicted files", () => {
 
 		const result = await mergeBranch(repo, "agentplate/w", "main", { autoResolve: true });
 
+		expect(result.status).toBe("failed");
 		expect(result.conflictFiles).toEqual(["*.txt"]);
-		expect(await mergeCommitPaths()).toEqual(["*.txt"]);
+		expect(await readFile("*.txt")).toBe("main\n");
 		expect((await git("status", "--porcelain")).trim()).toBe("?? operator.txt");
 	});
 
@@ -460,7 +574,7 @@ describe("mergeBranch — auto-resolve stages only conflicted files", () => {
 });
 
 describe("mergeBranch — modify/delete and mid-merge failures", () => {
-	test("branch-deleted vs target-modified resolves to the deletion (keep-theirs)", async () => {
+	test("modify/delete conflicts the target took part in are not auto-resolved", async () => {
 		await writeFile("x.txt", "x\n");
 		await writeFile("y.txt", "y\n");
 		await commitAll("add x, y");
@@ -475,16 +589,17 @@ describe("mergeBranch — modify/delete and mid-merge failures", () => {
 
 		const result = await mergeBranch(repo, "agentplate/w", "main", { autoResolve: true });
 
-		expect(result.status).toBe("merged");
-		expect(result.tier).toBe("auto-resolve");
+		// main edited x (the branch's deletion would discard that) and deleted y
+		// (the branch's edit would undo that): both stay as main has them.
+		expect(result.status).toBe("failed");
 		expect([...result.conflictFiles].sort()).toEqual(["x.txt", "y.txt"]);
-		expect(existsSync(join(repo, "x.txt"))).toBe(false);
-		expect(await readFile("y.txt")).toBe("agent y\n");
+		expect(await readFile("x.txt")).toBe("main x\n");
+		expect(existsSync(join(repo, "y.txt"))).toBe(false);
 		expect(await mergeHeadExists()).toBe(false);
 		expect((await git("status", "--porcelain")).trim()).toBe("");
 	});
 
-	test("a failure while committing the resolution aborts the merge (no MERGE_HEAD)", async () => {
+	test("a refused auto-resolve aborts the merge and the repo is not wedged", async () => {
 		await branchOff("agentplate/w");
 		await writeFile("file.txt", "BRANCH\nline2\nline3\n");
 		await commitAll("branch edit");
@@ -496,21 +611,15 @@ describe("mergeBranch — modify/delete and mid-merge failures", () => {
 		await commitAll("other");
 		await checkout("main");
 		const headBefore = (await git("rev-parse", "HEAD")).trim();
-		// A rejecting pre-commit hook makes `git commit --no-edit` fail mid-merge.
-		const hook = join(repo, ".git", "hooks", "pre-commit");
-		await Bun.write(hook, "#!/bin/sh\nexit 1\n");
-		chmodSync(hook, 0o755);
 
-		await expect(
-			mergeBranch(repo, "agentplate/w", "main", { autoResolve: true }),
-		).rejects.toThrow();
+		const refused = await mergeBranch(repo, "agentplate/w", "main", { autoResolve: true });
+		expect(refused.status).toBe("failed");
 
 		expect(await mergeHeadExists()).toBe(false);
 		expect((await git("rev-parse", "HEAD")).trim()).toBe(headBefore);
 		expect(await readFile("file.txt")).toBe("MAIN\nline2\nline3\n");
 
 		// The repo is not wedged: an unrelated merge still works afterwards.
-		rmSync(hook);
 		const next = await mergeBranch(repo, "agentplate/other", "main", { autoResolve: true });
 		expect(next.status).toBe("merged");
 		expect(next.tier).toBe("clean-merge");

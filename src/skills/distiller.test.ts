@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentRuntime, DirectSpawnOpts } from "../runtimes/types.ts";
@@ -629,20 +629,21 @@ describe("distillSkill", () => {
 		expect(store.list()).toHaveLength(0);
 	});
 
-	test("spawns the one-shot call with the resolved provider env merged over process.env", async () => {
+	test("spawns the one-shot call with the provider env over the ALLOWLISTED parent env", async () => {
 		const baseRef = await setupRepo(dir);
 		writeFileSync(join(dir, "e.ts"), "export const e = 1;\n");
 		await git(dir, "add", ".");
 		await git(dir, "commit", "-q", "-m", "env probe");
 
-		// The print command writes the provider env var AND an inherited process.env
-		// var to a probe file, then emits a skip draft. If the spawn dropped either
-		// half of the merged env, the probe records an empty field.
+		// The print command records the provider env var, an allowlisted inherited
+		// var (HOME), a runtime-passthrough var, and a deploy secret exported in the
+		// parent, then emits a skip draft. Only the deploy secret must be missing.
 		const probeFile = join(dir, "env-probe.txt");
 		const runtime: AgentRuntime = {
 			id: "fake-env",
 			stability: "experimental",
 			instructionPath: "CLAUDE.md",
+			envPassthrough: ["FAKE_RUNTIME_*"],
 			buildDirectSpawn(_opts: DirectSpawnOpts): string[] {
 				return ["true"];
 			},
@@ -653,12 +654,15 @@ describe("distillSkill", () => {
 				return [
 					"bash",
 					"-lc",
-					`printf '%s|%s' "\${FAKE_PROVIDER_KEY-}" "\${AGENTPLATE_INHERITED_PROBE-}" > '${probeFile}'; echo '{"action":"skip"}'`,
+					`printf '%s|%s|%s|%s' "\${FAKE_PROVIDER_KEY-}" "\${HOME:+home-ok}" "\${FAKE_RUNTIME_DIR-}" "\${GHCR_TOKEN-absent}" > '${probeFile}'; echo '{"action":"skip"}'`,
 				];
 			},
 		};
 
-		process.env.AGENTPLATE_INHERITED_PROBE = "inherited-ok";
+		const savedHome = process.env.HOME;
+		process.env.HOME = savedHome ?? dir;
+		process.env.FAKE_RUNTIME_DIR = "runtime-ok";
+		process.env.GHCR_TOKEN = ["ghp", "distillerfixture0123456789abcdef"].join("_");
 		try {
 			store = createSkillStore(dir);
 			const result = await distillSkill({
@@ -677,9 +681,118 @@ describe("distillSkill", () => {
 				},
 			});
 			expect(result.action).toBe("skipped");
-			expect(readFileSync(probeFile, "utf8")).toBe("key-from-provider|inherited-ok");
+			expect(readFileSync(probeFile, "utf8")).toBe("key-from-provider|home-ok|runtime-ok|absent");
 		} finally {
-			delete process.env.AGENTPLATE_INHERITED_PROBE;
+			delete process.env.FAKE_RUNTIME_DIR;
+			delete process.env.GHCR_TOKEN;
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
 		}
+	});
+
+	test("a non-zero exit is a failure even when stdout parses as a draft", async () => {
+		const baseRef = await setupRepo(dir);
+		writeFileSync(join(dir, "n.ts"), "export const n = 1;\n");
+		await git(dir, "add", ".");
+		await git(dir, "commit", "-q", "-m", "nonzero case");
+
+		const draft = JSON.stringify({
+			action: "create",
+			title: "Should Not Land",
+			goal: "g",
+			body: "## Steps\n1. x\n## Gotchas\nnone\n## Verification\nrun `bun test`\n",
+		});
+		const runtime: AgentRuntime = {
+			...fakeRuntime(draft),
+			buildPrintCommand(): string[] {
+				return ["bash", "-lc", `cat <<'AGENTPLATE_EOF'\n${draft}\nAGENTPLATE_EOF\nexit 7`];
+			},
+		};
+		store = createSkillStore(dir);
+		const result = await distillSkill({
+			store,
+			runtime,
+			root: dir,
+			worktreePath: dir,
+			baseRef,
+			taskId: null,
+			agentName: "builder-x",
+			capability: "builder",
+			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
+		});
+		expect(result.action).toBe("skipped");
+		expect(store.list()).toHaveLength(0);
+	});
+
+	test("a stalled model call is killed at timeoutMs and skipped", async () => {
+		const baseRef = await setupRepo(dir);
+		writeFileSync(join(dir, "t.ts"), "export const t = 1;\n");
+		await git(dir, "add", ".");
+		await git(dir, "commit", "-q", "-m", "timeout case");
+
+		const runtime: AgentRuntime = {
+			...fakeRuntime("{}"),
+			buildPrintCommand(): string[] {
+				return ["sleep", "30"];
+			},
+		};
+		store = createSkillStore(dir);
+		const started = performance.now();
+		const result = await distillSkill({
+			store,
+			runtime,
+			root: dir,
+			worktreePath: dir,
+			baseRef,
+			taskId: null,
+			agentName: "builder-x",
+			capability: "builder",
+			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
+			timeoutMs: 200,
+		});
+		expect(result.action).toBe("skipped");
+		expect(performance.now() - started).toBeLessThan(4000);
+	});
+
+	test("a stdin runtime receives the whole prompt on stdin (no argv size limit)", async () => {
+		const baseRef = await setupRepo(dir);
+		writeFileSync(join(dir, "s.ts"), "export const s = 1;\n");
+		await git(dir, "add", ".");
+		await git(dir, "commit", "-q", "-m", "stdin case");
+		// The spec is embedded untruncated: 200 KB is past Linux's 128 KiB per-arg cap.
+		const specDir = join(dir, ".agentplate", "specs");
+		mkdirSync(specDir, { recursive: true });
+		writeFileSync(join(specDir, "task-big.md"), `SPEC-MARKER\n${"s".repeat(200_000)}`);
+
+		const received = join(dir, "prompt-received.txt");
+		let built: string | undefined;
+		const runtime: AgentRuntime = {
+			...fakeRuntime("{}"),
+			promptInput: "stdin",
+			buildPrintCommand(prompt: string): string[] {
+				built = prompt;
+				return ["bash", "-lc", `cat > '${received}'; echo '{"action":"skip"}'`];
+			},
+		};
+		store = createSkillStore(dir);
+		const result = await distillSkill({
+			store,
+			runtime,
+			root: dir,
+			worktreePath: dir,
+			baseRef,
+			taskId: "task-big",
+			agentName: "builder-x",
+			capability: "builder",
+			appliedSlugs: [],
+			resolvedModel: RESOLVED_MODEL,
+		});
+		expect(result.action).toBe("skipped");
+		const piped = readFileSync(received, "utf8");
+		expect(piped).toBe(built as string);
+		expect(piped).toContain("SPEC-MARKER");
+		expect(piped.length).toBeGreaterThan(200_000);
 	});
 });

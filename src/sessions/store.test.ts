@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openDatabase } from "../db/sqlite.ts";
 import type { AgentSession, SessionState } from "../types.ts";
 import { createSessionStore, type SessionStore } from "./store.ts";
 
@@ -400,5 +401,99 @@ describe("createSessionStore — file-backed database", () => {
 		expect(second.getSession(session.id)?.state).toBe("working");
 		expect(second.countActive(run.id)).toBe(1);
 		second.close();
+	});
+});
+
+describe("createSessionStore — atomic claim + reservation", () => {
+	let dir: string;
+	let dbPath: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "agentplate-sessions-claim-"));
+		dbPath = join(dir, "sessions.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("claimTurn moves idle/booting to working, and only one of two drivers wins", () => {
+		// Two handles on one file = two driver processes (watch + a manual turn).
+		const a = createSessionStore(dbPath);
+		const b = createSessionStore(dbPath);
+		try {
+			const session = makeSession({ state: "idle" });
+			a.upsertSession(session);
+			expect(a.claimTurn(session.id)).toBe(true);
+			expect(b.claimTurn(session.id)).toBe(false); // already claimed
+			expect(b.getSession(session.id)?.state).toBe("working");
+
+			const booting = makeSession({ state: "booting" });
+			a.upsertSession(booting);
+			expect(b.claimTurn(booting.id)).toBe(true);
+			expect(a.claimTurn(booting.id)).toBe(false);
+		} finally {
+			a.close();
+			b.close();
+		}
+	});
+
+	test("claimTurn refuses working, terminal and missing sessions without touching them", () => {
+		const store = createSessionStore(":memory:");
+		try {
+			const states: SessionState[] = ["working", "completed", "failed", "stopped"];
+			for (const state of states) {
+				const session = makeSession({ state });
+				store.upsertSession(session);
+				expect(store.claimTurn(session.id)).toBe(false);
+				expect(store.getSession(session.id)?.state).toBe(state);
+			}
+			expect(store.claimTurn("no-such-id")).toBe(false);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("immediateTransaction returns fn's value and rolls back its writes when fn throws", () => {
+		const store = createSessionStore(dbPath);
+		try {
+			const kept = store.immediateTransaction(() => {
+				const s = makeSession({ runId: "run-r" });
+				store.upsertSession(s);
+				return s.id;
+			});
+			expect(store.getSession(kept)).not.toBeNull();
+
+			const refused = makeSession({ runId: "run-r" });
+			expect(() =>
+				store.immediateTransaction(() => {
+					store.upsertSession(refused);
+					throw new Error("at capacity");
+				}),
+			).toThrow("at capacity");
+			expect(store.getSession(refused.id)).toBeNull();
+			expect(store.countActive("run-r")).toBe(1);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("immediateTransaction holds the write lock before fn writes anything", () => {
+		const store = createSessionStore(dbPath);
+		const other = openDatabase(dbPath, { busyTimeoutMs: 0 });
+		try {
+			store.immediateTransaction(() => {
+				// Only *reading* so far (the capacity count) — yet another process can
+				// no longer start a write, so it cannot slip an insert past our count.
+				store.countActive("run-r");
+				expect(() => other.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
+			});
+			// Released on commit.
+			other.exec("BEGIN IMMEDIATE");
+			other.exec("COMMIT");
+		} finally {
+			other.close();
+			store.close();
+		}
 	});
 });

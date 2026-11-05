@@ -60,7 +60,7 @@ describe("runShip (dry-run)", () => {
 		});
 		expect(result.target).toBe("docker-gha");
 		expect(result.dryRun).toBe(true);
-		// Build stages ran (architect/builder/devops), deploy planned, verify skipped.
+		// Build stages are listed but were not run; deploy planned, verify skipped.
 		const names = result.stages.map((s) => s.name);
 		expect(names).toContain("architect");
 		expect(names).toContain("deploy");
@@ -74,6 +74,52 @@ describe("runShip (dry-run)", () => {
 		expect(existsSync(join(root, ".github", "workflows", "deploy.yml"))).toBe(false);
 		// No real deployment URL in dry-run.
 		expect(result.urls).toEqual([]);
+	});
+
+	test("never reports build stages it did not run as ok", async () => {
+		const result = await runShip(root, "a URL shortener", {
+			target: "docker-gha",
+			env: "preview",
+			dryRun: true,
+			yes: false,
+			build: true,
+		});
+		// ship spawns no architect/builder/devops agent, so each is honestly skipped.
+		for (const name of ["architect", "builder", "devops"]) {
+			const stage = result.stages.find((s) => s.name === name);
+			expect(stage?.status).toBe("skipped");
+			expect(stage?.detail).toContain("agentplate sling");
+		}
+		// Only the deploy stage (which really ran, as a plan) is ok.
+		const ok = result.stages.filter((s) => s.status === "ok").map((s) => s.name);
+		expect(ok).toEqual(["deploy"]);
+	});
+
+	test("--json reports the build stages as skipped", async () => {
+		let out = "";
+		const original = process.stdout.write.bind(process.stdout);
+		process.stdout.write = (chunk: string | Uint8Array): boolean => {
+			out += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+			return true;
+		};
+		try {
+			await createShipCommand().parseAsync(
+				["a URL shortener", "--target", "docker-gha", "--dry-run", "--json"],
+				{ from: "user" },
+			);
+		} finally {
+			process.stdout.write = original;
+		}
+		const envelope = JSON.parse(out) as {
+			data: { stages: Array<{ name: string; status: string }> };
+		};
+		const statuses = Object.fromEntries(envelope.data.stages.map((s) => [s.name, s.status]));
+		expect(statuses).toMatchObject({
+			architect: "skipped",
+			builder: "skipped",
+			devops: "skipped",
+			deploy: "ok",
+		});
 	});
 
 	test("--no-build skips build stages", async () => {

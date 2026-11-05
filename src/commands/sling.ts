@@ -1,9 +1,10 @@
 /**
  * `agentplate sling <task-id>` — spawn a worker agent.
  *
- * The end-to-end spawn path: resolve run + manifest → create an isolated git
- * worktree → write the per-task overlay (base definition + assignment) → create
- * the agent identity + session row → dispatch the task over mail → run the first
+ * The end-to-end spawn path: resolve run + manifest → atomically reserve the
+ * session row (capacity check + insert) → create an isolated git worktree off the
+ * canonical branch → write the per-task overlay (base definition + assignment) →
+ * create the agent identity → dispatch the task over mail → run the first
  * headless turn → observe the agent's terminal mail to transition the session.
  *
  * Headless spawn-per-turn: this runs the FIRST turn (a fresh runtime session).
@@ -12,18 +13,19 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Command } from "commander";
 import { assertCapacity } from "../agents/capacity.ts";
 import { driveTurn } from "../agents/drive.ts";
 import { createIdentity } from "../agents/identity.ts";
 import { buildDefaultManifest, getDefinition, loadManifest } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printHint, printInfo, printSuccess } from "../logging/color.ts";
-import { createMailClient } from "../mail/client.ts";
+import { createMailClient, resolveDispatchSender } from "../mail/client.ts";
 import {
 	assertSafeTaskId,
 	currentRunPath,
@@ -31,6 +33,7 @@ import {
 	manifestFilePath,
 	packageAgentDefPath,
 	sessionsDbPath,
+	worktreesDir,
 } from "../paths.ts";
 import { getRuntime, runtimeNameForCapability } from "../runtimes/registry.ts";
 import { resolveModel } from "../runtimes/resolve.ts";
@@ -39,6 +42,7 @@ import { retrieveSkillsForSpawn } from "../skills/lifecycle.ts";
 import type { AgentManifest, AgentSession, Capability, OverlayConfig } from "../types.ts";
 import { SUPPORTED_CAPABILITIES } from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
+import { readCurrentRun, requireInit } from "./shared.ts";
 
 export interface SlingOptions {
 	capability?: string;
@@ -52,11 +56,6 @@ export interface SlingOptions {
 	baseBranch?: string;
 	siblings?: string;
 	json?: boolean;
-}
-
-function readCurrentRun(root: string): string | null {
-	const path = currentRunPath(root);
-	return existsSync(path) ? readFileSync(path, "utf8").trim() || null : null;
 }
 
 function writeCurrentRun(root: string, runId: string): void {
@@ -87,6 +86,28 @@ function uniqueName(store: ReturnType<typeof createSessionStore>, preferred: str
 	return `${preferred}-${preferred.length}`;
 }
 
+/**
+ * Release a reserved session whose setup failed before its first turn. With no
+ * worktree yet nothing else exists, so the row is deleted, as if never reserved.
+ * Once the worktree exists the row is kept as `failed`, so it still records the
+ * worktree + branch for cleanup and frees its concurrency slot. Only a row still
+ * `booting` is touched, never one another driver has since claimed. Best-effort:
+ * the setup error is what the caller rethrows.
+ */
+function releaseReservation(
+	store: ReturnType<typeof createSessionStore>,
+	sessionId: string,
+	worktreeCreated: boolean,
+): void {
+	try {
+		if (store.transitionSessionState(sessionId, "booting", "failed") && !worktreeCreated) {
+			store.deleteSession(sessionId);
+		}
+	} catch {
+		// Leave the row; the reaper / `agentplate stop` can still clear it.
+	}
+}
+
 export function createSlingCommand(): Command {
 	return new Command("sling")
 		.description("Spawn a worker agent")
@@ -107,10 +128,7 @@ export function createSlingCommand(): Command {
 			// The task id names the spec file, agent and branch and is persisted on the
 			// session row (later used by purge), so reject path-like ids up front.
 			assertSafeTaskId(taskId);
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 
 			const capability = (opts.capability ?? "builder") as Capability;
@@ -130,104 +148,125 @@ export function createSlingCommand(): Command {
 				// empty --spec rather than launching the agent contract-less).
 				const specBody = readSpecContract(opts.spec, taskId);
 
-				// Resolve the run this agent belongs to.
-				const runId = resolveRun(store, root, opts);
-
-				// Enforce orchestration capacity BEFORE any worktree/session is created,
-				// so a runaway fan-out is refused cleanly instead of spawning unbounded.
-				const parentAgent = opts.parent ?? null;
-				assertCapacity({
-					depth: Number(opts.depth ?? "0"),
-					active: store.countActive(runId),
-					parentAgent,
-					parentActiveChildren: parentAgent ? store.countActiveByParent(parentAgent, runId) : 0,
-					limits: config.agents,
-				});
-
-				const name = uniqueName(store, opts.name ?? `${capability}-${taskId}`);
-				const branchName = `agentplate/${name}`;
-
-				// 1. Isolated worktree.
-				const worktree = await createWorktree(root, name, branchName, opts.baseBranch);
-
-				// 2. Retrieve relevant skills (records applied-skills.json for feedback).
-				const fileScope = opts.files ? opts.files.split(",").map((f) => f.trim()) : [];
-				const skillsOverlay = retrieveSkillsForSpawn({
-					root,
-					agentName: name,
-					capability,
-					taskId,
-					fileScope,
-					taskText: `${taskId} ${capability}`,
-					skills: config.skills,
-				});
-
-				// 3. Overlay (base definition + assignment + skills) → instruction file.
+				// Branch from the canonical branch — what auto-merge, `merge` and the
+				// skill diff all target — not whatever the root checkout is on, so an
+				// operator's unmerged feature-branch commits never ride along.
+				const baseBranch = opts.baseBranch ?? (config.project.canonicalBranch || undefined);
+				if (baseBranch?.startsWith("-")) {
+					throw new ValidationError(`Invalid base branch "${baseBranch}".`);
+				}
 				const runtime = getRuntime(
 					runtimeNameForCapability(config.runtime, capability, opts.runtime),
 					config.runtime.default,
 				);
-				// Surface project skip-defaults as constraints the spawning agent obeys.
-				const skipDirectives: string[] = [];
-				if (def.canSpawn && config.agents.skipScout) {
-					skipDirectives.push("Skip the scout step — dispatch builders directly (--skip-scout).");
-				}
-				if (def.canSpawn && config.agents.skipReview) {
-					skipDirectives.push("Skip the reviewer step before integrating (--skip-review).");
-				}
-				const overlayConfig: OverlayConfig = {
-					agentName: name,
-					capability,
-					taskId,
-					specPath: opts.spec,
-					branchName,
-					worktreePath: worktree.path,
-					parentAgent: opts.parent ?? null,
-					depth: Number(opts.depth ?? "0"),
-					fileScope,
-					baseDefinition: readBaseDefinition(root, def.file),
-					canSpawn: def.canSpawn,
-					qualityGates: config.project.qualityGates ?? [],
-					constraints: [...def.constraints, ...skipDirectives],
-					siblings: opts.siblings ? opts.siblings.split(",").map((s) => s.trim()) : undefined,
-					skillsOverlay: skillsOverlay || undefined,
-				};
-				writeOverlay(overlayConfig, runtime.instructionPath);
+				const resolved = resolveModel(config, root, def.model, capability);
 
-				// 3. Identity + session row.
-				createIdentity(root, name, capability);
-				const now = new Date().toISOString();
-				const session: AgentSession = {
-					id: `session-${name}-${Date.now()}`,
-					agentName: name,
-					capability,
-					taskId,
-					runId,
-					worktreePath: worktree.path,
-					branchName,
-					state: "booting",
-					parentAgent: opts.parent ?? null,
-					depth: Number(opts.depth ?? "0"),
-					pid: null,
-					runtimeSessionId: null,
-					startedAt: now,
-					lastActivity: now,
-				};
-				store.upsertSession(session);
+				// Resolve the run this agent belongs to.
+				const runId = resolveRun(store, root, opts);
+				const parentAgent = opts.parent ?? null;
+				const depth = Number(opts.depth ?? "0");
 
-				// 4. Dispatch over mail (before the turn, so checkInject sees it).
-				mail.send({
-					from: opts.parent ?? "operator",
-					to: name,
-					subject: `Dispatch: ${taskId}`,
-					body: dispatchBody(taskId, capability, overlayConfig, specBody),
-					type: "dispatch",
+				// 0. Reserve the slot. The capacity check, the name pick and the session
+				//    insert run in ONE `BEGIN IMMEDIATE` transaction, BEFORE the awaited
+				//    worktree add — so concurrent slings (a lead fanning out, several
+				//    POST /api/tasks) serialize instead of all passing the same count.
+				const session = store.immediateTransaction((): AgentSession => {
+					assertCapacity({
+						depth,
+						active: store.countActive(runId),
+						parentAgent,
+						parentActiveChildren: parentAgent ? store.countActiveByParent(parentAgent, runId) : 0,
+						limits: config.agents,
+					});
+					const agentName = uniqueName(store, opts.name ?? `${capability}-${taskId}`);
+					const now = new Date().toISOString();
+					const reserved: AgentSession = {
+						id: `session-${agentName}-${Date.now()}`,
+						agentName,
+						capability,
+						taskId,
+						runId,
+						worktreePath: join(worktreesDir(root), agentName),
+						branchName: `agentplate/${agentName}`,
+						state: "booting",
+						parentAgent,
+						depth,
+						pid: null,
+						runtimeSessionId: null,
+						startedAt: now,
+						lastActivity: now,
+					};
+					store.upsertSession(reserved);
+					return reserved;
 				});
+				const { agentName: name, branchName } = session;
+
+				let worktreeCreated = false;
+				try {
+					// 1. Isolated worktree (at the reserved row's worktreePath).
+					await createWorktree(root, name, branchName, baseBranch);
+					worktreeCreated = true;
+
+					// 2. Retrieve relevant skills (records applied-skills.json for feedback).
+					const fileScope = opts.files ? opts.files.split(",").map((f) => f.trim()) : [];
+					const skillsOverlay = retrieveSkillsForSpawn({
+						root,
+						agentName: name,
+						capability,
+						taskId,
+						fileScope,
+						taskText: `${taskId} ${capability}`,
+						skills: config.skills,
+					});
+
+					// 3. Overlay (base definition + assignment + skills) → instruction file.
+					// Surface project skip-defaults as constraints the spawning agent obeys.
+					const skipDirectives: string[] = [];
+					if (def.canSpawn && config.agents.skipScout) {
+						skipDirectives.push("Skip the scout step — dispatch builders directly (--skip-scout).");
+					}
+					if (def.canSpawn && config.agents.skipReview) {
+						skipDirectives.push("Skip the reviewer step before integrating (--skip-review).");
+					}
+					const overlayConfig: OverlayConfig = {
+						agentName: name,
+						capability,
+						taskId,
+						specPath: opts.spec,
+						branchName,
+						worktreePath: session.worktreePath,
+						parentAgent,
+						depth,
+						fileScope,
+						baseDefinition: readBaseDefinition(root, def.file),
+						canSpawn: def.canSpawn,
+						qualityGates: config.project.qualityGates ?? [],
+						constraints: [...def.constraints, ...skipDirectives],
+						siblings: opts.siblings ? opts.siblings.split(",").map((s) => s.trim()) : undefined,
+						skillsOverlay: skillsOverlay || undefined,
+					};
+					writeOverlay(overlayConfig, runtime.instructionPath);
+
+					// 3b. Identity (the session row was reserved in step 0).
+					createIdentity(root, name, capability);
+
+					// 4. Dispatch over mail (before the turn, so checkInject sees it).
+					mail.send({
+						from: resolveDispatchSender(opts.parent),
+						to: name,
+						subject: `Dispatch: ${taskId}`,
+						body: dispatchBody(taskId, capability, overlayConfig, specBody),
+						type: "dispatch",
+					});
+				} catch (error) {
+					releaseReservation(store, session.id, worktreeCreated);
+					throw error;
+				}
 
 				// 5. Run the first turn. Follow-up turns warm-start (resume) via
-				//    `agentplate turn`; driveTurn owns state + skills + auto-merge.
-				const resolved = resolveModel(config, root, def.model, capability);
-				const prompt = buildInitialPrompt(mail.checkInject(name), runtime.instructionPath);
+				//    `agentplate turn`; driveTurn owns state + skills + auto-merge. The
+				//    prompt is built lazily, after driveTurn claims the turn, so the
+				//    dispatch mail is consumed only by the driver that won the claim.
 				const { finalState, exitCode } = await driveTurn({
 					root,
 					config,
@@ -237,7 +276,7 @@ export function createSlingCommand(): Command {
 					mail,
 					session,
 					model: resolved,
-					prompt,
+					prompt: () => buildInitialPrompt(mail.checkInject(name), runtime.instructionPath),
 				});
 
 				if (useJson) {
@@ -247,7 +286,7 @@ export function createSlingCommand(): Command {
 						taskId,
 						runId,
 						branchName,
-						worktreePath: worktree.path,
+						worktreePath: session.worktreePath,
 						state: finalState,
 						exitCode: exitCode,
 					});
@@ -256,7 +295,7 @@ export function createSlingCommand(): Command {
 				printSuccess(`${brand(name)} [${capability}] → ${finalState}`);
 				printInfo(`  task:    ${taskId}`);
 				printInfo(`  branch:  ${branchName}`);
-				printInfo(`  worktree:${muted(` ${worktree.path}`)}`);
+				printInfo(`  worktree:${muted(` ${session.worktreePath}`)}`);
 				if (exitCode !== 0) {
 					printHint(`  turn exited ${exitCode}; see \`agentplate mail list --from ${name}\``);
 				}

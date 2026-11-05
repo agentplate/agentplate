@@ -2,10 +2,11 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 // The SPA is served by `agentplate serve` from ui/dist, possibly under an arbitrary
-// mount path, so all asset URLs must be relative ("./"). In dev, Vite serves the
-// app directly and proxies /api + /ws to a locally running `agentplate serve`
-// (default port 7551) so the live dashboard works without CORS or a separate
-// terminal juggling ports.
+// mount path, so all asset URLs must be relative ("./"). API + WS URLs follow the
+// same rule: they are app-relative and resolved against document.baseURI (see
+// src/urls.ts). In dev, Vite serves the app directly and proxies /api + /ws to a
+// locally running `agentplate serve` (default port 7551) so the live dashboard
+// works without CORS or a separate terminal juggling ports.
 const SERVE_TARGET = "http://127.0.0.1:7551";
 
 export default defineConfig({

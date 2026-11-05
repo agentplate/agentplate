@@ -2,42 +2,42 @@
  * `agentplate skill` — operate on the self-improving skill library.
  *
  * Skills live on disk as `.agentplate/skills/<slug>/` directories (skill.md +
- * outcomes.jsonl) with a derived FTS index; the {@link createSkillStore} in
- * `../skills/store.ts` is the single read/write path. This command is the
- * operator (and Stop-hook) surface over that store:
+ * outcomes.jsonl); the {@link createSkillStore} in `../skills/store.ts` is the
+ * single read/write path. This command is the operator (and Stop-hook) surface
+ * over that store:
  *
  *   list       — tabular roster (slug, title, confidence, applied/success, status)
  *   show       — print a skill's full skill.md
- *   search     — rank skills by a query (+ optional --files globs) and print the top
+ *   search     — rank skills for a task description (+ optional --files) exactly
+ *                as agent retrieval would, and print them
  *   record     — read a JSON SkillDraft from stdin, scrub it, and upsert (manual
  *                distillation path; the Stop hook pipes a draft here)
  *   outcome    — append a success/partial/failure outcome to a skill
  *   prune      — remove quarantined skills past the max-age window (dry-run default)
- *   reindex    — rebuild the FTS index from the skill.md source of truth
+ *   approve    — make a draft skill active (drafts exist under skills.requireReview)
  *   deprecate  — mark a skill deprecated (excluded from retrieval)
  *   restore    — return a deprecated/quarantined skill to active
+ *   reindex    — deprecated no-op, hidden from help (the FTS index it rebuilt is gone)
  *
  * `--json` is read via `command.optsWithGlobals().json === true` (each subcommand
  * still declares `--json`), matching the house pattern in `mail.ts`.
  *
- * Ranking note: the planned `retrieval.scoreSkill` lives in a sibling module
- * built in parallel and is not importable here yet, so `search` ranks via a
- * small, self-contained {@link scoreSkill} (token overlap on title/goal/
- * whenToUse/tags + file-pattern overlap, confidence as the tie-break) operating
- * over `store.list()`. It produces {@link RankedSkill} values from the
- * authoritative skill types and can be swapped for the shared retrieval scorer
- * without changing this command's surface.
+ * `search` calls {@link rankSkills} from `../skills/retrieval.ts`, the same
+ * ranker (status filter, safety scrub, scorer) that picks the skills injected
+ * into an agent's overlay, so its scores and order match what agents get.
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { accent, brand, muted, printInfo, printSuccess, printWarning } from "../logging/color.ts";
+import { rankSkills } from "../skills/retrieval.ts";
 import { sanitizeSkillDraft } from "../skills/safety.ts";
 import { createSkillStore, type SkillStore, serializeSkillMd } from "../skills/store.ts";
-import type { RankedSkill, Skill, SkillDraft, SkillStatus } from "../skills/types.ts";
+import type { Skill, SkillDraft, SkillStatus } from "../skills/types.ts";
 import type { OutcomeStatus } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 /** Provenance stamped onto manually-recorded skills (the operator path). */
 const OPERATOR_PROVENANCE = { taskId: null, agent: "operator", commit: null } as const;
@@ -47,156 +47,14 @@ const OPERATOR_PROVENANCE = { taskId: null, agent: "operator", commit: null } as
  * Every subcommand calls this first so an uninitialized project fails fast and
  * uniformly (matching the rest of the CLI).
  */
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
-
 /** Read the `--json` global flag off the action's trailing Command instance. */
 function wantsJson(command: Command): boolean {
 	return command.optsWithGlobals().json === true;
 }
 
 // ---------------------------------------------------------------------------
-// Pure helpers (search ranking + formatting) — unit-tested directly
+// Pure helpers (formatting + parsing) — unit-tested directly
 // ---------------------------------------------------------------------------
-
-/** Statuses excluded from retrieval / search results. */
-const RETRIEVABLE_STATUS: SkillStatus = "active";
-
-/**
- * Split free text into lowercase alphanumeric tokens (length >= 2), de-duplicated.
- * Used to compare a query against a skill's searchable text.
- */
-function tokenize(text: string): Set<string> {
-	const tokens = new Set<string>();
-	for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
-		if (raw.length >= 2) tokens.add(raw);
-	}
-	return tokens;
-}
-
-/** Concatenate the searchable text of a skill (title, goal, when-to-use, tags). */
-function searchableText(skill: Skill): string {
-	return [skill.title, skill.goal, skill.whenToUse.join(" "), skill.tags.join(" ")].join(" ");
-}
-
-/**
- * Translate a glob (supporting `*`, `**`, and `?`) into a `RegExp` anchored to
- * the whole string. `**` matches across path separators; `*` matches within a
- * segment; `?` matches a single non-separator character. Everything else is
- * escaped literally. Used for `--files` ↔ `filePatterns` overlap.
- */
-function globToRegExp(glob: string): RegExp {
-	let out = "";
-	for (let i = 0; i < glob.length; i++) {
-		const ch = glob[i];
-		if (ch === "*") {
-			if (glob[i + 1] === "*") {
-				out += ".*";
-				i++;
-			} else {
-				out += "[^/]*";
-			}
-		} else if (ch === "?") {
-			out += "[^/]";
-		} else if (ch !== undefined && /[.+^${}()|[\]\\]/.test(ch)) {
-			out += `\\${ch}`;
-		} else if (ch !== undefined) {
-			out += ch;
-		}
-	}
-	return new RegExp(`^${out}$`);
-}
-
-/**
- * Does a concrete file path match a skill's glob pattern, OR vice-versa? We test
- * both directions so a query path (`src/commands/skill.ts`) matches a skill's
- * pattern (`src/commands/*.ts`), and a query glob (`src/**`) matches a skill's
- * literal pattern (`src/index.ts`).
- */
-function fileMatchesPattern(file: string, pattern: string): boolean {
-	if (file === pattern) return true;
-	try {
-		if (globToRegExp(pattern).test(file)) return true;
-		if (globToRegExp(file).test(pattern)) return true;
-	} catch {
-		// A malformed glob never matches rather than throwing into the ranking loop.
-		return false;
-	}
-	return false;
-}
-
-/**
- * Relevance score of a single skill against a query and optional file globs.
- *
- * Components:
- *  - **text overlap**: fraction of the (tokenized) query terms that appear in the
- *    skill's searchable text, weighted heavily (the primary signal),
- *  - **file overlap**: fraction of the query's file globs that hit at least one of
- *    the skill's `filePatterns` (0 when no files were supplied),
- *  - **confidence**: the earned Wilson confidence, as a small additive tie-break so
- *    two equally-relevant skills order by track record.
- *
- * Returns a score in roughly `[0, 1+]`; absolute magnitude is unimportant, only
- * the ordering. A skill with no query-term overlap and no file overlap scores
- * `confidence * tieBreak` only, so a blank query degrades to "best skills first".
- */
-export function scoreSkill(skill: Skill, queryTokens: Set<string>, files: string[]): number {
-	// Text overlap: how many query terms the skill's text contains.
-	let textOverlap = 0;
-	if (queryTokens.size > 0) {
-		const skillTokens = tokenize(searchableText(skill));
-		let hits = 0;
-		for (const term of queryTokens) {
-			if (skillTokens.has(term)) hits++;
-		}
-		textOverlap = hits / queryTokens.size;
-	}
-
-	// File overlap: how many supplied globs match at least one of the skill's patterns.
-	let fileOverlap = 0;
-	if (files.length > 0 && skill.filePatterns.length > 0) {
-		let hits = 0;
-		for (const file of files) {
-			if (skill.filePatterns.some((pattern) => fileMatchesPattern(file, pattern))) hits++;
-		}
-		fileOverlap = hits / files.length;
-	}
-
-	// Weighted sum; confidence is a sub-unit tie-break so it never outranks real
-	// query relevance.
-	return textOverlap * 1.0 + fileOverlap * 0.75 + skill.confidence * 0.1;
-}
-
-/**
- * Rank `skills` against a query + file globs, dropping non-active skills and any
- * with a zero score when a query/files were actually supplied (so an empty result
- * is honest rather than padded). With neither a query nor files, every active
- * skill is returned ordered by confidence (the scorer's tie-break term).
- */
-export function rankSkills(skills: Skill[], query: string, files: string[]): RankedSkill[] {
-	const queryTokens = tokenize(query);
-	const hasFilter = queryTokens.size > 0 || files.length > 0;
-
-	const ranked: RankedSkill[] = [];
-	for (const skill of skills) {
-		if (skill.status !== RETRIEVABLE_STATUS) continue;
-		const score = scoreSkill(skill, queryTokens, files);
-		if (hasFilter && score <= 0) continue;
-		ranked.push({ skill, score });
-	}
-
-	// Highest score first; slug as a stable tiebreak so output is deterministic.
-	ranked.sort((a, b) => {
-		if (a.score !== b.score) return b.score - a.score;
-		return a.skill.slug < b.skill.slug ? -1 : a.skill.slug > b.skill.slug ? 1 : 0;
-	});
-	return ranked;
-}
 
 /** Format a 0..1 confidence as a fixed-width two-decimal string (e.g. `0.42`). */
 function formatConfidence(value: number): string {
@@ -277,9 +135,16 @@ function colorStatus(status: SkillStatus): string {
 
 /** Narrow an arbitrary string to a {@link SkillStatus}, or throw a ValidationError. */
 function parseStatusFilter(value: string): SkillStatus {
-	if (value === "active" || value === "deprecated" || value === "quarantined") return value;
+	if (
+		value === "active" ||
+		value === "draft" ||
+		value === "deprecated" ||
+		value === "quarantined"
+	) {
+		return value;
+	}
 	throw new ValidationError(
-		`Invalid --status "${value}" (expected active | deprecated | quarantined)`,
+		`Invalid --status "${value}" (expected active | draft | deprecated | quarantined)`,
 	);
 }
 
@@ -373,19 +238,35 @@ export function runShow(slug: string, useJson: boolean): void {
 /** Options accepted by `agentplate skill search`. */
 export interface SearchOptions {
 	files?: string[];
+	capability?: string;
 	json?: boolean;
 }
 
-/** `agentplate skill search <query>` — rank active skills by relevance and print the top. */
+/**
+ * `agentplate skill search <query>` — rank skills for a task description the way
+ * agent retrieval does. The query plays the spawn's task text, `--files` its
+ * file scope and `--capability` its capability; scores and order come from the
+ * shared {@link rankSkills}, so every listed skill is one an agent with that
+ * context would get (in full or as a summary). Active skills that fail the
+ * safety scrub are reported as warnings in table mode.
+ */
 export function runSearch(query: string, opts: SearchOptions, useJson: boolean): void {
 	const root = requireInit();
 	const store = createSkillStore(root);
 	try {
-		const files = opts.files ?? [];
-		const ranked = rankSkills(store.list(), query, files);
+		const { ranked, rejected } = rankSkills(store.list(), {
+			taskText: query,
+			capability: opts.capability ?? "",
+			fileScope: opts.files ?? [],
+		});
 		if (useJson) {
 			jsonOutput(ranked.map((r) => ({ ...toRow(r.skill), score: r.score })));
 			return;
+		}
+		for (const r of rejected) {
+			printWarning(
+				`${r.slug} is never injected: it fails the safety scrub (${r.violations.join("; ")})`,
+			);
 		}
 		if (ranked.length === 0) {
 			printInfo(muted("(no matching skills)"));
@@ -414,7 +295,8 @@ export interface RecordOptions {
  * it via {@link sanitizeSkillDraft}, and (unless `--dry-run`) upsert it with
  * operator provenance. This is the manual distillation path and the Stop-hook
  * target. A `skip` draft (or one downgraded to skip by a fatal safety violation)
- * never writes.
+ * never writes. With `skills.requireReview` on, the write lands as a `draft`
+ * that `agentplate skill approve` must activate, as distilled skills do.
  *
  * `readStdin` is injected so tests can supply a draft string without a real pipe.
  */
@@ -429,7 +311,8 @@ export async function runRecord(
 		);
 	}
 	const root = requireInit();
-	const store = createSkillStore(root);
+	const requireReview = loadConfig(root).skills.requireReview === true;
+	const store = createSkillStore(root, { requireReview });
 	try {
 		const draft = parseDraft(await readStdin());
 		const report = sanitizeSkillDraft(draft);
@@ -475,6 +358,9 @@ export async function runRecord(
 			printSuccess(
 				`${result.action === "created" ? "Created" : "Updated"} skill ${result.skill.slug}`,
 			);
+			if (result.skill.status === "draft") {
+				printInfo(muted(reviewHint(result.skill.slug)));
+			}
 			for (const v of report.violations) printWarning(v);
 		}
 	} finally {
@@ -584,14 +470,55 @@ function isOlderThan(iso: string, cutoffMs: number): boolean {
 	return t < cutoffMs;
 }
 
-/** `agentplate skill reindex` — rebuild the FTS index from skill.md files. */
+/** The next step for a skill written as a draft under `skills.requireReview`. */
+function reviewHint(slug: string): string {
+	return `    draft (skills.requireReview): review with \`agentplate skill show ${slug}\`, then run \`agentplate skill approve ${slug}\``;
+}
+
+/**
+ * `agentplate skill reindex` — deprecated no-op, kept so existing scripts keep
+ * working. It used to rebuild an FTS index that nothing read; skills are now
+ * read straight from their files. It still reads every skill (warning about any
+ * malformed file) and reports how many it read.
+ */
 export function runReindex(useJson: boolean): void {
 	const root = requireInit();
 	const store = createSkillStore(root);
 	try {
-		const count = store.reindex();
-		if (useJson) jsonOutput({ reindexed: count });
-		else printSuccess(`Reindexed ${count} skill(s)`);
+		const count = store.list().length;
+		if (useJson) jsonOutput({ reindexed: count, deprecated: true });
+		else {
+			printWarning("`agentplate skill reindex` is deprecated: there is no index to rebuild.");
+			printInfo(muted(`Read ${count} skill(s) from .agentplate/skills/`));
+		}
+	} finally {
+		store.close();
+	}
+}
+
+/**
+ * `agentplate skill approve <slug>` — make a `draft` skill `active` so retrieval
+ * starts injecting it. Drafts are written while `skills.requireReview` is on.
+ * Approving an already-active skill is a no-op; a deprecated or quarantined
+ * skill is refused (that is `skill restore`'s job), so approve never brings
+ * back a retired skill by accident.
+ */
+export function runApprove(slug: string, useJson: boolean): void {
+	const root = requireInit();
+	const store = createSkillStore(root);
+	try {
+		const skill = store.get(slug);
+		if (skill === null) throw new NotFoundError(`Skill "${slug}" not found`);
+		if (skill.status === "deprecated" || skill.status === "quarantined") {
+			throw new ValidationError(
+				`Skill "${slug}" is ${skill.status}, not a draft. Use \`agentplate skill restore ${slug}\` to reactivate it.`,
+			);
+		}
+		const changed = skill.status === "draft";
+		if (changed) store.setStatus(slug, "active");
+		if (useJson) jsonOutput({ slug, status: "active", changed });
+		else if (changed) printSuccess(`Approved ${slug} (draft → active)`);
+		else printInfo(muted(`${slug} is already active`));
 	} finally {
 		store.close();
 	}
@@ -618,7 +545,7 @@ export function runSetStatus(slug: string, status: SkillStatus, useJson: boolean
 function listCommand(): Command {
 	return new Command("list")
 		.description("List skills (slug, title, confidence, applied/success, status)")
-		.option("--status <status>", "filter by lifecycle status (active|deprecated|quarantined)")
+		.option("--status <status>", "filter by lifecycle status (active|draft|deprecated|quarantined)")
 		.option("--json", "output JSON")
 		.action((opts: ListOptions, command: Command) => {
 			runList(opts, wantsJson(command));
@@ -637,9 +564,12 @@ function showCommand(): Command {
 
 function searchCommand(): Command {
 	return new Command("search")
-		.description("Rank active skills by a query (+ optional --files) and print the top")
-		.argument("<query>", "search query")
-		.option("--files <glob...>", "file globs to weight relevance by")
+		.description(
+			"Rank skills for a task description exactly as agent retrieval would (+ optional --files)",
+		)
+		.argument("<query>", "task description to rank against")
+		.option("--files <path...>", "the agent's file scope (the paths given to `sling --files`)")
+		.option("--capability <capability>", "the agent's capability (e.g. builder)")
 		.option("--json", "output JSON")
 		.action((query: string, opts: SearchOptions, command: Command) => {
 			runSearch(query, opts, wantsJson(command));
@@ -683,10 +613,20 @@ function pruneCommand(): Command {
 
 function reindexCommand(): Command {
 	return new Command("reindex")
-		.description("Rebuild the FTS index from skill.md files")
+		.description("Deprecated no-op: skills are read straight from their files")
 		.option("--json", "output JSON")
 		.action((_opts: { json?: boolean }, command: Command) => {
 			runReindex(wantsJson(command));
+		});
+}
+
+function approveCommand(): Command {
+	return new Command("approve")
+		.description("Approve a draft skill so agents start receiving it (see skills.requireReview)")
+		.argument("<slug>", "skill slug")
+		.option("--json", "output JSON")
+		.action((slug: string, _opts: { json?: boolean }, command: Command) => {
+			runApprove(slug, wantsJson(command));
 		});
 }
 
@@ -720,9 +660,10 @@ export function createSkillCommand(): Command {
 		.addCommand(recordCommand())
 		.addCommand(outcomeCommand())
 		.addCommand(pruneCommand())
-		.addCommand(reindexCommand())
+		.addCommand(approveCommand())
 		.addCommand(deprecateCommand())
-		.addCommand(restoreCommand());
+		.addCommand(restoreCommand())
+		.addCommand(reindexCommand(), { hidden: true });
 }
 
 // Re-export the store type so test files importing this module get a single

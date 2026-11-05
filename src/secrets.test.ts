@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	chmodSync,
 	mkdirSync,
@@ -118,13 +118,38 @@ describe("secrets store — hand-written YAML values", () => {
 		expect(getSecret(root, "AGENTPLATE_TEST_KEY")).toBe("from-env");
 	});
 
-	test("a nested mapping or list value is a ConfigError naming the key, not a silent drop", () => {
-		writeFileSync(secretsPath(root), "GOOD: ok\nBAD:\n  nested: value\n");
-		expect(() => loadSecrets(root)).toThrow(ConfigError);
-		expect(() => loadSecrets(root)).toThrow(/BAD/);
+	test("a nested mapping or list value is skipped with a warning; other lookups still work", () => {
+		const writes: string[] = [];
+		const spy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		});
+		try {
+			writeFileSync(secretsPath(root), "GOOD: ok\nBAD:\n  nested: value\nLIST:\n  - a\n  - b\n");
+			expect(loadSecrets(root)).toEqual({ GOOD: "ok" });
+			expect(getSecret(root, "GOOD")).toBe("ok");
+			expect(hasSecret(root, "GOOD")).toBe(true);
+			expect(getSecret(root, "BAD")).toBeUndefined();
+			expect(hasSecret(root, "LIST")).toBe(false);
+		} finally {
+			spy.mockRestore();
+		}
+		const warnings = writes.join("");
+		expect(warnings).toContain("BAD");
+		expect(warnings).toMatch(/LIST.*list/);
+		// Each bad entry warns once, not on every lookup.
+		expect(warnings.split("Secret BAD").length - 1).toBe(1);
+	});
 
-		writeFileSync(secretsPath(root), "LIST:\n  - a\n  - b\n");
-		expect(() => loadSecrets(root)).toThrow(/LIST.*list/);
+	test("a nested entry does not hide the environment fallback for its name", () => {
+		process.env.AGENTPLATE_TEST_KEY = "from-env";
+		const spy = spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			writeFileSync(secretsPath(root), "AGENTPLATE_TEST_KEY:\n  nested: value\n");
+			expect(getSecret(root, "AGENTPLATE_TEST_KEY")).toBe("from-env");
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	test("setSecret refuses to rewrite a file holding an invalid entry (no data loss)", () => {

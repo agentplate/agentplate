@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { isLoopbackHost } from "../serve/server.ts";
-import { createServeCommand, remoteBindWarning } from "./serve.ts";
+import { createServeCommand, remoteBindWarning, tokenUrl } from "./serve.ts";
 
 describe("serve options", () => {
 	test("--allow-origin is repeatable and defaults to none", () => {
@@ -32,11 +32,19 @@ describe("serve options", () => {
 });
 
 describe("remoteBindWarning", () => {
-	test("names the host and spells out the unauthenticated-agent-spawn risk", () => {
+	test("names the host and spells out the token + agent-spawn risk", () => {
 		const w = remoteBindWarning("0.0.0.0");
 		expect(w).toContain("0.0.0.0");
 		expect(w).toContain("NOT a loopback");
-		expect(w).toContain("no authentication");
+		expect(w).toContain("bearer token");
+		expect(w).toContain("plain HTTP");
 		expect(w).toContain("spawn agents");
+	});
+});
+
+describe("tokenUrl", () => {
+	test("appends an encoded ?token= only when a token is required", () => {
+		expect(tokenUrl("http://127.0.0.1:7551", null)).toBe("http://127.0.0.1:7551");
+		expect(tokenUrl("http://0.0.0.0:7551", "a b&c")).toBe("http://0.0.0.0:7551/?token=a%20b%26c");
 	});
 });

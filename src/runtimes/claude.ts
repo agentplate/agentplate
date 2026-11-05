@@ -55,12 +55,42 @@ export class ClaudeRuntime implements AgentRuntime {
 	readonly instructionPath = ".claude/CLAUDE.md";
 
 	/**
+	 * `claude -p` with no prompt argument reads the prompt from stdin, so a turn
+	 * of any size (all of an agent's unread mail) never hits the argv limit.
+	 */
+	readonly promptInput = "stdin" as const;
+
+	/**
+	 * Claude Code's own namespace (`ANTHROPIC_*` endpoint/auth/model settings,
+	 * `CLAUDE_*` incl. `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_*` flags), its common
+	 * unprefixed switches (`DISABLE_*`, `IS_SANDBOX` — required to run
+	 * `bypassPermissions` as root in a container), and the non-secret Bedrock /
+	 * Vertex selectors. Raw cloud keys are NOT passed — they may equally be deploy
+	 * credentials; add them via `AGENTPLATE_ENV_PASSTHROUGH` if Claude needs them.
+	 */
+	readonly envPassthrough = [
+		"ANTHROPIC_*",
+		"CLAUDE_*",
+		"DISABLE_*",
+		"IS_SANDBOX",
+		"MAX_THINKING_TOKENS",
+		"BASH_DEFAULT_TIMEOUT_MS",
+		"BASH_MAX_TIMEOUT_MS",
+		"MCP_TIMEOUT",
+		"MCP_TOOL_TIMEOUT",
+		"AWS_PROFILE",
+		"AWS_REGION",
+		"CLOUD_ML_REGION",
+		"VERTEX_REGION_*",
+	] as const;
+
+	/**
 	 * Build argv for one headless streaming turn (run via `Bun.spawn`).
 	 *
 	 * Flag choices:
-	 * - `-p <prompt>` runs the prompt non-interactively and exits on completion.
-	 *   The prompt defaults to "" so a resume-only nudge turn (where the caller
-	 *   feeds the real text on stdin) still produces a well-formed argv.
+	 * - `-p` runs non-interactively and exits on completion. The prompt is NOT
+	 *   in argv: with no prompt argument `claude -p` reads it from stdin, which
+	 *   the caller writes ({@link promptInput}).
 	 * - `--output-format stream-json` + `--verbose` emit the per-event NDJSON that
 	 *   {@link parseEvents} consumes; `--verbose` is required for the streaming
 	 *   form to include tool-use / session events rather than a single result.
@@ -78,7 +108,6 @@ export class ClaudeRuntime implements AgentRuntime {
 		return [
 			"claude",
 			"-p",
-			opts.prompt ?? "",
 			"--output-format",
 			"stream-json",
 			"--verbose",
@@ -88,8 +117,8 @@ export class ClaudeRuntime implements AgentRuntime {
 			// string is treated as "no resume" so the first turn opens a new session.
 			...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
 			// Force sling-only spawning. The variadic `--disallowedTools <tools...>` is
-			// placed before `--permission-mode` so that flag terminates the list and the
-			// `-p` prompt (a leading flag value) is never swallowed.
+			// placed before `--permission-mode` so that flag terminates the list and no
+			// later argument is ever swallowed into it.
 			"--disallowedTools",
 			...BLOCKED_SPAWN_TOOLS,
 			"--permission-mode",
@@ -145,20 +174,24 @@ export class ClaudeRuntime implements AgentRuntime {
 	 * ignore the bearer, but the CLI refuses to start without one —
 	 * `ANTHROPIC_SMALL_FAST_MODEL` is pinned to the resolved model (Claude's
 	 * haiku-class background model does not exist on local servers), and
-	 * `ANTHROPIC_API_KEY` is set to "" because the caller spawns with
-	 * `{...process.env, ...thisEnv}`: without the explicit empty override, a
-	 * shell-exported real key would survive the merge and be sent to the local
-	 * endpoint. Any other authMode (api-key/env carry the real key in
+	 * `ANTHROPIC_API_KEY` is set to "" because the child inherits the shell's
+	 * `ANTHROPIC_*` vars (see {@link envPassthrough}): without the explicit empty
+	 * override, a shell-exported real key would survive the merge and be sent to
+	 * the local endpoint. Any other authMode (api-key/env carry the real key in
 	 * `model.env`; subscription keeps the CLI's own login) gets no dummy bearer.
 	 *
-	 * In EVERY authMode, a `baseUrl` whose host is not Anthropic's (a gateway such
-	 * as OpenRouter, a custom endpoint, a proxy) also pins `ANTHROPIC_API_KEY` to
-	 * "" — the CLI would otherwise send a shell-exported Anthropic key as
-	 * `x-api-key` to that third-party host — UNLESS the provider explicitly
-	 * resolved `ANTHROPIC_API_KEY` itself (its `authTokenEnv`), in which case
-	 * `model.env` carries it and it is forwarded as configured. The CLI treats an
-	 * empty value as unset, so a subscription login keeps working. Without a
-	 * `baseUrl` the behavior is unchanged.
+	 * In EVERY other authMode, a `baseUrl` whose host is not Anthropic's (a
+	 * gateway such as OpenRouter, a custom endpoint, a proxy):
+	 * - presents the provider's own credential as the bearer: when its
+	 *   `authTokenEnv` is a variable the CLI does not read (e.g.
+	 *   `OPENROUTER_API_KEY`), that value becomes `ANTHROPIC_AUTH_TOKEN` —
+	 *   without it the CLI sends no gateway credential at all;
+	 * - pins `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` to "" unless the
+	 *   provider set that variable itself — the CLI would otherwise send a
+	 *   shell-exported Anthropic key (`x-api-key`) or bearer token
+	 *   (`Authorization`) to that third-party host. The CLI treats an empty
+	 *   value as unset, so a subscription login keeps working.
+	 * Without a `baseUrl` the behavior is unchanged.
 	 */
 	buildEnv(model: ResolvedModel): Record<string, string> {
 		const env: Record<string, string> = { ...(model.env ?? {}) };
@@ -168,22 +201,28 @@ export class ClaudeRuntime implements AgentRuntime {
 				env.ANTHROPIC_AUTH_TOKEN = "agentplate-local";
 				env.ANTHROPIC_SMALL_FAST_MODEL = model.model;
 				env.ANTHROPIC_API_KEY = "";
-			} else if (!isAnthropicBaseUrl(model.baseUrl) && model.env?.ANTHROPIC_API_KEY === undefined) {
-				env.ANTHROPIC_API_KEY = "";
+			} else if (!isAnthropicBaseUrl(model.baseUrl)) {
+				const gatewayToken = gatewayCredential(model);
+				if (gatewayToken !== undefined && env.ANTHROPIC_AUTH_TOKEN === undefined) {
+					env.ANTHROPIC_AUTH_TOKEN = gatewayToken;
+				}
+				for (const name of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
+					if (env[name] === undefined) env[name] = "";
+				}
 			}
 		}
 		return env;
 	}
 
 	/**
-	 * Build argv for a one-shot, non-streaming call (`claude -p … --output-format
-	 * text`). Used later by AI-assisted merge resolution and skill distillation,
-	 * where we want only the final text answer, not an event stream. The model is
-	 * appended only when provided so the caller can defer to Claude Code's own
-	 * default.
+	 * Build argv for a one-shot, non-streaming call (`claude -p --output-format
+	 * text`). Used by skill distillation, where we want only the final text
+	 * answer, not an event stream. The prompt is read from stdin
+	 * ({@link promptInput}), so it is not in argv. The model is appended only when
+	 * provided so the caller can defer to Claude Code's own default.
 	 */
-	buildPrintCommand(prompt: string, model?: string): string[] {
-		const argv = ["claude", "-p", prompt, "--output-format", "text"];
+	buildPrintCommand(_prompt: string, model?: string): string[] {
+		const argv = ["claude", "-p", "--output-format", "text"];
 		if (model !== undefined) {
 			argv.push("--model", model);
 		}
@@ -265,6 +304,21 @@ export function isAnthropicBaseUrl(url: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * The provider credential to present to a gateway as the bearer: the resolved
+ * value of the provider's `authTokenEnv` when that is a variable the claude CLI
+ * does not read itself (e.g. `OPENROUTER_API_KEY`). `ANTHROPIC_API_KEY` /
+ * `ANTHROPIC_AUTH_TOKEN` are already forwarded under their own names.
+ */
+function gatewayCredential(model: ResolvedModel): string | undefined {
+	const name = model.authTokenEnv;
+	if (name === undefined || name === "ANTHROPIC_API_KEY" || name === "ANTHROPIC_AUTH_TOKEN") {
+		return undefined;
+	}
+	const value = model.env?.[name];
+	return value !== undefined && value !== "" ? value : undefined;
 }
 
 /**

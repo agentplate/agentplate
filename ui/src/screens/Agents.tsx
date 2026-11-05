@@ -4,8 +4,8 @@ import type { JSX } from "react";
 import {
 	IconActive,
 	IconAgents,
-	IconCompleted,
 	IconChild,
+	IconCompleted,
 	IconError,
 	IconIdle,
 	PageIcon,
@@ -80,11 +80,13 @@ export function AgentsScreen({
 						const color = agentColor(a.agentName);
 						const tone = stateTone(a.state);
 						return (
-							<div
+							<button
+								type="button"
 								key={a.id}
-								className="card row-click"
+								className="card row-click card-button"
 								style={{ borderLeft: `3px solid ${color}` }}
 								onClick={() => onSelect(a.agentName)}
+								aria-label={`Open details for ${a.agentName} (${tone.label})`}
 							>
 								<div className="row-2col" style={{ marginBottom: 8 }}>
 									<span style={{ fontWeight: 700, color }}>{a.agentName}</span>
@@ -105,7 +107,7 @@ export function AgentsScreen({
 										<IconChild size={13} /> {a.parentAgent}
 									</div>
 								) : null}
-							</div>
+							</button>
 						);
 					})}
 				</div>

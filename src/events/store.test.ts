@@ -4,9 +4,14 @@
 // store's only side effects are SQL writes, so an in-memory DB exercises the
 // real code path (schema creation, inserts, filtered SELECTs) with no cleanup.
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_LIST_LIMIT } from "../db/sqlite.ts";
 import type { EventStore } from "./store.ts";
-import { createEventStore } from "./store.ts";
+import { createEventStore, EVENTS_MIGRATIONS } from "./store.ts";
 
 describe("createEventStore", () => {
 	let store: EventStore;
@@ -152,14 +157,18 @@ describe("createEventStore", () => {
 		expect(events.length).toBe(2);
 	});
 
-	test("list treats non-positive limit as no limit", () => {
-		store.record({ agentName: "a", type: "1" });
-		store.record({ agentName: "a", type: "2" });
-		store.record({ agentName: "a", type: "3" });
+	test("list treats an invalid limit as the default cap, never as no limit", () => {
+		const total = DEFAULT_LIST_LIMIT + 5;
+		for (let i = 0; i < total; i++) store.record({ agentName: "a", type: String(i) });
 
-		// 0 and negative should not silently truncate to nothing.
-		expect(store.list({ limit: 0 }).length).toBe(3);
-		expect(store.list({ limit: -5 }).length).toBe(3);
+		// 0 / negative / NaN neither truncate to nothing nor dump the whole log.
+		for (const limit of [0, -1, -5, Number.NaN]) {
+			const rows = store.list({ limit });
+			expect(rows.length).toBe(DEFAULT_LIST_LIMIT);
+			expect(rows[0]?.type).toBe(String(total - 1)); // still newest first
+		}
+		// Omitting the limit is the explicit "every row" request.
+		expect(store.list().length).toBe(total);
 	});
 
 	test("list on an empty store returns an empty array", () => {
@@ -201,5 +210,77 @@ describe("createEventStore", () => {
 
 	test("deleteByAgent on an unknown agent returns 0", () => {
 		expect(store.deleteByAgent("nobody")).toBe(0);
+	});
+
+	test("usageTotals is empty when no usage has been recorded", () => {
+		store.record({ agentName: "a", type: "assistant" });
+		expect(store.usageTotals()).toEqual([]);
+	});
+});
+
+describe("usageTotals (file-backed, explicit timestamps)", () => {
+	let dir: string;
+	let path: string;
+	let store: EventStore;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "agentplate-events-"));
+		path = join(dir, "events.db");
+		store = createEventStore(path);
+	});
+
+	afterEach(() => {
+		store.close();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	/** Insert a row with a chosen created_at (the store always stamps "now"). */
+	function insert(agent: string, createdAt: string, detail: string | null, type = "result"): void {
+		const db = new Database(path);
+		db.query(
+			"INSERT INTO events (id, agent_name, run_id, type, tool, detail, created_at) VALUES (?, ?, NULL, ?, NULL, ?, ?)",
+		).run(crypto.randomUUID(), agent, type, detail, createdAt);
+		db.close();
+	}
+
+	test("sums by agent and day, oldest day first, ignoring rows without numeric usage", () => {
+		insert("builder", "2026-03-01T10:00:00.000Z", JSON.stringify({ tokens: 100, cost: 0.02 }));
+		insert("builder", "2026-03-01T23:59:59.999Z", JSON.stringify({ tokens: 50, cost: 0.01 }));
+		insert("builder", "2026-03-02T00:00:00.000Z", JSON.stringify({ tokens: 7, costUsd: 0.5 }));
+		insert("scout", "2026-03-01T12:00:00.000Z", JSON.stringify({ tokens: 30 }));
+		// `cost` wins over `costUsd` when both are numeric (same as the old JS reader).
+		insert("scout", "2026-03-02T12:00:00.000Z", JSON.stringify({ cost: 1, costUsd: 99 }));
+		// None of these carry usage: they must not throw or contribute.
+		insert("scout", "2026-03-01T12:00:00.000Z", "not json {", "error");
+		insert("scout", "2026-03-01T12:00:00.000Z", null, "assistant");
+		insert("scout", "2026-03-01T12:00:00.000Z", "[1, 2, 3]", "assistant");
+		insert("scout", "2026-03-01T12:00:00.000Z", "42", "assistant");
+		insert("scout", "2026-03-01T12:00:00.000Z", "null", "assistant");
+		insert("scout", "2026-03-01T12:00:00.000Z", JSON.stringify({ tokens: "9", cost: true }));
+		insert("idle", "2026-03-01T12:00:00.000Z", JSON.stringify({ tokens: 0, cost: 0 }));
+
+		const buckets = store.usageTotals();
+		expect(buckets.map((b) => ({ ...b, costUsd: Math.round(b.costUsd * 1e6) / 1e6 }))).toEqual([
+			{ agentName: "builder", day: "2026-03-01", tokens: 150, costUsd: 0.03 },
+			{ agentName: "scout", day: "2026-03-01", tokens: 30, costUsd: 0 },
+			{ agentName: "builder", day: "2026-03-02", tokens: 7, costUsd: 0.5 },
+			{ agentName: "scout", day: "2026-03-02", tokens: 0, costUsd: 1 },
+		]);
+	});
+
+	test("an existing pre-versioning events.db keeps its rows and is stamped at the newest version", () => {
+		store.record({ agentName: "a", type: "kept" });
+		store.close();
+		// Simulate a DB written before schema versioning existed.
+		const raw = new Database(path);
+		raw.exec("PRAGMA user_version = 0");
+		raw.close();
+
+		store = createEventStore(path);
+		expect(store.list().map((e) => e.type)).toEqual(["kept"]);
+		const check = new Database(path);
+		const { user_version } = check.query("PRAGMA user_version").get() as { user_version: number };
+		check.close();
+		expect(user_version).toBe(EVENTS_MIGRATIONS.at(-1)?.version ?? -1);
 	});
 });

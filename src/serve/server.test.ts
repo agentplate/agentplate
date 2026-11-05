@@ -14,6 +14,7 @@ import {
 	isLoopbackHost,
 	MAX_BODY_BYTES,
 	normalizeOrigin,
+	resolveAuthToken,
 	type ServeHandle,
 	startServer,
 } from "./server.ts";
@@ -704,5 +705,110 @@ describe("websocket", () => {
 		const parsed = JSON.parse(frame) as { type: string; overview: { project: string } };
 		expect(parsed.type).toBe("snapshot");
 		expect(parsed.overview.project).toBe("serve-test");
+	});
+});
+
+describe("bearer token on non-loopback binds", () => {
+	let remote: ServeHandle;
+	let base: string;
+
+	beforeEach(() => {
+		// A wildcard bind is non-loopback, so a per-launch token is generated.
+		remote = startServer({ root, port: 0, host: "0.0.0.0", uiDir: join(root, "no-ui") });
+		base = `http://127.0.0.1:${remote.server.port}`;
+	});
+
+	afterEach(() => {
+		remote.stop();
+	});
+
+	function wsFrame(url: string): Promise<string> {
+		const ws = new WebSocket(url);
+		return new Promise<string>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("no frame")), 3000);
+			ws.onmessage = (ev) => {
+				clearTimeout(timer);
+				ws.close();
+				resolve(typeof ev.data === "string" ? ev.data : "");
+			};
+			ws.onerror = () => {
+				clearTimeout(timer);
+				reject(new Error("ws refused"));
+			};
+		});
+	}
+
+	test("a random per-launch token is generated (and differs per launch)", () => {
+		expect(remote.token).toMatch(/^[0-9a-f-]{36}$/);
+		const other = startServer({ root, port: 0, host: "0.0.0.0", uiDir: join(root, "no-ui") });
+		try {
+			expect(other.token).not.toBe(remote.token);
+		} finally {
+			other.stop();
+		}
+	});
+
+	test("/api/* without a token is 401 (GET and POST); nothing is written", async () => {
+		const get = await fetch(`${base}/api/overview`);
+		expect(get.status).toBe(401);
+		expect(get.headers.get("www-authenticate")).toContain("Bearer");
+		const postRes = await fetch(`${base}/api/tasks`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ prompt: "do a thing" }),
+		});
+		expect(postRes.status).toBe(401);
+		expect(specFiles()).toEqual([]);
+		// The async GETs are gated too.
+		expect((await fetch(`${base}/api/system`)).status).toBe(401);
+	});
+
+	test("a wrong token is 401", async () => {
+		const res = await fetch(`${base}/api/overview`, {
+			headers: { authorization: "Bearer not-the-token" },
+		});
+		expect(res.status).toBe(401);
+		expect((await fetch(`${base}/api/overview?token=nope`)).status).toBe(401);
+	});
+
+	test("Authorization: Bearer or ?token= unlocks /api/*", async () => {
+		const token = remote.token ?? "";
+		const viaHeader = await fetch(`${base}/api/overview`, {
+			headers: { authorization: `Bearer ${token}` },
+		});
+		expect(viaHeader.status).toBe(200);
+		const viaQuery = await fetch(`${base}/api/overview?token=${encodeURIComponent(token)}`);
+		expect(viaQuery.status).toBe(200);
+	});
+
+	test("/ws requires the token (query param, since browsers can't set WS headers)", async () => {
+		const ws = `ws://127.0.0.1:${remote.server.port}/ws`;
+		await expect(wsFrame(ws)).rejects.toThrow("ws refused");
+		const frame = await wsFrame(`${ws}?token=${encodeURIComponent(remote.token ?? "")}`);
+		expect((JSON.parse(frame) as { type: string }).type).toBe("snapshot");
+	});
+
+	test("/healthz and the static SPA stay reachable without a token", async () => {
+		expect((await fetch(`${base}/healthz`)).status).toBe(200);
+		// UI not built here → 503, but crucially not 401: the page load itself is ungated.
+		expect((await fetch(`${base}/?token=x`)).status).toBe(503);
+	});
+});
+
+describe("bearer token: loopback stays token-free", () => {
+	test("a loopback bind has no token and serves /api + /ws without one", async () => {
+		expect(handle.token).toBeNull();
+		expect((await fetch(`${handle.url}/api/overview`)).status).toBe(200);
+		const frame = await firstWsFrame();
+		expect((JSON.parse(frame) as { type: string }).type).toBe("snapshot");
+	});
+
+	test("resolveAuthToken: loopback → null, remote → uuid, explicit wins, empty refused", () => {
+		expect(resolveAuthToken("127.0.0.1", undefined)).toBeNull();
+		expect(resolveAuthToken("localhost", undefined)).toBeNull();
+		expect(resolveAuthToken("0.0.0.0", undefined)).toMatch(/^[0-9a-f-]{36}$/);
+		expect(resolveAuthToken("0.0.0.0", null)).toBeNull();
+		expect(resolveAuthToken("127.0.0.1", "fixed")).toBe("fixed");
+		expect(() => resolveAuthToken("0.0.0.0", " ")).toThrow(ValidationError);
 	});
 });
