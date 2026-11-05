@@ -40,50 +40,9 @@
 import { AGENTPLATE_DIR } from "../config.ts";
 import { SubprocessError, WorktreeError } from "../errors.ts";
 import type { MergeResult } from "../types.ts";
+import { runGit, runGitChecked } from "../utils/git.ts";
 
 /** Result of running a git subprocess. */
-interface GitResult {
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-}
-
-/**
- * Run a git command in `repoRoot` and capture its output. Never throws on a
- * non-zero exit — callers inspect `exitCode` because for git a non-zero exit is
- * frequently expected (a merge conflict is exit 1, not a crash).
- */
-async function runGit(repoRoot: string, args: string[]): Promise<GitResult> {
-	const proc = Bun.spawn(["git", ...args], {
-		cwd: repoRoot,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-	return { stdout, stderr, exitCode };
-}
-
-/**
- * Run a git command that is expected to succeed. Throws {@link SubprocessError}
- * (carrying the git exit code) on any non-zero exit. Use this only for steps
- * where a failure is genuinely exceptional (checkout of an existing branch,
- * staging, committing a resolution).
- */
-async function runGitChecked(repoRoot: string, args: string[]): Promise<GitResult> {
-	const result = await runGit(repoRoot, args);
-	if (result.exitCode !== 0) {
-		throw new SubprocessError(
-			`git ${args.join(" ")} failed (exit ${result.exitCode}): ${result.stderr.trim()}`,
-			result.exitCode,
-		);
-	}
-	return result;
-}
-
 /**
  * Split git's NUL-delimited (`-z`) path output into a clean array. `-z` paths
  * are verbatim (never C-quoted), so they can be passed straight back to git.

@@ -7,11 +7,10 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
-import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { eventsDbPath } from "../paths.ts";
+import { requireInit } from "./shared.ts";
 
 export function createLogCommand(): Command {
 	return new Command("log")
@@ -29,10 +28,7 @@ export function createLogCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				const events = createEventStore(eventsDbPath(root));
 				try {
 					const record = events.record({

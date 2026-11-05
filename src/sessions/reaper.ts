@@ -29,6 +29,7 @@ import { createMailStore } from "../mail/store.ts";
 import { createMergeQueue } from "../merge/queue.ts";
 import { eventsDbPath, mailDbPath, mergeDbPath, worktreesDir } from "../paths.ts";
 import type { AgentSession, SessionState } from "../types.ts";
+import { runGit } from "../utils/git.ts";
 import { deleteBranch, removeWorktree, worktreeExists } from "../worktree/manager.ts";
 import { type PurgeReport, purgeAgentData } from "./purge.ts";
 import type { SessionStore } from "./store.ts";
@@ -125,23 +126,19 @@ function isGeneratedOverlay(path: string): boolean {
  * worktree is kept, never force-removed.
  */
 export async function worktreeHasUncommittedChanges(worktreePath: string): Promise<boolean> {
-	const proc = Bun.spawn(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-		cwd: worktreePath,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
 	let out: string;
-	let code: number;
 	try {
-		[out, , code] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
+		const result = await runGit(worktreePath, [
+			"status",
+			"--porcelain=v1",
+			"-z",
+			"--untracked-files=all",
 		]);
+		if (result.exitCode !== 0) return true;
+		out = result.stdout;
 	} catch {
 		return true;
 	}
-	if (code !== 0) return true;
 	const entries = out.split("\0");
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];

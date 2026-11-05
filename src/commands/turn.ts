@@ -14,7 +14,7 @@
 
 import { Command } from "commander";
 import { driveAgentTurn } from "../agents/drive.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
@@ -22,6 +22,7 @@ import { brand, muted, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
 import { eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { CLAIMABLE_STATES, createSessionStore } from "../sessions/store.ts";
+import { requireInit } from "./shared.ts";
 
 interface TurnOptions {
 	json?: boolean;
@@ -34,10 +35,7 @@ export function createTurnCommand(): Command {
 		.option("--json", "output JSON")
 		.action(async (agent: string, _opts: TurnOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 
 			const store = createSessionStore(sessionsDbPath(root));

@@ -17,13 +17,14 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { muted, printInfo, printSuccess, printWarning } from "../logging/color.ts";
 import { sessionsDbPath } from "../paths.ts";
 import { reapIdleSessions, selectIdleSessions } from "../sessions/reaper.ts";
 import { createSessionStore } from "../sessions/store.ts";
+import { requireInit } from "./shared.ts";
 
 export function createReapCommand(): Command {
 	return new Command("reap")
@@ -50,10 +51,7 @@ export function createReapCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				const config = loadConfig(root);
 
 				const minutes =

@@ -6,23 +6,15 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { muted, printInfo, printSuccess } from "../logging/color.ts";
 import { createMailClient, isMailType, resolveSender } from "../mail/client.ts";
 import type { MailMessage } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 /** `--from` help: inside an agent's turn mail is always sent as that agent. */
 const FROM_HELP = "sender (default: this agent inside its turn, else operator)";
-
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
 
 function printMessage(m: MailMessage): void {
 	printInfo(`${m.read ? " " : "•"} [${m.type}] ${m.from} → ${m.to}: ${m.subject}`);

@@ -28,7 +28,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { accent, brand, muted, printInfo, printSuccess, printWarning } from "../logging/color.ts";
@@ -37,6 +37,7 @@ import { sanitizeSkillDraft } from "../skills/safety.ts";
 import { createSkillStore, type SkillStore, serializeSkillMd } from "../skills/store.ts";
 import type { Skill, SkillDraft, SkillStatus } from "../skills/types.ts";
 import type { OutcomeStatus } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 /** Provenance stamped onto manually-recorded skills (the operator path). */
 const OPERATOR_PROVENANCE = { taskId: null, agent: "operator", commit: null } as const;
@@ -46,14 +47,6 @@ const OPERATOR_PROVENANCE = { taskId: null, agent: "operator", commit: null } as
  * Every subcommand calls this first so an uninitialized project fails fast and
  * uniformly (matching the rest of the CLI).
  */
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
-
 /** Read the `--json` global flag off the action's trailing Command instance. */
 function wantsJson(command: Command): boolean {
 	return command.optsWithGlobals().json === true;

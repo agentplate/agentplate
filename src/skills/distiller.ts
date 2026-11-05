@@ -28,10 +28,13 @@
  * rather than minting a hazardous or noise skill.
  */
 
+import { join } from "node:path";
+import { specsDir } from "../paths.ts";
 import type { AgentRuntime } from "../runtimes/types.ts";
 import type { ResolvedModel } from "../types.ts";
 import { agentChildEnv, armKillTimer } from "../utils/child-process.ts";
 import { resolveArgv } from "../utils/detect.ts";
+import { gitOutput } from "../utils/git.ts";
 import { sanitizeSkillDraft } from "./safety.ts";
 import { type createSkillStore, isValidSlug } from "./store.ts";
 import type { Skill, SkillDraft, SkillProvenance } from "./types.ts";
@@ -343,16 +346,14 @@ interface GitResult {
  * crash session-end); the caller checks `ok` and treats failure as "no diff".
  */
 async function runGit(cwd: string, args: string[]): Promise<GitResult> {
-	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	const stdout = await new Response(proc.stdout).text();
-	const exitCode = await proc.exited;
-	return { stdout: stdout.trim(), ok: exitCode === 0 };
+	const stdout = await gitOutput(cwd, args);
+	return { stdout: stdout ?? "", ok: stdout !== null };
 }
 
 /** Read the spec markdown for a task id under `<root>/.agentplate/specs/`, or "". */
 async function readSpecText(root: string, taskId: string | null): Promise<string> {
 	if (taskId === null || taskId === "") return "";
-	const specFile = `${root}/.agentplate/specs/${taskId}.md`;
+	const specFile = join(specsDir(root), `${taskId}.md`);
 	const file = Bun.file(specFile);
 	if (!(await file.exists())) return "";
 	try {

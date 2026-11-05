@@ -20,7 +20,7 @@ import { driveTurn } from "../agents/drive.ts";
 import { createIdentity } from "../agents/identity.ts";
 import { buildDefaultManifest, getDefinition, loadManifest } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
@@ -42,6 +42,7 @@ import { retrieveSkillsForSpawn } from "../skills/lifecycle.ts";
 import type { AgentManifest, AgentSession, Capability, OverlayConfig } from "../types.ts";
 import { SUPPORTED_CAPABILITIES } from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
+import { readCurrentRun, requireInit } from "./shared.ts";
 
 export interface SlingOptions {
 	capability?: string;
@@ -55,11 +56,6 @@ export interface SlingOptions {
 	baseBranch?: string;
 	siblings?: string;
 	json?: boolean;
-}
-
-function readCurrentRun(root: string): string | null {
-	const path = currentRunPath(root);
-	return existsSync(path) ? readFileSync(path, "utf8").trim() || null : null;
 }
 
 function writeCurrentRun(root: string, runId: string): void {
@@ -132,10 +128,7 @@ export function createSlingCommand(): Command {
 			// The task id names the spec file, agent and branch and is persisted on the
 			// session row (later used by purge), so reject path-like ids up front.
 			assertSafeTaskId(taskId);
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 
 			const capability = (opts.capability ?? "builder") as Capability;

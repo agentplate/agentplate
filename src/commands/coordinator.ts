@@ -16,7 +16,7 @@ import {
 	writeGeneratedInstructionFile,
 } from "../agents/instruction-file.ts";
 import { writeCoordinatorSystemPrompt } from "../agents/system-prompt.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { NotFoundError, ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import {
@@ -35,6 +35,7 @@ import type { AgentRuntime, InteractiveSpawnOpts } from "../runtimes/types.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession } from "../types.ts";
 import { resolveArgv } from "../utils/detect.ts";
+import { requireInit } from "./shared.ts";
 
 const COORDINATOR_NAME = "coordinator";
 
@@ -201,14 +202,6 @@ function markCoordinatorStopped(root: string): void {
 	} finally {
 		store.close();
 	}
-}
-
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
 }
 
 function startCommand(): Command {

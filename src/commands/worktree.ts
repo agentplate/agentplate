@@ -3,21 +3,13 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { muted, printInfo, printSuccess } from "../logging/color.ts";
 import { sessionsDbPath, worktreesDir } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { listWorktrees, removeWorktree } from "../worktree/manager.ts";
-
-function requireInit(): string {
-	const root = findProjectRoot();
-	if (!isInitialized(root)) {
-		throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-	}
-	return root;
-}
+import { requireInit } from "./shared.ts";
 
 function listCommand(): Command {
 	return new Command("list")

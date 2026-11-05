@@ -410,12 +410,12 @@ export function buildTasks(ctx: ApiContext): TaskItem[] {
 	const byTask = new Map<string, TaskItem>();
 	try {
 		// 1. Seed from spec files (so queued-but-unspawned tasks appear).
-		const specsDir = join(ctx.root, ".agentplate", "specs");
-		if (existsSync(specsDir)) {
-			for (const file of readdirSync(specsDir)) {
+		const specs = specsDir(ctx.root);
+		if (existsSync(specs)) {
+			for (const file of readdirSync(specs)) {
 				if (!file.endsWith(".md")) continue;
 				const taskId = file.slice(0, -3);
-				const summary = firstSpecLine(join(specsDir, file));
+				const summary = firstSpecLine(join(specs, file));
 				byTask.set(taskId, {
 					taskId,
 					status: "pending",

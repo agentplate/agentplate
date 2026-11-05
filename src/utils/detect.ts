@@ -7,6 +7,7 @@
  */
 
 import { basename } from "node:path";
+import { gitOutput as runGit } from "./git.ts";
 
 /** Runtime adapter ids Agentplate knows how to detect by their CLI name. */
 const RUNTIME_CLIS: ReadonlyArray<{ runtime: string; cli: string }> = [
@@ -16,17 +17,6 @@ const RUNTIME_CLIS: ReadonlyArray<{ runtime: string; cli: string }> = [
 	{ runtime: "gemini", cli: "gemini" },
 	{ runtime: "cursor", cli: "cursor-agent" },
 ];
-
-async function runGit(root: string, args: string[]): Promise<string | null> {
-	try {
-		const proc = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
-		const code = await proc.exited;
-		if (code !== 0) return null;
-		return (await new Response(proc.stdout).text()).trim();
-	} catch {
-		return null;
-	}
-}
 
 /**
  * True if `cli` is resolvable on PATH. Uses `Bun.which`, which is cross-platform

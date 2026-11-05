@@ -19,7 +19,7 @@
 
 import { writeFileSync } from "node:fs";
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { getDeployTarget } from "../deploy/registry.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
@@ -27,6 +27,7 @@ import { brand, muted, printError, printHint, printInfo, printSuccess } from "..
 import { currentRunPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { type DeployRunResult, runDeploy } from "./deploy.ts";
+import { requireInit } from "./shared.ts";
 
 export interface ShipOptions {
 	target?: string;
@@ -172,10 +173,7 @@ export function createShipCommand(): Command {
 		.option("--json", "output JSON")
 		.action(async (idea: string, opts: ShipOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const result = await runShip(root, idea, opts);
 
 			if (useJson) {

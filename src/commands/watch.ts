@@ -12,18 +12,18 @@
  * remain — the run drained), or the default (loop until Ctrl-C).
  */
 
-import { existsSync, readFileSync } from "node:fs";
 import { Command } from "commander";
 import { driveAgentTurn } from "../agents/drive.ts";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printInfo, printSuccess, printWarning } from "../logging/color.ts";
 import { createMailClient } from "../mail/client.ts";
-import { currentRunPath, eventsDbPath, sessionsDbPath } from "../paths.ts";
+import { eventsDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession } from "../types.ts";
+import { readCurrentRun, requireInit } from "./shared.ts";
 
 interface WatchOptions {
 	run?: string;
@@ -35,13 +35,6 @@ interface WatchOptions {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Current run id from `.agentplate/current-run.txt`, or undefined (= all runs). */
-function readCurrentRun(root: string): string | undefined {
-	const path = currentRunPath(root);
-	if (!existsSync(path)) return undefined;
-	return readFileSync(path, "utf8").trim() || undefined;
-}
-
 export function createWatchCommand(): Command {
 	return new Command("watch")
 		.description("Auto-advance idle agents: run their next (resumed) turn when they have mail")
@@ -52,16 +45,13 @@ export function createWatchCommand(): Command {
 		.option("--json", "output a JSON summary")
 		.action(async (opts: WatchOptions, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 			const interval = Number(opts.interval ?? "2000");
 			if (!Number.isFinite(interval) || interval < 0) {
 				throw new ValidationError("--interval must be a non-negative number of milliseconds.");
 			}
-			const runId = opts.run ?? readCurrentRun(root);
+			const runId = opts.run ?? readCurrentRun(root) ?? undefined;
 
 			const store = createSessionStore(sessionsDbPath(root));
 			const mail = createMailClient(root);

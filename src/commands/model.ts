@@ -6,8 +6,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadCommittedConfig, loadConfig } from "../config.ts";
-import { ValidationError } from "../errors.ts";
+import { isInitialized, loadCommittedConfig, loadConfig } from "../config.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, printHint, printInfo, printSuccess } from "../logging/color.ts";
 import { getProviderSpec } from "../providers/registry.ts";
@@ -15,6 +14,7 @@ import { scaffoldAgentplateDir } from "../scaffold.ts";
 import { setSecret } from "../secrets.ts";
 import type { AgentplateConfig } from "../types.ts";
 import { runSetupWizard } from "../wizard/setup.ts";
+import { requireInit } from "./shared.ts";
 
 type PlainObject = Record<string, unknown>;
 
@@ -101,10 +101,7 @@ export function createModelCommand(): Command {
 		.option("--json", "print the current provider/model and exit")
 		.action(async (_opts: { json?: boolean }, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			const config = loadConfig(root);
 
 			// `--json` is a read-only query of the current selection.

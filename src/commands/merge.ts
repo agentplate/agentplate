@@ -8,7 +8,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { printError, printInfo, printSuccess } from "../logging/color.ts";
@@ -18,6 +18,7 @@ import { mergeBranch, predictMerge } from "../merge/resolver.ts";
 import { mergeDbPath, sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, MergeResult } from "../types.ts";
+import { requireInit } from "./shared.ts";
 
 export function createMergeCommand(): Command {
 	return new Command("merge")
@@ -39,10 +40,7 @@ export function createMergeCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				const config = loadConfig(root);
 				const target = opts.into ?? config.project.canonicalBranch;
 

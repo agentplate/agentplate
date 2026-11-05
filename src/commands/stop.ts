@@ -12,8 +12,7 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
-import { NotFoundError, ValidationError } from "../errors.ts";
+import { NotFoundError } from "../errors.ts";
 import { createEventStore } from "../events/store.ts";
 import { jsonOutput } from "../json.ts";
 import { printHint, printSuccess, printWarning } from "../logging/color.ts";
@@ -24,6 +23,7 @@ import { type PurgeReport, purgeAgentData } from "../sessions/purge.ts";
 import { isRemovableWorktree, terminatePid } from "../sessions/reaper.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { deleteBranch, removeWorktree } from "../worktree/manager.ts";
+import { requireInit } from "./shared.ts";
 
 export function createStopCommand(): Command {
 	return new Command("stop")
@@ -42,10 +42,7 @@ export function createStopCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				// --purge implies removing the worktree: a full wipe leaves no worktree.
 				const cleanWorktree = opts.cleanWorktree || opts.purge === true;
 				const store = createSessionStore(sessionsDbPath(root));

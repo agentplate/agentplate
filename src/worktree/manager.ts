@@ -1,7 +1,8 @@
 import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { SubprocessError, WorktreeError } from "../errors.ts";
+import { WorktreeError } from "../errors.ts";
+import { runGitChecked } from "../utils/git.ts";
 
 // Where every agent's isolated worktree lives, relative to the repo root.
 // Mirrors agentplate's layout (.agentplate/worktrees/<agent>) so the rest of
@@ -29,26 +30,7 @@ export interface WorktreeEntry {
  * the higher-level WorktreeError translation) have the real git diagnostic.
  */
 async function git(repoRoot: string, args: string[]): Promise<string> {
-	const proc = Bun.spawn(["git", ...args], {
-		cwd: repoRoot,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-
-	// Drain both streams before awaiting exit. Reading after `await proc.exited`
-	// is fine for small outputs, but draining first avoids any chance of a
-	// pipe-buffer stall on large `git worktree list` output.
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
-
-	if (exitCode !== 0) {
-		const detail = stderr.trim() || stdout.trim() || `exit code ${exitCode}`;
-		throw new SubprocessError(`git ${args.join(" ")} failed: ${detail}`);
-	}
-
+	const { stdout } = await runGitChecked(repoRoot, args);
 	return stdout.trim();
 }
 

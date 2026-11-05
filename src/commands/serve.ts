@@ -7,12 +7,11 @@
 
 import { join } from "node:path";
 import { Command } from "commander";
-import { findProjectRoot, isInitialized } from "../config.ts";
-import { ValidationError } from "../errors.ts";
 import { jsonOutput } from "../json.ts";
 import { accent, brand, printHint, printInfo, printSuccess } from "../logging/color.ts";
 import { packageRootDir } from "../paths.ts";
 import { isLoopbackHost, startServer } from "../serve/server.ts";
+import { requireInit } from "./shared.ts";
 
 /**
  * The warning printed (to stderr, never suppressed) when binding off loopback:
@@ -64,10 +63,7 @@ export function createServeCommand(): Command {
 				command: Command,
 			) => {
 				const useJson = command.optsWithGlobals().json === true;
-				const root = findProjectRoot();
-				if (!isInitialized(root)) {
-					throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-				}
+				const root = requireInit();
 				const uiDir = opts.uiDir ?? join(packageRootDir(), "ui", "dist");
 				if (!isLoopbackHost(opts.host)) process.stderr.write(`${remoteBindWarning(opts.host)}\n`);
 				const handle = startServer({

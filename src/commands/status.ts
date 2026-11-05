@@ -3,13 +3,13 @@
  */
 
 import { Command } from "commander";
-import { findProjectRoot, isInitialized, loadConfig } from "../config.ts";
-import { ValidationError } from "../errors.ts";
+import { loadConfig } from "../config.ts";
 import { jsonOutput } from "../json.ts";
 import { brand, muted, printInfo } from "../logging/color.ts";
 import { sessionsDbPath } from "../paths.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import { listWorktrees } from "../worktree/manager.ts";
+import { requireInit } from "./shared.ts";
 
 export function createStatusCommand(): Command {
 	return new Command("status")
@@ -18,10 +18,7 @@ export function createStatusCommand(): Command {
 		.option("--json", "output JSON")
 		.action(async (opts: { all?: boolean; json?: boolean }, command: Command) => {
 			const useJson = command.optsWithGlobals().json === true;
-			const root = findProjectRoot();
-			if (!isInitialized(root)) {
-				throw new ValidationError("Not initialized. Run `agentplate setup` first.");
-			}
+			const root = requireInit();
 			loadConfig(root);
 			const store = createSessionStore(sessionsDbPath(root));
 			try {
